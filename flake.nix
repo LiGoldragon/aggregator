@@ -54,14 +54,17 @@
         apps.default = {
           type = "app";
           program = "${self.packages.${system}.default}/bin/aggregator";
+          meta.description = "Run the aggregator evidence collection CLI";
         };
         apps.daemon = {
           type = "app";
           program = "${self.packages.${system}.default}/bin/aggregator-daemon";
+          meta.description = "Run the aggregator daemon";
         };
         apps.meta = {
           type = "app";
           program = "${self.packages.${system}.default}/bin/meta-aggregator";
+          meta.description = "Run the aggregator meta-configuration CLI";
         };
         devShells.default = pkgs.mkShell {
           name = "aggregator";
