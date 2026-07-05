@@ -45,6 +45,11 @@ impl ClaudeJsonlRootReader {
 
     pub fn collect(&self, request: &TranscriptReadRequest) -> TranscriptReadOutcome {
         let source_identifier = self.source_identifier();
+        if let Some(outcome) = request
+            .unsupported_relative_window_outcome(SourceKind::Claude, source_identifier.clone())
+        {
+            return outcome;
+        }
         if !self.root.exists() {
             return TranscriptReadOutcome::from_records(
                 SourceKind::Claude,

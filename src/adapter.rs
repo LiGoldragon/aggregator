@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 
 use signal_aggregator::{
     ByteCount, ByteLimit, ByteRange, FilesystemPath, ItemCount, LimitPolicy, LineNumber, LineRange,
-    Projection, SegmentProjection, SourceIdentifier, SourceKind, SourceVolume, TimeWindow,
-    Timestamp, TranscriptSegment, TranscriptSegmentIdentifier, TranscriptText,
-    TranscriptTextExcerpt, Truncation, TruncationReason,
+    Projection, ReadFailure, ReadFailureReason, SegmentProjection, SourceIdentifier, SourceKind,
+    SourceVolume, TimeWindow, Timestamp, TranscriptSegment, TranscriptSegmentIdentifier,
+    TranscriptText, TranscriptTextExcerpt, Truncation, TruncationReason,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -50,6 +50,28 @@ impl TranscriptReadRequest {
     pub fn accepts_timestamp(&self, timestamp: Option<&Timestamp>) -> TimeWindowAcceptance {
         TimeWindowMatcher::new(self.time_window.clone()).accepts(timestamp)
     }
+
+    pub fn unsupported_relative_window_outcome(
+        &self,
+        source: SourceKind,
+        source_identifier: SourceIdentifier,
+    ) -> Option<TranscriptReadOutcome> {
+        if !matches!(self.time_window, TimeWindow::Recent(_)) {
+            return None;
+        }
+        Some(TranscriptReadOutcome::from_records(
+            source,
+            source_identifier.clone(),
+            Vec::new(),
+            vec![ReadFailure {
+                source,
+                path: None,
+                source_identifier: Some(source_identifier),
+                reason: ReadFailureReason::UnsupportedFormat,
+            }],
+            self,
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,7 +92,7 @@ impl TimeWindowMatcher {
 
     pub fn accepts(&self, timestamp: Option<&Timestamp>) -> TimeWindowAcceptance {
         match &self.time_window {
-            TimeWindow::Recent(_) => TimeWindowAcceptance::Accepted,
+            TimeWindow::Recent(_) => TimeWindowAcceptance::Rejected,
             TimeWindow::Since(start) => timestamp.map_or(TimeWindowAcceptance::Rejected, |value| {
                 if value.as_str() >= start.as_str() {
                     TimeWindowAcceptance::Accepted
@@ -304,9 +326,16 @@ impl TranscriptProjectionState {
                     .maximum_bytes
                     .into_u64()
                     .saturating_sub(self.projected_bytes);
-                let text_limit = TextProjectionLimit::new(ByteLimit::new(
-                    bound.maximum_bytes.into_u64().min(remaining_request_bytes),
-                ));
+                let truncation_reason = if remaining_request_bytes < bound.maximum_bytes.into_u64()
+                {
+                    TruncationReason::RequestLimit
+                } else {
+                    TruncationReason::ProjectionLimit
+                };
+                let text_limit = TextProjectionLimit::new(
+                    ByteLimit::new(bound.maximum_bytes.into_u64().min(remaining_request_bytes)),
+                    truncation_reason,
+                );
                 let excerpt = text_limit.project(record);
                 self.projected_bytes += excerpt.byte_count.into_u64();
                 if excerpt.truncation.is_some() {
@@ -315,11 +344,7 @@ impl TranscriptProjectionState {
                         path: Some(record.filesystem_path()),
                         original_bytes: Some(ByteCount::new(record.byte_count())),
                         projected_bytes: excerpt.byte_count,
-                        reason: if remaining_request_bytes < bound.maximum_bytes.into_u64() {
-                            TruncationReason::RequestLimit
-                        } else {
-                            TruncationReason::ProjectionLimit
-                        },
+                        reason: truncation_reason,
                     });
                 }
                 SegmentProjection::Text(excerpt)
@@ -337,11 +362,15 @@ pub enum SegmentLimitTruncation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextProjectionLimit {
     maximum_bytes: ByteLimit,
+    truncation_reason: TruncationReason,
 }
 
 impl TextProjectionLimit {
-    pub fn new(maximum_bytes: ByteLimit) -> Self {
-        Self { maximum_bytes }
+    pub fn new(maximum_bytes: ByteLimit, truncation_reason: TruncationReason) -> Self {
+        Self {
+            maximum_bytes,
+            truncation_reason,
+        }
     }
 
     pub fn project(&self, record: &TranscriptRecord) -> TranscriptTextExcerpt {
@@ -353,7 +382,7 @@ impl TextProjectionLimit {
                 path: Some(record.filesystem_path()),
                 original_bytes: Some(ByteCount::new(record.byte_count())),
                 projected_bytes: ByteCount::new(projected_bytes),
-                reason: TruncationReason::ProjectionLimit,
+                reason: self.truncation_reason,
             })
         } else {
             None

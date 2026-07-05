@@ -5,7 +5,7 @@ use aggregator::{
     RepositoryAdapterConfiguration, RuntimeConfiguration, RuntimeConfigurationValidation,
     SemaPlane, SignalPlane, TranscriptAdapterConfiguration, TranscriptRootConfiguration,
     adapter::{
-        TranscriptReadRequest,
+        TranscriptReadOutcome, TranscriptReadRequest, TranscriptRecord,
         claude::ClaudeTranscriptAdapter,
         codex::CodexTranscriptAdapter,
         pi::PiTranscriptAdapter,
@@ -25,7 +25,8 @@ use signal_aggregator::{
     EvidenceRequest, FilesystemPath as SignalFilesystemPath, LimitPolicy, Projection,
     ReadFailureReason, RejectionReason, RelativeDuration, RepositoryIdentifier, RepositoryPath,
     RepositoryWorktreeState, RequestIdentifier, SegmentLimit, SegmentProjection, SelectedSources,
-    SourceKind, SourceSelection, TimeRange, TimeWindow, Timestamp,
+    SourceIdentifier, SourceKind, SourceSelection, TimeRange, TimeWindow, Timestamp,
+    TruncationReason,
 };
 use tempfile::TempDir;
 
@@ -50,12 +51,21 @@ fn read_request(
     projection: Projection,
     maximum_segments: u64,
 ) -> TranscriptReadRequest {
+    read_request_with_byte_limit(time_window, projection, maximum_segments, 1024)
+}
+
+fn read_request_with_byte_limit(
+    time_window: TimeWindow,
+    projection: Projection,
+    maximum_segments: u64,
+    maximum_bytes: u64,
+) -> TranscriptReadRequest {
     TranscriptReadRequest::new(
         time_window,
         projection,
         LimitPolicy {
             maximum_segments: SegmentLimit::new(maximum_segments),
-            maximum_bytes: ByteLimit::new(1024),
+            maximum_bytes: ByteLimit::new(maximum_bytes),
         },
     )
 }
@@ -254,6 +264,146 @@ fn claude_jsonl_adapter_projects_bounded_text_and_reports_malformed_lines() {
     assert!(!outcome.truncations.is_empty());
     match &outcome.transcript_segments[0].projection {
         SegmentProjection::Text(excerpt) => assert_eq!(excerpt.text.as_str(), "hello "),
+        other => panic!("expected text projection, got {other:?}"),
+    }
+}
+
+#[test]
+fn recent_time_window_does_not_accept_old_or_timestampless_records() {
+    let source_identifier = SourceIdentifier::new("fixture-source");
+    let request = read_request(
+        TimeWindow::Recent(RelativeDuration {
+            amount: DurationAmount::new(1),
+            unit: DurationUnit::Hours,
+        }),
+        Projection::MetadataOnly,
+        8,
+    );
+    let outcome = TranscriptReadOutcome::from_records(
+        SourceKind::Claude,
+        source_identifier.clone(),
+        vec![
+            TranscriptRecord::new(
+                SourceKind::Claude,
+                source_identifier.clone(),
+                "old.jsonl".into(),
+                1,
+                Some(Timestamp::new("2000-01-01T00:00:00Z")),
+                "old record".to_string(),
+            ),
+            TranscriptRecord::new(
+                SourceKind::Claude,
+                source_identifier,
+                "missing-timestamp.jsonl".into(),
+                1,
+                None,
+                "timestampless record".to_string(),
+            ),
+        ],
+        Vec::new(),
+        &request,
+    );
+
+    assert!(outcome.transcript_segments.is_empty());
+    assert!(outcome.source_volumes.is_empty());
+}
+
+#[test]
+fn recent_time_window_reports_unsupported_without_projecting_transcripts() {
+    let root = TempDir::new().expect("temporary root");
+    fs::write(
+        root.path().join("project.jsonl"),
+        concat!(
+            "{\"timestamp\":\"2000-01-01T00:00:00Z\",\"text\":\"old\"}\n",
+            "{\"text\":\"timestampless\"}\n",
+        ),
+    )
+    .expect("write fixture transcript");
+    let adapter =
+        ClaudeTranscriptAdapter::new(TranscriptRootConfiguration::new(root.path().to_path_buf()));
+    let outcome = adapter.collect(&read_request(
+        TimeWindow::Recent(RelativeDuration {
+            amount: DurationAmount::new(1),
+            unit: DurationUnit::Hours,
+        }),
+        Projection::MetadataOnly,
+        8,
+    ));
+
+    assert!(outcome.transcript_segments.is_empty());
+    assert_eq!(outcome.read_failures.len(), 1);
+    assert_eq!(
+        outcome.read_failures[0].reason,
+        ReadFailureReason::UnsupportedFormat
+    );
+}
+
+#[test]
+fn request_byte_limit_truncation_reason_is_carried_into_text_excerpt() {
+    let root = TempDir::new().expect("temporary root");
+    fs::write(
+        root.path().join("project.jsonl"),
+        "{\"timestamp\":\"2026-01-02T00:00:00Z\",\"text\":\"hello world\"}\n",
+    )
+    .expect("write fixture transcript");
+    let adapter =
+        ClaudeTranscriptAdapter::new(TranscriptRootConfiguration::new(root.path().to_path_buf()));
+    let outcome = adapter.collect(&read_request_with_byte_limit(
+        TimeWindow::Since(Timestamp::new("2026-01-01T00:00:00Z")),
+        Projection::BoundedText(BoundedTextProjection {
+            maximum_bytes: ByteLimit::new(10),
+        }),
+        8,
+        4,
+    ));
+
+    assert_eq!(
+        outcome.truncations[0].reason,
+        TruncationReason::RequestLimit
+    );
+    match &outcome.transcript_segments[0].projection {
+        SegmentProjection::Text(excerpt) => assert_eq!(
+            excerpt
+                .truncation
+                .as_ref()
+                .map(|truncation| truncation.reason),
+            Some(TruncationReason::RequestLimit)
+        ),
+        other => panic!("expected text projection, got {other:?}"),
+    }
+}
+
+#[test]
+fn projection_byte_limit_truncation_reason_is_carried_into_text_excerpt() {
+    let root = TempDir::new().expect("temporary root");
+    fs::write(
+        root.path().join("project.jsonl"),
+        "{\"timestamp\":\"2026-01-02T00:00:00Z\",\"text\":\"hello world\"}\n",
+    )
+    .expect("write fixture transcript");
+    let adapter =
+        ClaudeTranscriptAdapter::new(TranscriptRootConfiguration::new(root.path().to_path_buf()));
+    let outcome = adapter.collect(&read_request_with_byte_limit(
+        TimeWindow::Since(Timestamp::new("2026-01-01T00:00:00Z")),
+        Projection::BoundedText(BoundedTextProjection {
+            maximum_bytes: ByteLimit::new(4),
+        }),
+        8,
+        10,
+    ));
+
+    assert_eq!(
+        outcome.truncations[0].reason,
+        TruncationReason::ProjectionLimit
+    );
+    match &outcome.transcript_segments[0].projection {
+        SegmentProjection::Text(excerpt) => assert_eq!(
+            excerpt
+                .truncation
+                .as_ref()
+                .map(|truncation| truncation.reason),
+            Some(TruncationReason::ProjectionLimit)
+        ),
         other => panic!("expected text projection, got {other:?}"),
     }
 }
