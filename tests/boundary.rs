@@ -1,17 +1,33 @@
+use std::fs;
+
 use aggregator::{
-    AdapterKind, ConfigurationFixture, ConfigurationStore, NexusPlane, SemaPlane, SignalPlane,
+    AdapterKind, ConfigurationFixture, ConfigurationStore, NexusPlane,
+    RepositoryAdapterConfiguration, RuntimeConfiguration, RuntimeConfigurationValidation,
+    SemaPlane, SignalPlane, TranscriptAdapterConfiguration, TranscriptRootConfiguration,
     adapter::{
-        claude::ClaudeTranscriptAdapter, codex::CodexTranscriptAdapter, pi::PiTranscriptAdapter,
-        repository::RepositoryAdapter,
+        TranscriptReadRequest,
+        claude::ClaudeTranscriptAdapter,
+        codex::CodexTranscriptAdapter,
+        pi::PiTranscriptAdapter,
+        repository::{
+            RepositoryAdapter, RepositoryChangeFixture, RepositoryCommandPolicy,
+            RepositoryEvidenceFixture,
+        },
     },
 };
-use meta_signal_aggregator::{ConfigurationChange, MetaAggregatorReply};
+use meta_signal_aggregator::{
+    ActiveRepository, AggregatorConfiguration, ConfigurationChange, FilesystemPath,
+    MetaAggregatorReply, RepositoryName, SocketMode, TranscriptRoot, TranscriptSource,
+};
 use nota::{NotaEncode, NotaSource};
 use signal_aggregator::{
-    AggregatorReply, ByteLimit, DurationAmount, DurationUnit, EvidenceRequest, LimitPolicy,
-    Projection, RejectionReason, RelativeDuration, RequestIdentifier, SegmentLimit,
-    SourceSelection, TimeWindow,
+    AggregatorReply, BoundedTextProjection, ByteLimit, DurationAmount, DurationUnit,
+    EvidenceRequest, FilesystemPath as SignalFilesystemPath, LimitPolicy, Projection,
+    ReadFailureReason, RejectionReason, RelativeDuration, RepositoryIdentifier, RepositoryPath,
+    RepositoryWorktreeState, RequestIdentifier, SegmentLimit, SegmentProjection, SelectedSources,
+    SourceKind, SourceSelection, TimeRange, TimeWindow, Timestamp,
 };
+use tempfile::TempDir;
 
 fn evidence_request() -> EvidenceRequest {
     EvidenceRequest {
@@ -29,15 +45,81 @@ fn evidence_request() -> EvidenceRequest {
     }
 }
 
+fn read_request(
+    time_window: TimeWindow,
+    projection: Projection,
+    maximum_segments: u64,
+) -> TranscriptReadRequest {
+    TranscriptReadRequest::new(
+        time_window,
+        projection,
+        LimitPolicy {
+            maximum_segments: SegmentLimit::new(maximum_segments),
+            maximum_bytes: ByteLimit::new(1024),
+        },
+    )
+}
+
+fn accepted_configuration(root: &TempDir) -> AggregatorConfiguration {
+    let repository = root.path().join("repository");
+    let claude = root.path().join("claude");
+    let codex = root.path().join("codex");
+    fs::create_dir_all(&repository).expect("repository directory");
+    fs::create_dir_all(&claude).expect("claude directory");
+    fs::create_dir_all(&codex).expect("codex directory");
+    AggregatorConfiguration {
+        ordinary_socket_path: FilesystemPath::new(
+            root.path().join("ordinary.sock").display().to_string(),
+        ),
+        ordinary_socket_mode: SocketMode::new(0o660),
+        meta_socket_path: FilesystemPath::new(root.path().join("meta.sock").display().to_string()),
+        meta_socket_mode: SocketMode::new(0o600),
+        store_path: FilesystemPath::new(root.path().join("store.sema").display().to_string()),
+        active_repositories: vec![ActiveRepository {
+            name: RepositoryName::new("fixture-repository"),
+            path: FilesystemPath::new(repository.display().to_string()),
+        }],
+        transcript_sources: vec![
+            TranscriptSource::Claude(TranscriptRoot {
+                path: FilesystemPath::new(claude.display().to_string()),
+            }),
+            TranscriptSource::Codex(TranscriptRoot {
+                path: FilesystemPath::new(codex.display().to_string()),
+            }),
+        ],
+        default_projection: Projection::MetadataOnly,
+        default_limit_policy: LimitPolicy {
+            maximum_segments: SegmentLimit::new(16),
+            maximum_bytes: ByteLimit::new(4096),
+        },
+    }
+}
+
 #[test]
 fn adapter_skeletons_name_the_approved_sources() {
+    let root = TranscriptRootConfiguration::new(std::env::temp_dir());
+    let repository =
+        RepositoryAdapterConfiguration::new(RepositoryName::new("primary"), std::env::temp_dir());
     assert_eq!(
-        ClaudeTranscriptAdapter.kind(),
+        ClaudeTranscriptAdapter::new(root.clone()).kind(),
         AdapterKind::ClaudeTranscript
     );
-    assert_eq!(CodexTranscriptAdapter.kind(), AdapterKind::CodexTranscript);
-    assert_eq!(PiTranscriptAdapter.kind(), AdapterKind::PiTranscript);
-    assert_eq!(RepositoryAdapter.kind(), AdapterKind::Repository);
+    assert_eq!(
+        CodexTranscriptAdapter::new(root.clone()).kind(),
+        AdapterKind::CodexTranscript
+    );
+    assert_eq!(
+        PiTranscriptAdapter::new(root).kind(),
+        AdapterKind::PiTranscript
+    );
+    assert_eq!(
+        RepositoryAdapter::command_policy(
+            vec![repository],
+            RepositoryCommandPolicy::unavailable(),
+        )
+        .kind(),
+        AdapterKind::Repository
+    );
 }
 
 #[test]
@@ -58,7 +140,7 @@ fn nexus_scaffold_does_not_collect_private_sources() {
     let nexus = NexusPlane::with_adapters(vec![AdapterKind::ClaudeTranscript]);
     let error = nexus
         .collect(evidence_request())
-        .expect_err("scaffold stops before reading");
+        .expect_err("scaffold stops before daemon collection orchestration");
     assert!(error.to_string().contains("not implemented"));
 }
 
@@ -95,4 +177,161 @@ fn configuration_store_names_missing_storage() {
         .read_configuration()
         .expect_err("storage is intentionally skeletal");
     assert!(error.to_string().contains("not implemented"));
+}
+
+#[test]
+fn runtime_configuration_validates_paths_and_maps_source_selection() {
+    let root = TempDir::new().expect("temporary root");
+    let configuration = accepted_configuration(&root);
+    let validation = RuntimeConfiguration::validate_from_meta(&configuration);
+    let runtime = match validation {
+        RuntimeConfigurationValidation::Accepted(runtime) => runtime,
+        RuntimeConfigurationValidation::Rejected(report) => {
+            panic!("unexpected rejection: {report:?}")
+        }
+    };
+    assert_eq!(runtime.repositories().len(), 1);
+    assert_eq!(runtime.transcript_sources().len(), 2);
+    let selected = runtime.select_sources(&SourceSelection::Only(SelectedSources {
+        sources: vec![SourceKind::Claude, SourceKind::Repository],
+    }));
+    assert_eq!(selected.repositories.len(), 1);
+    assert_eq!(selected.transcript_sources.len(), 1);
+    assert!(matches!(
+        selected.transcript_sources.first(),
+        Some(TranscriptAdapterConfiguration::Claude(_))
+    ));
+}
+
+#[test]
+fn runtime_configuration_reports_missing_paths_as_validation_issues() {
+    let root = TempDir::new().expect("temporary root");
+    let mut configuration = accepted_configuration(&root);
+    configuration.transcript_sources = vec![TranscriptSource::Pi(TranscriptRoot {
+        path: FilesystemPath::new(root.path().join("missing-pi").display().to_string()),
+    })];
+    let validation = RuntimeConfiguration::validate_from_meta(&configuration);
+    let report = match validation {
+        RuntimeConfigurationValidation::Accepted(_) => panic!("missing path was accepted"),
+        RuntimeConfigurationValidation::Rejected(report) => report,
+    };
+    assert!(report.issues.iter().any(|issue| issue.kind
+        == meta_signal_aggregator::ConfigurationValidationIssueKind::UnreadablePath));
+}
+
+#[test]
+fn claude_jsonl_adapter_projects_bounded_text_and_reports_malformed_lines() {
+    let root = TempDir::new().expect("temporary root");
+    let transcript = root.path().join("project.jsonl");
+    fs::write(
+        &transcript,
+        concat!(
+            "{\"timestamp\":\"2026-01-01T00:00:00Z\",\"text\":\"outside\",\"unknown\":1}\n",
+            "{\"timestamp\":\"2026-01-02T00:00:00Z\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hello world\"}]},\"ignored\":true}\n",
+            "not-json\n",
+            "{\"timestamp\":\"2026-01-02T01:00:00Z\",\"text\":\"second matching record\"}\n",
+        ),
+    )
+    .expect("write fixture transcript");
+    let adapter =
+        ClaudeTranscriptAdapter::new(TranscriptRootConfiguration::new(root.path().to_path_buf()));
+    let outcome = adapter.collect(&read_request(
+        TimeWindow::Range(TimeRange {
+            start: Timestamp::new("2026-01-02T00:00:00Z"),
+            end: Timestamp::new("2026-01-02T23:59:59Z"),
+        }),
+        Projection::BoundedText(BoundedTextProjection {
+            maximum_bytes: ByteLimit::new(6),
+        }),
+        1,
+    ));
+    assert_eq!(outcome.transcript_segments.len(), 1);
+    assert_eq!(outcome.read_failures.len(), 1);
+    assert_eq!(
+        outcome.read_failures[0].reason,
+        ReadFailureReason::Malformed
+    );
+    assert!(!outcome.truncations.is_empty());
+    match &outcome.transcript_segments[0].projection {
+        SegmentProjection::Text(excerpt) => assert_eq!(excerpt.text.as_str(), "hello "),
+        other => panic!("expected text projection, got {other:?}"),
+    }
+}
+
+#[test]
+fn codex_adapter_reads_session_index_and_tolerates_unknown_fields() {
+    let root = TempDir::new().expect("temporary root");
+    let sessions = root.path().join("sessions");
+    fs::create_dir_all(&sessions).expect("sessions directory");
+    fs::write(
+        root.path().join("index.jsonl"),
+        "{\"path\":\"sessions/one.jsonl\",\"extra\":42}\n",
+    )
+    .expect("write index");
+    fs::write(
+        sessions.join("one.jsonl"),
+        "{\"timestamp\":\"2026-02-01T00:00:00Z\",\"content\":\"codex answer\",\"ignored\":true}\n",
+    )
+    .expect("write session");
+    let adapter =
+        CodexTranscriptAdapter::new(TranscriptRootConfiguration::new(root.path().to_path_buf()));
+    let outcome = adapter.collect(&read_request(
+        TimeWindow::Since(Timestamp::new("2026-01-01T00:00:00Z")),
+        Projection::MetadataOnly,
+        8,
+    ));
+    assert_eq!(outcome.transcript_segments.len(), 1);
+    assert_eq!(outcome.transcript_segments[0].source, SourceKind::Codex);
+    assert!(outcome.read_failures.is_empty());
+}
+
+#[test]
+fn pi_adapter_reads_run_history_records() {
+    let root = TempDir::new().expect("temporary root");
+    fs::write(
+        root.path().join("run-history.jsonl"),
+        "{\"started_at\":\"2026-03-01T00:00:00Z\",\"output\":\"pi run output\",\"unknown\":{}}\n",
+    )
+    .expect("write run history");
+    let adapter =
+        PiTranscriptAdapter::new(TranscriptRootConfiguration::new(root.path().to_path_buf()));
+    let outcome = adapter.collect(&read_request(
+        TimeWindow::Since(Timestamp::new("2026-02-01T00:00:00Z")),
+        Projection::IdentifiersOnly,
+        8,
+    ));
+    assert_eq!(outcome.transcript_segments.len(), 1);
+    assert_eq!(outcome.transcript_segments[0].source, SourceKind::Pi);
+    assert!(matches!(
+        outcome.transcript_segments[0].projection,
+        SegmentProjection::IdentifiersOnly
+    ));
+}
+
+#[test]
+fn repository_adapter_uses_fixture_or_reports_policy_unavailable() {
+    let repository = RepositoryAdapterConfiguration::new(
+        RepositoryName::new("fixture-repository"),
+        std::env::temp_dir(),
+    );
+    let fixture = RepositoryEvidenceFixture::new(vec![
+        RepositoryChangeFixture::new(
+            RepositoryIdentifier::new("fixture-repository"),
+            SignalFilesystemPath::new("/fixture/repository"),
+            vec![RepositoryPath::new("src/lib.rs")],
+            RepositoryWorktreeState::HasChanges,
+        ),
+        RepositoryChangeFixture::new(
+            RepositoryIdentifier::new("other"),
+            SignalFilesystemPath::new("/fixture/other"),
+            vec![RepositoryPath::new("README.md")],
+            RepositoryWorktreeState::Clean,
+        ),
+    ]);
+    let fixture_outcome = RepositoryAdapter::fixture(vec![repository.clone()], fixture).collect();
+    assert_eq!(fixture_outcome.repository_changes.len(), 1);
+    let unavailable_outcome =
+        RepositoryAdapter::command_policy(vec![repository], RepositoryCommandPolicy::unavailable())
+            .collect();
+    assert_eq!(unavailable_outcome.read_failures.len(), 1);
 }

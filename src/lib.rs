@@ -16,7 +16,11 @@ pub use adapter::AdapterKind;
 pub use client::{
     AggregatorClientCommand, ConfigurationWriterCommand, MetaAggregatorClientCommand,
 };
-pub use configuration::{ConfigurationFixture, ConfigurationStore};
+pub use configuration::{
+    ConfigurationFixture, ConfigurationStore, RepositoryAdapterConfiguration, RuntimeConfiguration,
+    RuntimeConfigurationValidation, RuntimeSourceSelection, TranscriptAdapterConfiguration,
+    TranscriptRootConfiguration,
+};
 pub use daemon::AggregatorDaemonCommand;
 pub use error::{Error, Result};
 pub use nexus::NexusPlane;

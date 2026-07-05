@@ -35,8 +35,10 @@ configuration.
 
 Active repositories come from configuration. Transcript locations and formats
 are adapter-specific records, not hard-coded daemon paths. The first adapter
-modules are placeholders for Claude transcripts, Codex transcripts, Pi
-transcripts, and repositories.
+modules can read fixture/configured roots for Claude JSONL transcripts, Codex
+session roots and indexes, Pi run-history roots, and fixture or policy-backed
+repository evidence. They return normalized evidence plus typed read failures;
+daemon orchestration and durable persistence remain separate work.
 
 ## Time windows
 
@@ -74,6 +76,8 @@ tests/boundary.rs                         scaffold boundary witnesses
 
 ## Status
 
-This is a first-pass scaffold. It compiles and exposes the repo shape, contract
-dependencies, binaries, adapter modules, and boundary tests. It deliberately
-returns typed not-implemented errors rather than reading local private sources.
+This is a foundation slice. It compiles and exposes the repo shape, current
+contract dependencies, binaries, configuration validation, adapter modules, and
+boundary tests. The adapters only read explicitly configured or fixture roots;
+the Nexus/daemon path still deliberately returns typed not-implemented errors
+rather than scanning local private sources.
