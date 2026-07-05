@@ -1,13 +1,15 @@
 use std::{
     fs,
     io::Write,
+    net::Shutdown,
+    os::unix::{fs::PermissionsExt, net::UnixStream},
     process::{Child, Command, Stdio},
     thread,
     time::Duration,
 };
 
 use aggregator::{
-    AdapterKind, CollectionClock, ConfigurationFixture, ConfigurationStore, NexusPlane,
+    AdapterKind, CollectionClock, ConfigurationFixture, ConfigurationStore, Error, NexusPlane,
     ReferenceTime, RepositoryAdapterConfiguration, RuntimeConfiguration,
     RuntimeConfigurationValidation, SemaPlane, SignalPlane, TranscriptAdapterConfiguration,
     TranscriptRootConfiguration,
@@ -21,11 +23,12 @@ use aggregator::{
             RepositoryEvidenceFixture,
         },
     },
+    daemon::PrototypeSocket,
 };
 use meta_signal_aggregator::{
     ActiveRepository, AggregatorConfiguration, ConfigurationCandidate, ConfigurationChange,
-    FilesystemPath, MetaAggregatorReply, MetaAggregatorRequest, ObserveConfiguration,
-    RepositoryName, SocketMode, TranscriptRoot, TranscriptSource,
+    ConfigurationObservation, FilesystemPath, MetaAggregatorReply, MetaAggregatorRequest,
+    ObserveConfiguration, RepositoryName, SocketMode, TranscriptRoot, TranscriptSource,
 };
 use nota::{NotaEncode, NotaSource};
 use signal_aggregator::{
@@ -176,6 +179,26 @@ fn wait_for_socket(path: &std::path::Path) {
     panic!("socket did not appear: {}", path.display());
 }
 
+fn assert_socket_mode(path: &std::path::Path, expected_mode: u32) {
+    let mode = fs::metadata(path)
+        .expect("socket metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, expected_mode, "socket mode for {}", path.display());
+}
+
+fn send_malformed_socket_bytes(path: &std::path::Path) {
+    let mut stream = UnixStream::connect(path).expect("connect raw socket");
+    stream
+        .write_all(b"(Version (client_name None))")
+        .expect("write malformed socket request");
+    stream
+        .shutdown(Shutdown::Write)
+        .expect("shutdown malformed socket request");
+    thread::sleep(Duration::from_millis(50));
+}
+
 #[test]
 fn adapter_skeletons_name_the_approved_sources() {
     let root = TranscriptRootConfiguration::new(std::env::temp_dir());
@@ -262,6 +285,20 @@ fn configuration_store_round_trips_nota_file_storage() {
         .expect("write configuration");
     let decoded = store.read_configuration().expect("read configuration");
     assert_eq!(decoded, configuration);
+}
+
+#[test]
+fn prototype_socket_rejects_preexisting_regular_file() {
+    let root = TempDir::new().expect("temporary root");
+    let socket_path = root.path().join("ordinary.sock");
+    fs::write(&socket_path, "not a socket").expect("write regular file");
+
+    let error = PrototypeSocket::new(socket_path.clone(), SocketMode::new(0o660))
+        .listen()
+        .expect_err("regular file must not be removed as stale socket");
+
+    assert!(matches!(error, Error::StartupConfiguration { .. }));
+    assert!(socket_path.is_file());
 }
 
 #[test]
@@ -480,12 +517,14 @@ fn daemon_cli_boundary_handles_collect_version_and_meta_configuration() {
         &configuration.to_nota(),
     );
     let _daemon = DaemonGuard::start(&configuration_path, "2026-01-02T01:00:00Z");
-    wait_for_socket(std::path::Path::new(
-        configuration.ordinary_socket_path.as_str(),
-    ));
-    wait_for_socket(std::path::Path::new(
-        configuration.meta_socket_path.as_str(),
-    ));
+    let ordinary_socket_path = std::path::Path::new(configuration.ordinary_socket_path.as_str());
+    let meta_socket_path = std::path::Path::new(configuration.meta_socket_path.as_str());
+    wait_for_socket(ordinary_socket_path);
+    wait_for_socket(meta_socket_path);
+    assert_socket_mode(ordinary_socket_path, 0o660);
+    assert_socket_mode(meta_socket_path, 0o600);
+
+    send_malformed_socket_bytes(ordinary_socket_path);
 
     let version_output = run_binary_with_input(
         env!("CARGO_BIN_EXE_aggregator"),
@@ -578,6 +617,79 @@ fn daemon_cli_boundary_handles_collect_version_and_meta_configuration() {
             .iter()
             .any(|failure| failure.reason == ReadFailureReason::UnsupportedFormat)
     );
+}
+
+#[test]
+fn meta_configure_persists_to_startup_configuration_for_restart() {
+    let root = TempDir::new().expect("temporary root");
+    let configuration = accepted_configuration(&root);
+    let configuration_path = root.path().join("configuration.nota");
+    run_binary_with_input(
+        env!("CARGO_BIN_EXE_aggregator-write-configuration"),
+        &configuration_path,
+        &configuration.to_nota(),
+    );
+    let daemon = DaemonGuard::start(&configuration_path, "2026-01-02T01:00:00Z");
+    wait_for_socket(std::path::Path::new(
+        configuration.meta_socket_path.as_str(),
+    ));
+
+    let mut updated_configuration = configuration.clone();
+    updated_configuration.ordinary_socket_path = FilesystemPath::new(
+        root.path()
+            .join("ordinary-restarted.sock")
+            .display()
+            .to_string(),
+    );
+    updated_configuration.meta_socket_path = FilesystemPath::new(
+        root.path()
+            .join("meta-restarted.sock")
+            .display()
+            .to_string(),
+    );
+    updated_configuration.store_path =
+        FilesystemPath::new(root.path().join("future-ledger.sema").display().to_string());
+
+    let configure_output = run_binary_with_input(
+        env!("CARGO_BIN_EXE_meta-aggregator"),
+        &configuration_path,
+        &MetaAggregatorRequest::Configure(ConfigurationChange {
+            configuration: updated_configuration.clone(),
+        })
+        .to_nota(),
+    );
+    let configure_reply = NotaSource::new(&configure_output)
+        .parse::<MetaAggregatorReply>()
+        .expect("parse configure reply");
+    assert!(matches!(
+        configure_reply,
+        MetaAggregatorReply::ConfigurationConfigured(_)
+    ));
+
+    drop(daemon);
+    let _restarted_daemon = DaemonGuard::start(&configuration_path, "2026-01-02T01:00:00Z");
+    wait_for_socket(std::path::Path::new(
+        updated_configuration.meta_socket_path.as_str(),
+    ));
+
+    let observe_output = run_binary_with_input(
+        env!("CARGO_BIN_EXE_meta-aggregator"),
+        &configuration_path,
+        &MetaAggregatorRequest::ObserveConfiguration(ObserveConfiguration { observer: None })
+            .to_nota(),
+    );
+    let observe_reply = NotaSource::new(&observe_output)
+        .parse::<MetaAggregatorReply>()
+        .expect("parse observe reply");
+    match observe_reply {
+        MetaAggregatorReply::ConfigurationObserved(observed) => match observed.observation {
+            ConfigurationObservation::Configured(observed_configuration) => {
+                assert_eq!(observed_configuration, updated_configuration);
+            }
+            other => panic!("expected configured observation, got {other:?}"),
+        },
+        other => panic!("expected configuration observation, got {other:?}"),
+    }
 }
 
 #[test]
@@ -675,6 +787,30 @@ fn codex_adapter_reads_session_index_and_tolerates_unknown_fields() {
     assert_eq!(outcome.transcript_segments.len(), 1);
     assert_eq!(outcome.transcript_segments[0].source, SourceKind::Codex);
     assert!(outcome.read_failures.is_empty());
+}
+
+#[test]
+fn codex_adapter_reports_index_paths_that_escape_root_as_read_failure() {
+    let root = TempDir::new().expect("temporary root");
+    fs::write(
+        root.path().join("index.jsonl"),
+        "{\"path\":\"/outside-configured-root/session.jsonl\"}\n",
+    )
+    .expect("write escaping index");
+    let adapter =
+        CodexTranscriptAdapter::new(TranscriptRootConfiguration::new(root.path().to_path_buf()));
+    let outcome = adapter.collect(&read_request(
+        TimeWindow::Since(Timestamp::new("2026-01-01T00:00:00Z")),
+        Projection::MetadataOnly,
+        8,
+    ));
+
+    assert_eq!(outcome.read_failures.len(), 1);
+    assert_eq!(
+        outcome.read_failures[0].reason,
+        ReadFailureReason::PermissionDenied
+    );
+    assert!(outcome.transcript_segments.is_empty());
 }
 
 #[test]

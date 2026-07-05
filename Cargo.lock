@@ -10,6 +10,7 @@ dependencies = [
  "nota 0.5.1 (git+https://github.com/LiGoldragon/nota-next.git?branch=main)",
  "serde_json",
  "signal-aggregator",
+ "signal-frame",
  "tempfile",
  "thiserror",
  "time",

@@ -33,6 +33,7 @@ meta-signal-aggregator = { git = "https://github.com/LiGoldragon/meta-signal-agg
 nota                   = { package = "nota", git = "https://github.com/LiGoldragon/nota-next.git", branch = "main" }
 serde_json             = "1"
 signal-aggregator      = { git = "https://github.com/LiGoldragon/signal-aggregator", branch = "main", features = ["nota-text"] }
+signal-frame           = { git = "https://github.com/LiGoldragon/signal-frame.git", branch = "main", features = ["nota-text"] }
 thiserror              = "2"
 time                   = { version = "0.3", features = ["formatting", "parsing"] }
 

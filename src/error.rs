@@ -31,6 +31,22 @@ pub enum Error {
         detail: String,
     },
 
+    #[error("frame {context} failed: {source}")]
+    Frame {
+        context: &'static str,
+        #[source]
+        source: signal_frame::FrameError,
+    },
+
+    #[error("protocol {context} failed: {detail}")]
+    Protocol {
+        context: &'static str,
+        detail: String,
+    },
+
+    #[error("startup configuration error: {detail}")]
+    StartupConfiguration { detail: String },
+
     #[error("I/O {context} failed: {source}")]
     Io {
         context: &'static str,
@@ -49,6 +65,23 @@ impl Error {
     pub fn nota(context: &'static str, detail: impl Into<String>) -> Self {
         Self::Nota {
             context,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn frame(context: &'static str, source: signal_frame::FrameError) -> Self {
+        Self::Frame { context, source }
+    }
+
+    pub fn protocol(context: &'static str, detail: impl Into<String>) -> Self {
+        Self::Protocol {
+            context,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn startup_configuration(detail: impl Into<String>) -> Self {
+        Self::StartupConfiguration {
             detail: detail.into(),
         }
     }

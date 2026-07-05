@@ -55,8 +55,19 @@ impl ConfigurationStore {
             std::fs::create_dir_all(parent)
                 .map_err(|error| Error::io("creating configuration directory", error))?;
         }
-        std::fs::write(path, configuration.to_nota())
-            .map_err(|error| Error::io("writing configuration", error))
+        let temporary_path = self.temporary_path(path);
+        std::fs::write(&temporary_path, configuration.to_nota())
+            .map_err(|error| Error::io("writing temporary configuration", error))?;
+        std::fs::rename(&temporary_path, path)
+            .map_err(|error| Error::io("committing configuration", error))
+    }
+
+    pub fn temporary_path(&self, path: &Path) -> PathBuf {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("configuration.nota");
+        path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()))
     }
 }
 
@@ -72,11 +83,11 @@ impl ConfigurationFixture {
             meta_socket_mode: SocketMode::new(0o600),
             store_path: FilesystemPath::new("/var/lib/aggregator/aggregator.sema"),
             active_repositories: vec![ActiveRepository {
-                name: RepositoryName::new("primary"),
-                path: FilesystemPath::new("/home/li/primary"),
+                name: RepositoryName::new("example-repository"),
+                path: FilesystemPath::new("/srv/aggregator/repositories/example"),
             }],
             transcript_sources: vec![TranscriptSource::Claude(TranscriptRoot {
-                path: FilesystemPath::new("/home/li/.claude/projects"),
+                path: FilesystemPath::new("/srv/aggregator/transcripts/claude"),
             })],
             default_projection: Projection::MetadataOnly,
             default_limit_policy: LimitPolicy {

@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
 use signal_aggregator::{
@@ -159,20 +159,48 @@ impl CodexIndex {
         let mut files = Vec::new();
         for line in text.lines() {
             if let Some(path) = CodexIndexRecord::new(line).path() {
-                files.push(self.absolute_path(&path));
+                files.push(CodexIndexPath::new(self.root.clone(), path).session_path()?);
             }
         }
         files.sort();
         Ok(files)
     }
+}
 
-    pub fn absolute_path(&self, path: &str) -> PathBuf {
-        let candidate = Path::new(path);
-        if candidate.is_absolute() {
-            candidate.to_path_buf()
-        } else {
-            self.root.join(candidate)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexIndexPath {
+    root: PathBuf,
+    path: String,
+}
+
+impl CodexIndexPath {
+    pub fn new(root: PathBuf, path: String) -> Self {
+        Self { root, path }
+    }
+
+    pub fn session_path(&self) -> std::io::Result<PathBuf> {
+        let path = Path::new(&self.path);
+        if path.is_absolute() {
+            return if path.starts_with(&self.root) {
+                Ok(path.to_path_buf())
+            } else {
+                Err(self.outside_root_error())
+            };
         }
+        if path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::RootDir))
+        {
+            return Err(self.outside_root_error());
+        }
+        Ok(self.root.join(path))
+    }
+
+    pub fn outside_root_error(&self) -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "codex index path escapes configured root",
+        )
     }
 }
 
