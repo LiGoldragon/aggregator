@@ -6,6 +6,7 @@ use meta_signal_aggregator::{
     ConfigurationValidationReport, FilesystemPath, RepositoryName, SocketMode, TranscriptRoot,
     TranscriptSource, ValidationIssueDetail,
 };
+use nota::{NotaEncode, NotaSource};
 use signal_aggregator::{
     ByteLimit, LimitPolicy, Projection, RepositoryIdentifier, SegmentLimit, SelectedSources,
     SourceKind, SourceSelection,
@@ -34,7 +35,28 @@ impl ConfigurationStore {
     }
 
     pub fn read_configuration(&self) -> Result<AggregatorConfiguration> {
-        Err(Error::ConfigurationStorageNotImplemented)
+        let path = self
+            .path
+            .as_ref()
+            .ok_or(Error::ConfigurationStorageNotImplemented)?;
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| Error::io("reading configuration", error))?;
+        NotaSource::new(&text)
+            .parse::<AggregatorConfiguration>()
+            .map_err(|error| Error::nota("configuration decode", error.to_string()))
+    }
+
+    pub fn write_configuration(&self, configuration: &AggregatorConfiguration) -> Result<()> {
+        let path = self
+            .path
+            .as_ref()
+            .ok_or(Error::ConfigurationStorageNotImplemented)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| Error::io("creating configuration directory", error))?;
+        }
+        std::fs::write(path, configuration.to_nota())
+            .map_err(|error| Error::io("writing configuration", error))
     }
 }
 

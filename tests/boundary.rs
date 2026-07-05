@@ -1,9 +1,16 @@
-use std::fs;
+use std::{
+    fs,
+    io::Write,
+    process::{Child, Command, Stdio},
+    thread,
+    time::Duration,
+};
 
 use aggregator::{
-    AdapterKind, ConfigurationFixture, ConfigurationStore, NexusPlane,
-    RepositoryAdapterConfiguration, RuntimeConfiguration, RuntimeConfigurationValidation,
-    SemaPlane, SignalPlane, TranscriptAdapterConfiguration, TranscriptRootConfiguration,
+    AdapterKind, CollectionClock, ConfigurationFixture, ConfigurationStore, NexusPlane,
+    ReferenceTime, RepositoryAdapterConfiguration, RuntimeConfiguration,
+    RuntimeConfigurationValidation, SemaPlane, SignalPlane, TranscriptAdapterConfiguration,
+    TranscriptRootConfiguration,
     adapter::{
         TranscriptReadOutcome, TranscriptReadRequest, TranscriptRecord,
         claude::ClaudeTranscriptAdapter,
@@ -16,17 +23,18 @@ use aggregator::{
     },
 };
 use meta_signal_aggregator::{
-    ActiveRepository, AggregatorConfiguration, ConfigurationChange, FilesystemPath,
-    MetaAggregatorReply, RepositoryName, SocketMode, TranscriptRoot, TranscriptSource,
+    ActiveRepository, AggregatorConfiguration, ConfigurationCandidate, ConfigurationChange,
+    FilesystemPath, MetaAggregatorReply, MetaAggregatorRequest, ObserveConfiguration,
+    RepositoryName, SocketMode, TranscriptRoot, TranscriptSource,
 };
 use nota::{NotaEncode, NotaSource};
 use signal_aggregator::{
-    AggregatorReply, BoundedTextProjection, ByteLimit, DurationAmount, DurationUnit,
-    EvidenceRequest, FilesystemPath as SignalFilesystemPath, LimitPolicy, Projection,
-    ReadFailureReason, RejectionReason, RelativeDuration, RepositoryIdentifier, RepositoryPath,
-    RepositoryWorktreeState, RequestIdentifier, SegmentLimit, SegmentProjection, SelectedSources,
-    SourceIdentifier, SourceKind, SourceSelection, TimeRange, TimeWindow, Timestamp,
-    TruncationReason,
+    AggregatorReply, AggregatorRequest, BoundedTextProjection, ByteLimit, ContractName,
+    DurationAmount, DurationUnit, EvidenceRequest, FilesystemPath as SignalFilesystemPath,
+    LimitPolicy, Projection, ReadFailureReason, RejectionReason, RelativeDuration,
+    RepositoryIdentifier, RepositoryPath, RepositoryWorktreeState, RequestIdentifier, SegmentLimit,
+    SegmentProjection, SelectedSources, SourceIdentifier, SourceKind, SourceSelection, TimeRange,
+    TimeWindow, Timestamp, TruncationReason, Version,
 };
 use tempfile::TempDir;
 
@@ -105,6 +113,69 @@ fn accepted_configuration(root: &TempDir) -> AggregatorConfiguration {
     }
 }
 
+fn run_binary_with_input(
+    binary: &str,
+    configuration_path: &std::path::Path,
+    input: &str,
+) -> String {
+    let mut child = Command::new(binary)
+        .arg("--configuration")
+        .arg(configuration_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn binary");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(input.as_bytes())
+        .expect("write stdin");
+    let output = child.wait_with_output().expect("wait for binary");
+    assert!(
+        output.status.success(),
+        "binary failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("utf8 stdout")
+}
+
+struct DaemonGuard {
+    child: Child,
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl DaemonGuard {
+    fn start(configuration_path: &std::path::Path, reference_timestamp: &str) -> Self {
+        let child = Command::new(env!("CARGO_BIN_EXE_aggregator-daemon"))
+            .arg("--configuration")
+            .arg(configuration_path)
+            .env("AGGREGATOR_REFERENCE_TIMESTAMP", reference_timestamp)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn daemon");
+        Self { child }
+    }
+}
+
+fn wait_for_socket(path: &std::path::Path) {
+    for _ in 0..100 {
+        if path.exists() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("socket did not appear: {}", path.display());
+}
+
 #[test]
 fn adapter_skeletons_name_the_approved_sources() {
     let root = TranscriptRootConfiguration::new(std::env::temp_dir());
@@ -166,13 +237,14 @@ fn configuration_fixture_round_trips_through_nota() {
 
 #[test]
 fn sema_scaffold_observes_and_configures_typed_configuration() {
+    let root = TempDir::new().expect("temporary root");
     let mut sema = SemaPlane::empty();
     assert!(matches!(
         sema.observe_configuration(),
         MetaAggregatorReply::ConfigurationObserved(_)
     ));
     let configured = sema.configure(ConfigurationChange {
-        configuration: ConfigurationFixture::minimal(),
+        configuration: accepted_configuration(&root),
     });
     assert!(matches!(
         configured,
@@ -181,12 +253,15 @@ fn sema_scaffold_observes_and_configures_typed_configuration() {
 }
 
 #[test]
-fn configuration_store_names_missing_storage() {
-    let store = ConfigurationStore::in_memory();
-    let error = store
-        .read_configuration()
-        .expect_err("storage is intentionally skeletal");
-    assert!(error.to_string().contains("not implemented"));
+fn configuration_store_round_trips_nota_file_storage() {
+    let root = TempDir::new().expect("temporary root");
+    let configuration = accepted_configuration(&root);
+    let store = ConfigurationStore::at_path(root.path().join("configuration.nota"));
+    store
+        .write_configuration(&configuration)
+        .expect("write configuration");
+    let decoded = store.read_configuration().expect("read configuration");
+    assert_eq!(decoded, configuration);
 }
 
 #[test]
@@ -335,6 +410,173 @@ fn recent_time_window_reports_unsupported_without_projecting_transcripts() {
     assert_eq!(
         outcome.read_failures[0].reason,
         ReadFailureReason::UnsupportedFormat
+    );
+}
+
+#[test]
+fn nexus_lowers_recent_window_before_transcript_adapters() {
+    let root = TempDir::new().expect("temporary root");
+    let configuration = accepted_configuration(&root);
+    fs::write(
+        root.path().join("claude/project.jsonl"),
+        concat!(
+            "{\"timestamp\":\"2026-01-01T00:00:00Z\",\"text\":\"old\"}\n",
+            "{\"text\":\"timestampless\"}\n",
+            "{\"timestamp\":\"2026-01-02T00:30:00Z\",\"text\":\"recent\"}\n",
+        ),
+    )
+    .expect("write transcript");
+    let runtime = RuntimeConfiguration::validate_from_meta(&configuration)
+        .accepted_configuration()
+        .expect("accepted configuration")
+        .clone();
+    let clock = CollectionClock::fixed(
+        ReferenceTime::from_timestamp(Timestamp::new("2026-01-02T01:00:00Z"))
+            .expect("reference timestamp"),
+    );
+    let request = EvidenceRequest {
+        source_selection: SourceSelection::Only(SelectedSources {
+            sources: vec![SourceKind::Claude],
+        }),
+        ..evidence_request()
+    };
+    let package = NexusPlane::with_runtime_configuration(runtime, clock)
+        .collect(request)
+        .expect("collect through nexus");
+
+    assert_eq!(package.transcript_segments.len(), 1);
+    assert_eq!(
+        package.transcript_segments[0]
+            .timestamp
+            .as_ref()
+            .map(|value| value.as_str()),
+        Some("2026-01-02T00:30:00Z")
+    );
+    assert!(
+        !package
+            .read_failures
+            .iter()
+            .any(|failure| failure.reason == ReadFailureReason::UnsupportedFormat)
+    );
+}
+
+#[test]
+fn daemon_cli_boundary_handles_collect_version_and_meta_configuration() {
+    let root = TempDir::new().expect("temporary root");
+    let configuration = accepted_configuration(&root);
+    fs::write(
+        root.path().join("claude/project.jsonl"),
+        concat!(
+            "{\"timestamp\":\"2026-01-01T00:00:00Z\",\"text\":\"old\"}\n",
+            "{\"text\":\"timestampless\"}\n",
+            "{\"timestamp\":\"2026-01-02T00:30:00Z\",\"text\":\"recent\"}\n",
+        ),
+    )
+    .expect("write transcript");
+    let configuration_path = root.path().join("configuration.nota");
+    run_binary_with_input(
+        env!("CARGO_BIN_EXE_aggregator-write-configuration"),
+        &configuration_path,
+        &configuration.to_nota(),
+    );
+    let _daemon = DaemonGuard::start(&configuration_path, "2026-01-02T01:00:00Z");
+    wait_for_socket(std::path::Path::new(
+        configuration.ordinary_socket_path.as_str(),
+    ));
+    wait_for_socket(std::path::Path::new(
+        configuration.meta_socket_path.as_str(),
+    ));
+
+    let version_output = run_binary_with_input(
+        env!("CARGO_BIN_EXE_aggregator"),
+        &configuration_path,
+        &AggregatorRequest::Version(Version {
+            client_name: Some(ContractName::new("boundary-test")),
+        })
+        .to_nota(),
+    );
+    let version_reply = NotaSource::new(&version_output)
+        .parse::<AggregatorReply>()
+        .expect("parse version reply");
+    assert!(matches!(version_reply, AggregatorReply::VersionReported(_)));
+
+    let observe_output = run_binary_with_input(
+        env!("CARGO_BIN_EXE_meta-aggregator"),
+        &configuration_path,
+        &MetaAggregatorRequest::ObserveConfiguration(ObserveConfiguration { observer: None })
+            .to_nota(),
+    );
+    let observe_reply = NotaSource::new(&observe_output)
+        .parse::<MetaAggregatorReply>()
+        .expect("parse observe reply");
+    assert!(matches!(
+        observe_reply,
+        MetaAggregatorReply::ConfigurationObserved(_)
+    ));
+
+    let validate_output = run_binary_with_input(
+        env!("CARGO_BIN_EXE_meta-aggregator"),
+        &configuration_path,
+        &MetaAggregatorRequest::ValidateConfiguration(ConfigurationCandidate {
+            configuration: configuration.clone(),
+        })
+        .to_nota(),
+    );
+    let validate_reply = NotaSource::new(&validate_output)
+        .parse::<MetaAggregatorReply>()
+        .expect("parse validate reply");
+    assert!(matches!(
+        validate_reply,
+        MetaAggregatorReply::ConfigurationValidated(_)
+    ));
+
+    let configure_output = run_binary_with_input(
+        env!("CARGO_BIN_EXE_meta-aggregator"),
+        &configuration_path,
+        &MetaAggregatorRequest::Configure(ConfigurationChange {
+            configuration: configuration.clone(),
+        })
+        .to_nota(),
+    );
+    let configure_reply = NotaSource::new(&configure_output)
+        .parse::<MetaAggregatorReply>()
+        .expect("parse configure reply");
+    assert!(matches!(
+        configure_reply,
+        MetaAggregatorReply::ConfigurationConfigured(_)
+    ));
+
+    let collect_request = EvidenceRequest {
+        source_selection: SourceSelection::Only(SelectedSources {
+            sources: vec![SourceKind::Claude],
+        }),
+        ..evidence_request()
+    };
+    let collect_output = run_binary_with_input(
+        env!("CARGO_BIN_EXE_aggregator"),
+        &configuration_path,
+        &AggregatorRequest::Collect(collect_request).to_nota(),
+    );
+    let collect_reply = NotaSource::new(&collect_output)
+        .parse::<AggregatorReply>()
+        .expect("parse collect reply");
+    let package = match collect_reply {
+        AggregatorReply::EvidenceCollected(package) => package,
+        other => panic!("expected collected evidence, got {other:?}"),
+    };
+    assert_eq!(package.transcript_segments.len(), 1);
+    assert_eq!(
+        package.transcript_segments[0]
+            .timestamp
+            .as_ref()
+            .map(|value| value.as_str()),
+        Some("2026-01-02T00:30:00Z")
+    );
+    assert!(
+        !package
+            .read_failures
+            .iter()
+            .any(|failure| failure.reason == ReadFailureReason::UnsupportedFormat)
     );
 }
 

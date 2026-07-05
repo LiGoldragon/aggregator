@@ -13,9 +13,47 @@ pub enum Error {
     #[error("configuration storage is not implemented in the scaffold")]
     ConfigurationStorageNotImplemented,
 
+    #[error("configuration is unavailable")]
+    ConfigurationUnavailable,
+
     #[error("{adapter:?} collection is not implemented in the scaffold")]
     CollectionNotImplemented { adapter: AdapterKind },
 
     #[error("argument error: {detail}")]
     Argument { detail: String },
+
+    #[error("clock error: {detail}")]
+    Clock { detail: String },
+
+    #[error("NOTA {context} failed: {detail}")]
+    Nota {
+        context: &'static str,
+        detail: String,
+    },
+
+    #[error("I/O {context} failed: {source}")]
+    Io {
+        context: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+impl Error {
+    pub fn argument(detail: impl Into<String>) -> Self {
+        Self::Argument {
+            detail: detail.into(),
+        }
+    }
+
+    pub fn nota(context: &'static str, detail: impl Into<String>) -> Self {
+        Self::Nota {
+            context,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn io(context: &'static str, source: std::io::Error) -> Self {
+        Self::Io { context, source }
+    }
 }

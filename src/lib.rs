@@ -5,6 +5,7 @@
 
 pub mod adapter;
 pub mod client;
+pub mod clock;
 pub mod configuration;
 pub mod daemon;
 pub mod error;
@@ -16,6 +17,7 @@ pub use adapter::AdapterKind;
 pub use client::{
     AggregatorClientCommand, ConfigurationWriterCommand, MetaAggregatorClientCommand,
 };
+pub use clock::{CollectionClock, ReferenceTime};
 pub use configuration::{
     ConfigurationFixture, ConfigurationStore, RepositoryAdapterConfiguration, RuntimeConfiguration,
     RuntimeConfigurationValidation, RuntimeSourceSelection, TranscriptAdapterConfiguration,
