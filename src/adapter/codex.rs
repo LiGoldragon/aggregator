@@ -180,20 +180,35 @@ impl CodexIndexPath {
 
     pub fn session_path(&self) -> std::io::Result<PathBuf> {
         let path = Path::new(&self.path);
-        if path.is_absolute() {
-            return if path.starts_with(&self.root) {
-                Ok(path.to_path_buf())
+        let candidate = if path.is_absolute() {
+            if path.starts_with(&self.root) {
+                path.to_path_buf()
             } else {
-                Err(self.outside_root_error())
-            };
+                return Err(self.outside_root_error());
+            }
+        } else {
+            if path
+                .components()
+                .any(|component| matches!(component, Component::ParentDir | Component::RootDir))
+            {
+                return Err(self.outside_root_error());
+            }
+            self.root.join(path)
+        };
+        self.root_bound_session_path(candidate)
+    }
+
+    pub fn root_bound_session_path(&self, candidate: PathBuf) -> std::io::Result<PathBuf> {
+        if !candidate.exists() {
+            return Ok(candidate);
         }
-        if path
-            .components()
-            .any(|component| matches!(component, Component::ParentDir | Component::RootDir))
-        {
-            return Err(self.outside_root_error());
+        let canonical_root = self.root.canonicalize()?;
+        let canonical_candidate = candidate.canonicalize()?;
+        if canonical_candidate.starts_with(canonical_root) {
+            Ok(candidate)
+        } else {
+            Err(self.outside_root_error())
         }
-        Ok(self.root.join(path))
     }
 
     pub fn outside_root_error(&self) -> std::io::Error {

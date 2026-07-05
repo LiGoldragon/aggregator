@@ -2,7 +2,10 @@ use std::{
     fs,
     io::Write,
     net::Shutdown,
-    os::unix::{fs::PermissionsExt, net::UnixStream},
+    os::unix::{
+        fs::{PermissionsExt, symlink},
+        net::UnixStream,
+    },
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
@@ -845,6 +848,40 @@ fn codex_adapter_reports_index_paths_that_escape_root_as_read_failure() {
         "{\"path\":\"/outside-configured-root/session.jsonl\"}\n",
     )
     .expect("write escaping index");
+    let adapter =
+        CodexTranscriptAdapter::new(TranscriptRootConfiguration::new(root.path().to_path_buf()));
+    let outcome = adapter.collect(&read_request(
+        TimeWindow::Since(Timestamp::new("2026-01-01T00:00:00Z")),
+        Projection::MetadataOnly,
+        8,
+    ));
+
+    assert_eq!(outcome.read_failures.len(), 1);
+    assert_eq!(
+        outcome.read_failures[0].reason,
+        ReadFailureReason::PermissionDenied
+    );
+    assert!(outcome.transcript_segments.is_empty());
+}
+
+#[test]
+fn codex_adapter_reports_symlinked_index_paths_that_escape_root_as_read_failure() {
+    let root = TempDir::new().expect("temporary root");
+    let outside_root = TempDir::new().expect("outside temporary root");
+    let sessions = root.path().join("sessions");
+    fs::create_dir_all(&sessions).expect("sessions directory");
+    let outside_session = outside_root.path().join("session.jsonl");
+    fs::write(
+        &outside_session,
+        "{\"timestamp\":\"2026-02-01T00:00:00Z\",\"content\":\"outside codex answer\"}\n",
+    )
+    .expect("write outside session");
+    symlink(&outside_session, sessions.join("escape.jsonl")).expect("session symlink");
+    fs::write(
+        root.path().join("index.jsonl"),
+        "{\"path\":\"sessions/escape.jsonl\"}\n",
+    )
+    .expect("write symlink index");
     let adapter =
         CodexTranscriptAdapter::new(TranscriptRootConfiguration::new(root.path().to_path_buf()));
     let outcome = adapter.collect(&read_request(
