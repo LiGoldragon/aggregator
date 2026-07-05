@@ -54,9 +54,13 @@ impl SemaPlane {
                 reason: ConfigurationRejectionReason::InvalidConfiguration,
             });
         }
-        if let Some(store) = &self.store
-            && store.write_configuration(&change.configuration).is_err()
-        {
+        let Some(store) = &self.store else {
+            return MetaAggregatorReply::ConfigurationRejected(ConfigurationRejected {
+                operation: MetaAggregatorOperationKind::Configure,
+                reason: ConfigurationRejectionReason::StoreUnavailable,
+            });
+        };
+        if store.write_configuration(&change.configuration).is_err() {
             return MetaAggregatorReply::ConfigurationRejected(ConfigurationRejected {
                 operation: MetaAggregatorOperationKind::Configure,
                 reason: ConfigurationRejectionReason::StoreUnavailable,

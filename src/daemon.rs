@@ -110,8 +110,11 @@ impl PrototypeDaemon {
             self.configuration.meta_socket_mode,
             self.sema.clone(),
         );
-        let ordinary_thread = thread::spawn(move || ordinary_service.serve());
-        let meta_thread = thread::spawn(move || meta_service.serve());
+        let meta_listener = meta_service.listen()?;
+        let ordinary_listener = ordinary_service.listen()?;
+        let ordinary_thread =
+            thread::spawn(move || ordinary_service.serve_listener(ordinary_listener));
+        let meta_thread = thread::spawn(move || meta_service.serve_listener(meta_listener));
         ordinary_thread
             .join()
             .map_err(|_| Error::argument("ordinary socket thread panicked"))??;
@@ -145,8 +148,16 @@ impl OrdinarySocketService {
         }
     }
 
+    pub fn listen(&self) -> Result<UnixListener> {
+        PrototypeSocket::new(self.socket_path.clone(), self.socket_mode).listen()
+    }
+
     pub fn serve(&self) -> Result<()> {
-        let listener = PrototypeSocket::new(self.socket_path.clone(), self.socket_mode).listen()?;
+        let listener = self.listen()?;
+        self.serve_listener(listener)
+    }
+
+    pub fn serve_listener(&self, listener: UnixListener) -> Result<()> {
         for stream in listener.incoming() {
             let stream =
                 stream.map_err(|error| Error::io("accepting ordinary connection", error))?;
@@ -188,8 +199,16 @@ impl MetaSocketService {
         }
     }
 
+    pub fn listen(&self) -> Result<UnixListener> {
+        PrototypeSocket::new(self.socket_path.clone(), self.socket_mode).listen()
+    }
+
     pub fn serve(&self) -> Result<()> {
-        let listener = PrototypeSocket::new(self.socket_path.clone(), self.socket_mode).listen()?;
+        let listener = self.listen()?;
+        self.serve_listener(listener)
+    }
+
+    pub fn serve_listener(&self, listener: UnixListener) -> Result<()> {
         for stream in listener.incoming() {
             let stream = stream.map_err(|error| Error::io("accepting meta connection", error))?;
             let _connection_result = self.handle_stream(stream);

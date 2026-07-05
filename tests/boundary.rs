@@ -4,6 +4,7 @@ use std::{
     net::Shutdown,
     os::unix::{fs::PermissionsExt, net::UnixStream},
     process::{Child, Command, Stdio},
+    sync::{Arc, Mutex},
     thread,
     time::Duration,
 };
@@ -23,7 +24,7 @@ use aggregator::{
             RepositoryEvidenceFixture,
         },
     },
-    daemon::PrototypeSocket,
+    daemon::{PrototypeDaemon, PrototypeSocket},
 };
 use meta_signal_aggregator::{
     ActiveRepository, AggregatorConfiguration, ConfigurationCandidate, ConfigurationChange,
@@ -259,7 +260,7 @@ fn configuration_fixture_round_trips_through_nota() {
 }
 
 #[test]
-fn sema_scaffold_observes_and_configures_typed_configuration() {
+fn sema_scaffold_observes_configuration_and_rejects_configuration_without_store() {
     let root = TempDir::new().expect("temporary root");
     let mut sema = SemaPlane::empty();
     assert!(matches!(
@@ -271,8 +272,30 @@ fn sema_scaffold_observes_and_configures_typed_configuration() {
     });
     assert!(matches!(
         configured,
+        MetaAggregatorReply::ConfigurationRejected(rejection)
+            if rejection.reason == meta_signal_aggregator::ConfigurationRejectionReason::StoreUnavailable
+    ));
+}
+
+#[test]
+fn sema_configure_persists_typed_configuration_when_store_is_available() {
+    let root = TempDir::new().expect("temporary root");
+    let configuration = accepted_configuration(&root);
+    let store = ConfigurationStore::at_path(root.path().join("configuration.nota"));
+    let mut sema = SemaPlane::with_configuration_store(configuration.clone(), store.clone());
+
+    let configured = sema.configure(ConfigurationChange {
+        configuration: configuration.clone(),
+    });
+
+    assert!(matches!(
+        configured,
         MetaAggregatorReply::ConfigurationConfigured(_)
     ));
+    assert_eq!(
+        store.read_configuration().expect("persisted configuration"),
+        configuration
+    );
 }
 
 #[test]
@@ -299,6 +322,31 @@ fn prototype_socket_rejects_preexisting_regular_file() {
 
     assert!(matches!(error, Error::StartupConfiguration { .. }));
     assert!(socket_path.is_file());
+}
+
+#[test]
+fn daemon_startup_rejects_meta_regular_file_before_serving_ordinary_socket() {
+    let root = TempDir::new().expect("temporary root");
+    let configuration = accepted_configuration(&root);
+    let ordinary_socket_path =
+        std::path::PathBuf::from(configuration.ordinary_socket_path.as_str());
+    let meta_socket_path = std::path::PathBuf::from(configuration.meta_socket_path.as_str());
+    fs::write(&meta_socket_path, "not a socket").expect("write regular file");
+    let sema = Arc::new(Mutex::new(SemaPlane::with_configuration(
+        configuration.clone(),
+    )));
+    let clock = CollectionClock::fixed(
+        ReferenceTime::from_timestamp(Timestamp::new("2026-01-02T01:00:00Z"))
+            .expect("reference timestamp"),
+    );
+
+    let error = PrototypeDaemon::new(configuration, sema, clock)
+        .run()
+        .expect_err("meta startup failure should return promptly");
+
+    assert!(matches!(error, Error::StartupConfiguration { .. }));
+    assert!(meta_socket_path.is_file());
+    assert!(!ordinary_socket_path.exists());
 }
 
 #[test]
