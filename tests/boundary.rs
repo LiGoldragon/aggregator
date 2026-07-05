@@ -18,9 +18,9 @@ use aggregator::{
     RuntimeConfigurationValidation, SemaPlane, SignalPlane, TranscriptAdapterConfiguration,
     TranscriptRootConfiguration,
     adapter::{
-        TranscriptReadOutcome, TranscriptReadRequest, TranscriptRecord,
-        claude::ClaudeTranscriptAdapter,
-        codex::CodexTranscriptAdapter,
+        TranscriptReadOutcome, TranscriptReadRequest, TranscriptRecord, TranscriptScanLimits,
+        claude::{ClaudeJsonlRootReader, ClaudeTranscriptAdapter},
+        codex::{CodexSessionRootReader, CodexTranscriptAdapter},
         pi::PiTranscriptAdapter,
         repository::{
             RepositoryAdapter, RepositoryChangeFixture, RepositoryCommandPolicy,
@@ -429,6 +429,137 @@ fn claude_jsonl_adapter_projects_bounded_text_and_reports_malformed_lines() {
         SegmentProjection::Text(excerpt) => assert_eq!(excerpt.text.as_str(), "hello "),
         other => panic!("expected text projection, got {other:?}"),
     }
+}
+
+#[test]
+fn transcript_reader_reports_file_limit_without_unbounded_read() {
+    let root = TempDir::new().expect("temporary root");
+    fs::write(
+        root.path().join("too-large.jsonl"),
+        "{\"timestamp\":\"2026-01-02T00:00:00Z\",\"text\":\"this fixture exceeds the small runtime read cap\"}\n",
+    )
+    .expect("write oversized fixture transcript");
+    let reader = ClaudeJsonlRootReader::with_limits(
+        root.path().to_path_buf(),
+        TranscriptScanLimits::new(16, 16, 32, 1024, 8),
+    );
+    let outcome = reader.collect(&read_request(
+        TimeWindow::Since(Timestamp::new("2026-01-01T00:00:00Z")),
+        Projection::MetadataOnly,
+        8,
+    ));
+
+    assert!(outcome.transcript_segments.is_empty());
+    assert!(outcome.read_failures.is_empty());
+    assert_eq!(outcome.truncations.len(), 1);
+    let truncated_path = outcome.truncations[0]
+        .path
+        .as_ref()
+        .map(|path| path.as_str());
+    let expected_path = root.path().join("too-large.jsonl").display().to_string();
+    assert_eq!(truncated_path, Some(expected_path.as_str()));
+    assert!(
+        outcome.truncations[0]
+            .original_bytes
+            .as_ref()
+            .is_some_and(|count| count.into_u64() > 32)
+    );
+}
+
+#[test]
+fn transcript_reader_caps_file_discovery_line_size_and_failure_reports() {
+    let root = TempDir::new().expect("temporary root");
+    fs::write(
+        root.path().join("first.jsonl"),
+        concat!(
+            "not-json\n",
+            "{\"timestamp\":\"2026-01-02T00:00:00Z\",\"text\":\"this line is too large for the small test cap\"}\n",
+            "also-not-json\n",
+        ),
+    )
+    .expect("write first fixture transcript");
+    fs::write(
+        root.path().join("second.jsonl"),
+        "{\"timestamp\":\"2026-01-02T00:00:00Z\",\"text\":\"second\"}\n",
+    )
+    .expect("write second fixture transcript");
+    let reader = ClaudeJsonlRootReader::with_limits(
+        root.path().to_path_buf(),
+        TranscriptScanLimits::new(16, 1, 4096, 32, 1),
+    );
+    let outcome = reader.collect(&read_request(
+        TimeWindow::Since(Timestamp::new("2026-01-01T00:00:00Z")),
+        Projection::MetadataOnly,
+        8,
+    ));
+
+    assert!(outcome.transcript_segments.is_empty());
+    assert_eq!(outcome.read_failures.len(), 1);
+    assert_eq!(
+        outcome.read_failures[0].reason,
+        ReadFailureReason::Malformed
+    );
+    assert!(outcome.truncations.len() >= 3);
+    assert!(outcome.truncations.iter().any(|truncation| {
+        truncation
+            .path
+            .as_ref()
+            .is_some_and(|path| path.as_str().contains("second.jsonl"))
+    }));
+    assert!(outcome.truncations.iter().any(|truncation| {
+        truncation
+            .path
+            .as_ref()
+            .is_some_and(|path| path.as_str().contains("first.jsonl:2"))
+    }));
+}
+
+#[test]
+fn canonical_timestamp_model_rejects_non_z_offsets_as_malformed_input() {
+    let root = TempDir::new().expect("temporary root");
+    fs::write(
+        root.path().join("project.jsonl"),
+        concat!(
+            "{\"timestamp\":\"2026-01-02T01:00:00+01:00\",\"text\":\"offset\"}\n",
+            "{\"timestamp\":\"2026-01-02T00:00:00Z\",\"text\":\"canonical\"}\n",
+        ),
+    )
+    .expect("write timestamp fixture transcript");
+    let adapter =
+        ClaudeTranscriptAdapter::new(TranscriptRootConfiguration::new(root.path().to_path_buf()));
+    let outcome = adapter.collect(&read_request(
+        TimeWindow::Since(Timestamp::new("2026-01-01T00:00:00Z")),
+        Projection::MetadataOnly,
+        8,
+    ));
+
+    assert_eq!(outcome.transcript_segments.len(), 1);
+    assert_eq!(outcome.read_failures.len(), 1);
+    assert_eq!(
+        outcome.read_failures[0].reason,
+        ReadFailureReason::Malformed
+    );
+    assert!(
+        outcome.read_failures[0]
+            .path
+            .as_ref()
+            .is_some_and(|path| path.as_str().contains("project.jsonl:1"))
+    );
+}
+
+#[test]
+fn signal_plane_rejects_non_canonical_time_windows() {
+    let request = EvidenceRequest {
+        time_window: TimeWindow::Since(Timestamp::new("2026-01-02T01:00:00+01:00")),
+        ..evidence_request()
+    };
+
+    let rejection = SignalPlane
+        .collect_rejection(&request)
+        .expect("offset window must be rejected");
+    assert!(
+        matches!(rejection, AggregatorReply::EvidenceRejected(rejection) if rejection.reason == RejectionReason::InvalidTimeWindow)
+    );
 }
 
 #[test]
@@ -861,6 +992,50 @@ fn codex_adapter_reports_index_paths_that_escape_root_as_read_failure() {
         outcome.read_failures[0].reason,
         ReadFailureReason::PermissionDenied
     );
+    assert!(
+        outcome.read_failures[0]
+            .path
+            .as_ref()
+            .is_some_and(|path| path.as_str().contains("index.jsonl:1"))
+    );
+    assert!(
+        outcome.read_failures[0]
+            .source_identifier
+            .as_ref()
+            .is_some_and(|identifier| identifier
+                .as_str()
+                .contains("locator:/outside-configured-root/session.jsonl"))
+    );
+    assert!(outcome.transcript_segments.is_empty());
+}
+
+#[test]
+fn codex_adapter_reports_malformed_index_lines_with_index_line_context() {
+    let root = TempDir::new().expect("temporary root");
+    fs::write(root.path().join("index.jsonl"), "not-json\n{}").expect("write malformed index");
+    let reader = CodexSessionRootReader::with_limits(
+        root.path().to_path_buf(),
+        TranscriptScanLimits::new(16, 16, 4096, 128, 8),
+    );
+    let outcome = reader.collect(&read_request(
+        TimeWindow::Since(Timestamp::new("2026-01-01T00:00:00Z")),
+        Projection::MetadataOnly,
+        8,
+    ));
+
+    assert_eq!(outcome.read_failures.len(), 2);
+    assert!(outcome.read_failures.iter().any(|failure| {
+        failure
+            .path
+            .as_ref()
+            .is_some_and(|path| path.as_str().contains("index.jsonl:1"))
+    }));
+    assert!(outcome.read_failures.iter().any(|failure| {
+        failure
+            .path
+            .as_ref()
+            .is_some_and(|path| path.as_str().contains("index.jsonl:2"))
+    }));
     assert!(outcome.transcript_segments.is_empty());
 }
 

@@ -3,6 +3,8 @@ use signal_aggregator::{
     EvidenceRequest, RejectionReason, RequestIdentifier, TimeWindow, VersionReport,
 };
 
+use crate::time_model::CanonicalTimestamp;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SignalPlane;
 
@@ -42,14 +44,20 @@ impl SignalPlane {
                 }
             }
             TimeWindow::Range(range) => {
-                if range.start.as_str() > range.end.as_str() {
+                let Ok(start) = CanonicalTimestamp::parse(&range.start) else {
+                    return Some(RejectionReason::InvalidTimeWindow);
+                };
+                let Ok(end) = CanonicalTimestamp::parse(&range.end) else {
+                    return Some(RejectionReason::InvalidTimeWindow);
+                };
+                if start.is_after(&end) {
                     Some(RejectionReason::InvalidTimeWindow)
                 } else {
                     None
                 }
             }
             TimeWindow::Since(timestamp) => {
-                if timestamp.as_str().is_empty() {
+                if CanonicalTimestamp::parse(timestamp).is_err() {
                     Some(RejectionReason::InvalidTimeWindow)
                 } else {
                     None

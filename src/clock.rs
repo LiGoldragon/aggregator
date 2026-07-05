@@ -1,7 +1,7 @@
 use signal_aggregator::{RelativeDuration, TimeRange, TimeWindow, Timestamp};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::{Error, Result};
+use crate::{Error, Result, time_model::CanonicalTimestamp};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectionClock {
@@ -53,13 +53,14 @@ impl ReferenceTime {
     }
 
     pub fn from_timestamp(timestamp: Timestamp) -> Result<Self> {
-        let instant =
-            OffsetDateTime::parse(timestamp.as_str(), &Rfc3339).map_err(|error| Error::Clock {
+        let instant = CanonicalTimestamp::parse(&timestamp)
+            .map_err(|error| Error::Clock {
                 detail: format!(
-                    "invalid reference timestamp {}: {error}",
+                    "invalid reference timestamp {}: {error:?}",
                     timestamp.as_str()
                 ),
-            })?;
+            })?
+            .instant();
         Ok(Self { instant })
     }
 

@@ -8,9 +8,13 @@ use signal_aggregator::{
 use crate::{
     AdapterKind,
     adapter::{
-        TranscriptFileDiscovery, TranscriptReadOutcome, TranscriptReadRequest, TranscriptRecord,
+        TranscriptBoundedFile, TranscriptBoundedFileRead, TranscriptFailureAccumulator,
+        TranscriptFileDiscovery, TranscriptLineLocator, TranscriptLineText,
+        TranscriptLineTextOutcome, TranscriptReadOutcome, TranscriptReadRequest, TranscriptRecord,
+        TranscriptScanLimits,
     },
     configuration::TranscriptRootConfiguration,
+    time_model::CanonicalTimestamp,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,11 +39,16 @@ impl CodexTranscriptAdapter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexSessionRootReader {
     root: PathBuf,
+    limits: TranscriptScanLimits,
 }
 
 impl CodexSessionRootReader {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self::with_limits(root, TranscriptScanLimits::default_runtime())
+    }
+
+    pub fn with_limits(root: PathBuf, limits: TranscriptScanLimits) -> Self {
+        Self { root, limits }
     }
 
     pub fn collect(&self, request: &TranscriptReadRequest) -> TranscriptReadOutcome {
@@ -58,8 +67,8 @@ impl CodexSessionRootReader {
                 request,
             );
         }
-        let files = match self.session_files() {
-            Ok(files) => files,
+        let session_files = match self.session_files() {
+            Ok(session_files) => session_files,
             Err(error) => {
                 return TranscriptReadOutcome::from_records(
                     SourceKind::Codex,
@@ -71,30 +80,62 @@ impl CodexSessionRootReader {
             }
         };
         let mut records = Vec::new();
-        let mut failures = Vec::new();
-        for file in files {
-            match std::fs::read_to_string(&file) {
-                Ok(text) => self.read_file_lines(&file, &text, &mut records, &mut failures),
+        let mut failures = TranscriptFailureAccumulator::new(
+            SourceKind::Codex,
+            Some(self.root.clone()),
+            self.limits.maximum_failures(),
+        );
+        for failure in session_files.read_failures {
+            failures.push(failure);
+        }
+        let mut truncations = session_files.truncations;
+        for file in session_files.files {
+            match TranscriptBoundedFile::new(file.clone(), self.limits.clone()).read_to_string() {
+                Ok(TranscriptBoundedFileRead::Text(text)) => self.read_file_lines(
+                    &file,
+                    &text,
+                    &mut records,
+                    &mut failures,
+                    &mut truncations,
+                ),
+                Ok(TranscriptBoundedFileRead::Truncated(truncation)) => {
+                    truncations.push(truncation.into_truncation(SourceKind::Codex));
+                }
                 Err(error) => failures.push(self.failure_from_io(error, Some(file))),
             }
         }
-        TranscriptReadOutcome::from_records(
+        let failure_outcome = failures.finish();
+        truncations.extend(failure_outcome.truncations);
+        TranscriptReadOutcome::from_records_and_truncations(
             SourceKind::Codex,
             source_identifier,
             records,
-            failures,
+            failure_outcome.failures,
+            truncations,
             request,
         )
     }
 
-    pub fn session_files(&self) -> std::io::Result<Vec<PathBuf>> {
+    pub fn session_files(&self) -> std::io::Result<CodexSessionFiles> {
         let index_path = self.root.join("index.jsonl");
         if index_path.exists() {
-            return CodexIndex::new(self.root.clone(), index_path).session_files();
+            return CodexIndex::new(self.root.clone(), index_path, self.limits.clone())
+                .session_files();
         }
-        let mut files = TranscriptFileDiscovery::new(self.root.clone()).jsonl_files()?;
+        let discovery =
+            TranscriptFileDiscovery::with_limits(self.root.clone(), self.limits.clone())
+                .discover_jsonl_files()?;
+        let mut files = discovery.files;
         files.retain(|path| path.file_name().is_none_or(|name| name != "index.jsonl"));
-        Ok(files)
+        Ok(CodexSessionFiles {
+            files,
+            read_failures: Vec::new(),
+            truncations: discovery
+                .truncations
+                .into_iter()
+                .map(|truncation| truncation.into_truncation(SourceKind::Codex))
+                .collect(),
+        })
     }
 
     pub fn read_file_lines(
@@ -102,10 +143,23 @@ impl CodexSessionRootReader {
         file: &Path,
         text: &str,
         records: &mut Vec<TranscriptRecord>,
-        failures: &mut Vec<ReadFailure>,
+        failures: &mut TranscriptFailureAccumulator,
+        truncations: &mut Vec<signal_aggregator::Truncation>,
     ) {
         for (line_index, line) in text.lines().enumerate() {
             let line_number = line_index as u64 + 1;
+            let line_text = TranscriptLineText::new(file, line_number, line, self.limits.clone());
+            let line = match line_text.bounded_text() {
+                TranscriptLineTextOutcome::Text(line) => line,
+                TranscriptLineTextOutcome::Truncated(truncation) => {
+                    truncations.push(truncation.into_truncation(SourceKind::Codex));
+                    failures.push(self.failure(
+                        ReadFailureReason::Malformed,
+                        Some(TranscriptLineLocator::new(file.to_path_buf(), line_number).path()),
+                    ));
+                    continue;
+                }
+            };
             match CodexJsonlRecord::new(line).into_transcript_record(
                 file.to_path_buf(),
                 line_number,
@@ -113,8 +167,10 @@ impl CodexSessionRootReader {
             ) {
                 CodexJsonlRecordResult::Record(record) => records.push(record),
                 CodexJsonlRecordResult::Malformed => {
-                    failures
-                        .push(self.failure(ReadFailureReason::Malformed, Some(file.to_path_buf())));
+                    failures.push(self.failure(
+                        ReadFailureReason::Malformed,
+                        Some(TranscriptLineLocator::new(file.to_path_buf(), line_number).path()),
+                    ));
                 }
             }
         }
@@ -144,26 +200,119 @@ impl CodexSessionRootReader {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexSessionFiles {
+    pub files: Vec<PathBuf>,
+    pub read_failures: Vec<ReadFailure>,
+    pub truncations: Vec<signal_aggregator::Truncation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexIndex {
     root: PathBuf,
     path: PathBuf,
+    limits: TranscriptScanLimits,
 }
 
 impl CodexIndex {
-    pub fn new(root: PathBuf, path: PathBuf) -> Self {
-        Self { root, path }
+    pub fn new(root: PathBuf, path: PathBuf, limits: TranscriptScanLimits) -> Self {
+        Self { root, path, limits }
     }
 
-    pub fn session_files(&self) -> std::io::Result<Vec<PathBuf>> {
-        let text = std::fs::read_to_string(&self.path)?;
+    pub fn session_files(&self) -> std::io::Result<CodexSessionFiles> {
         let mut files = Vec::new();
-        for line in text.lines() {
-            if let Some(path) = CodexIndexRecord::new(line).path() {
-                files.push(CodexIndexPath::new(self.root.clone(), path).session_path()?);
+        let mut read_failures = TranscriptFailureAccumulator::new(
+            SourceKind::Codex,
+            Some(self.path.clone()),
+            self.limits.maximum_failures(),
+        );
+        let mut truncations = Vec::new();
+        match TranscriptBoundedFile::new(self.path.clone(), self.limits.clone()).read_to_string()? {
+            TranscriptBoundedFileRead::Text(text) => {
+                for (line_index, line) in text.lines().enumerate() {
+                    let line_number = line_index as u64 + 1;
+                    let line_text =
+                        TranscriptLineText::new(&self.path, line_number, line, self.limits.clone());
+                    let line = match line_text.bounded_text() {
+                        TranscriptLineTextOutcome::Text(line) => line,
+                        TranscriptLineTextOutcome::Truncated(truncation) => {
+                            truncations.push(truncation.into_truncation(SourceKind::Codex));
+                            read_failures.push(self.read_failure(
+                                ReadFailureReason::Malformed,
+                                line_number,
+                                None,
+                            ));
+                            continue;
+                        }
+                    };
+                    let record = CodexIndexRecord::new(line).path();
+                    match record {
+                        CodexIndexRecordPath::Path(path) => {
+                            match CodexIndexPath::new(self.root.clone(), path.clone())
+                                .session_path()
+                            {
+                                Ok(path) => files.push(path),
+                                Err(error) => read_failures.push(self.read_failure(
+                                    match error.kind() {
+                                        std::io::ErrorKind::PermissionDenied => {
+                                            ReadFailureReason::PermissionDenied
+                                        }
+                                        std::io::ErrorKind::NotFound => ReadFailureReason::Missing,
+                                        _ => ReadFailureReason::IoFailure,
+                                    },
+                                    line_number,
+                                    Some(path),
+                                )),
+                            }
+                        }
+                        CodexIndexRecordPath::Malformed => read_failures.push(self.read_failure(
+                            ReadFailureReason::Malformed,
+                            line_number,
+                            None,
+                        )),
+                    }
+                }
+            }
+            TranscriptBoundedFileRead::Truncated(truncation) => {
+                truncations.push(truncation.into_truncation(SourceKind::Codex));
             }
         }
         files.sort();
-        Ok(files)
+        let failure_outcome = read_failures.finish();
+        truncations.extend(failure_outcome.truncations);
+        Ok(CodexSessionFiles {
+            files,
+            read_failures: failure_outcome.failures,
+            truncations,
+        })
+    }
+
+    pub fn read_failure(
+        &self,
+        reason: ReadFailureReason,
+        line_number: u64,
+        offending_locator: Option<String>,
+    ) -> ReadFailure {
+        let mut source_identifier = format!(
+            "codex:{}|index:{}|line:{}",
+            self.root.display(),
+            self.path.display(),
+            line_number
+        );
+        if let Some(locator) = offending_locator {
+            source_identifier.push_str("|locator:");
+            source_identifier.push_str(&locator);
+        }
+        ReadFailure {
+            source: SourceKind::Codex,
+            path: Some(FilesystemPath::new(
+                TranscriptLineLocator::new(self.path.clone(), line_number)
+                    .path()
+                    .display()
+                    .to_string(),
+            )),
+            source_identifier: Some(SourceIdentifier::new(source_identifier)),
+            reason,
+        }
     }
 }
 
@@ -229,17 +378,23 @@ impl<'a> CodexIndexRecord<'a> {
         Self { line }
     }
 
-    pub fn path(&self) -> Option<String> {
-        serde_json::from_str::<Value>(self.line)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .or_else(|| value.get("session_path").and_then(Value::as_str))
-                    .map(ToOwned::to_owned)
-            })
+    pub fn path(&self) -> CodexIndexRecordPath {
+        let Ok(value) = serde_json::from_str::<Value>(self.line) else {
+            return CodexIndexRecordPath::Malformed;
+        };
+        value
+            .get("path")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("session_path").and_then(Value::as_str))
+            .map(|path| CodexIndexRecordPath::Path(path.to_owned()))
+            .unwrap_or(CodexIndexRecordPath::Malformed)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexIndexRecordPath {
+    Path(String),
+    Malformed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,9 +420,16 @@ impl<'a> CodexJsonlRecord<'a> {
         let Some(text) = CodexJsonValue::new(&value).text() else {
             return CodexJsonlRecordResult::Malformed;
         };
-        let timestamp = CodexJsonValue::new(&value)
-            .timestamp()
-            .map(|value| Timestamp::new(value.to_string()));
+        let timestamp = match CodexJsonValue::new(&value).timestamp() {
+            Some(value) => {
+                let timestamp = Timestamp::new(value.to_string());
+                if CanonicalTimestamp::parse(&timestamp).is_err() {
+                    return CodexJsonlRecordResult::Malformed;
+                }
+                Some(timestamp)
+            }
+            None => None,
+        };
         CodexJsonlRecordResult::Record(TranscriptRecord::new(
             SourceKind::Codex,
             source_identifier,

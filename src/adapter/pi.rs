@@ -8,9 +8,13 @@ use signal_aggregator::{
 use crate::{
     AdapterKind,
     adapter::{
-        TranscriptFileDiscovery, TranscriptReadOutcome, TranscriptReadRequest, TranscriptRecord,
+        TranscriptBoundedFile, TranscriptBoundedFileRead, TranscriptFailureAccumulator,
+        TranscriptFileDiscovery, TranscriptLineLocator, TranscriptLineText,
+        TranscriptLineTextOutcome, TranscriptReadOutcome, TranscriptReadRequest, TranscriptRecord,
+        TranscriptScanLimits,
     },
     configuration::TranscriptRootConfiguration,
+    time_model::CanonicalTimestamp,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,11 +39,16 @@ impl PiTranscriptAdapter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PiRunHistoryRootReader {
     root: PathBuf,
+    limits: TranscriptScanLimits,
 }
 
 impl PiRunHistoryRootReader {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self::with_limits(root, TranscriptScanLimits::default_runtime())
+    }
+
+    pub fn with_limits(root: PathBuf, limits: TranscriptScanLimits) -> Self {
+        Self { root, limits }
     }
 
     pub fn collect(&self, request: &TranscriptReadRequest) -> TranscriptReadOutcome {
@@ -58,31 +67,55 @@ impl PiRunHistoryRootReader {
                 request,
             );
         }
-        let files = match TranscriptFileDiscovery::new(self.root.clone()).jsonl_files() {
-            Ok(files) => files,
-            Err(error) => {
-                return TranscriptReadOutcome::from_records(
-                    SourceKind::Pi,
-                    source_identifier.clone(),
-                    Vec::new(),
-                    vec![self.failure_from_io(error, Some(self.root.clone()))],
-                    request,
-                );
-            }
-        };
+        let discovery =
+            match TranscriptFileDiscovery::with_limits(self.root.clone(), self.limits.clone())
+                .discover_jsonl_files()
+            {
+                Ok(discovery) => discovery,
+                Err(error) => {
+                    return TranscriptReadOutcome::from_records(
+                        SourceKind::Pi,
+                        source_identifier.clone(),
+                        Vec::new(),
+                        vec![self.failure_from_io(error, Some(self.root.clone()))],
+                        request,
+                    );
+                }
+            };
         let mut records = Vec::new();
-        let mut failures = Vec::new();
-        for file in files {
-            match std::fs::read_to_string(&file) {
-                Ok(text) => self.read_file_lines(&file, &text, &mut records, &mut failures),
+        let mut failures = TranscriptFailureAccumulator::new(
+            SourceKind::Pi,
+            Some(self.root.clone()),
+            self.limits.maximum_failures(),
+        );
+        let mut truncations = discovery
+            .truncations
+            .into_iter()
+            .map(|truncation| truncation.into_truncation(SourceKind::Pi))
+            .collect::<Vec<_>>();
+        for file in discovery.files {
+            match TranscriptBoundedFile::new(file.clone(), self.limits.clone()).read_to_string() {
+                Ok(TranscriptBoundedFileRead::Text(text)) => self.read_file_lines(
+                    &file,
+                    &text,
+                    &mut records,
+                    &mut failures,
+                    &mut truncations,
+                ),
+                Ok(TranscriptBoundedFileRead::Truncated(truncation)) => {
+                    truncations.push(truncation.into_truncation(SourceKind::Pi));
+                }
                 Err(error) => failures.push(self.failure_from_io(error, Some(file))),
             }
         }
-        TranscriptReadOutcome::from_records(
+        let failure_outcome = failures.finish();
+        truncations.extend(failure_outcome.truncations);
+        TranscriptReadOutcome::from_records_and_truncations(
             SourceKind::Pi,
             source_identifier,
             records,
-            failures,
+            failure_outcome.failures,
+            truncations,
             request,
         )
     }
@@ -92,10 +125,23 @@ impl PiRunHistoryRootReader {
         file: &Path,
         text: &str,
         records: &mut Vec<TranscriptRecord>,
-        failures: &mut Vec<ReadFailure>,
+        failures: &mut TranscriptFailureAccumulator,
+        truncations: &mut Vec<signal_aggregator::Truncation>,
     ) {
         for (line_index, line) in text.lines().enumerate() {
             let line_number = line_index as u64 + 1;
+            let line_text = TranscriptLineText::new(file, line_number, line, self.limits.clone());
+            let line = match line_text.bounded_text() {
+                TranscriptLineTextOutcome::Text(line) => line,
+                TranscriptLineTextOutcome::Truncated(truncation) => {
+                    truncations.push(truncation.into_truncation(SourceKind::Pi));
+                    failures.push(self.failure(
+                        ReadFailureReason::Malformed,
+                        Some(TranscriptLineLocator::new(file.to_path_buf(), line_number).path()),
+                    ));
+                    continue;
+                }
+            };
             match PiJsonlRecord::new(line).into_transcript_record(
                 file.to_path_buf(),
                 line_number,
@@ -103,8 +149,10 @@ impl PiRunHistoryRootReader {
             ) {
                 PiJsonlRecordResult::Record(record) => records.push(record),
                 PiJsonlRecordResult::Malformed => {
-                    failures
-                        .push(self.failure(ReadFailureReason::Malformed, Some(file.to_path_buf())));
+                    failures.push(self.failure(
+                        ReadFailureReason::Malformed,
+                        Some(TranscriptLineLocator::new(file.to_path_buf(), line_number).path()),
+                    ));
                 }
             }
         }
@@ -156,9 +204,16 @@ impl<'a> PiJsonlRecord<'a> {
         let Some(text) = PiJsonValue::new(&value).text() else {
             return PiJsonlRecordResult::Malformed;
         };
-        let timestamp = PiJsonValue::new(&value)
-            .timestamp()
-            .map(|value| Timestamp::new(value.to_string()));
+        let timestamp = match PiJsonValue::new(&value).timestamp() {
+            Some(value) => {
+                let timestamp = Timestamp::new(value.to_string());
+                if CanonicalTimestamp::parse(&timestamp).is_err() {
+                    return PiJsonlRecordResult::Malformed;
+                }
+                Some(timestamp)
+            }
+            None => None,
+        };
         PiJsonlRecordResult::Record(TranscriptRecord::new(
             SourceKind::Pi,
             source_identifier,

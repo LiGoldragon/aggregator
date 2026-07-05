@@ -12,6 +12,8 @@ use signal_aggregator::{
     TranscriptText, TranscriptTextExcerpt, Truncation, TruncationReason,
 };
 
+use crate::time_model::CanonicalTimestamp;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AdapterKind {
     ClaudeTranscript,
@@ -91,22 +93,37 @@ impl TimeWindowMatcher {
     }
 
     pub fn accepts(&self, timestamp: Option<&Timestamp>) -> TimeWindowAcceptance {
+        let Some(timestamp) = timestamp else {
+            return TimeWindowAcceptance::Rejected;
+        };
+        let Ok(candidate) = CanonicalTimestamp::parse(timestamp) else {
+            return TimeWindowAcceptance::Rejected;
+        };
         match &self.time_window {
             TimeWindow::Recent(_) => TimeWindowAcceptance::Rejected,
-            TimeWindow::Since(start) => timestamp.map_or(TimeWindowAcceptance::Rejected, |value| {
-                if value.as_str() >= start.as_str() {
+            TimeWindow::Since(start) => {
+                let Ok(start) = CanonicalTimestamp::parse(start) else {
+                    return TimeWindowAcceptance::Rejected;
+                };
+                if candidate.is_at_or_after(&start) {
                     TimeWindowAcceptance::Accepted
                 } else {
                     TimeWindowAcceptance::Rejected
                 }
-            }),
-            TimeWindow::Range(range) => timestamp.map_or(TimeWindowAcceptance::Rejected, |value| {
-                if value.as_str() >= range.start.as_str() && value.as_str() <= range.end.as_str() {
+            }
+            TimeWindow::Range(range) => {
+                let Ok(start) = CanonicalTimestamp::parse(&range.start) else {
+                    return TimeWindowAcceptance::Rejected;
+                };
+                let Ok(end) = CanonicalTimestamp::parse(&range.end) else {
+                    return TimeWindowAcceptance::Rejected;
+                };
+                if candidate.is_at_or_after(&start) && candidate.is_at_or_before(&end) {
                     TimeWindowAcceptance::Accepted
                 } else {
                     TimeWindowAcceptance::Rejected
                 }
-            }),
+            }
         }
     }
 }
@@ -136,8 +153,32 @@ impl TranscriptReadOutcome {
         read_failures: Vec<signal_aggregator::ReadFailure>,
         request: &TranscriptReadRequest,
     ) -> Self {
-        TranscriptProjectionBuilder::new(source, source_identifier, records, read_failures)
-            .project(request)
+        Self::from_records_and_truncations(
+            source,
+            source_identifier,
+            records,
+            read_failures,
+            Vec::new(),
+            request,
+        )
+    }
+
+    pub fn from_records_and_truncations(
+        source: SourceKind,
+        source_identifier: SourceIdentifier,
+        records: Vec<TranscriptRecord>,
+        read_failures: Vec<signal_aggregator::ReadFailure>,
+        read_truncations: Vec<Truncation>,
+        request: &TranscriptReadRequest,
+    ) -> Self {
+        TranscriptProjectionBuilder::new(
+            source,
+            source_identifier,
+            records,
+            read_failures,
+            read_truncations,
+        )
+        .project(request)
     }
 }
 
@@ -203,6 +244,7 @@ pub struct TranscriptProjectionBuilder {
     source_identifier: SourceIdentifier,
     records: Vec<TranscriptRecord>,
     read_failures: Vec<signal_aggregator::ReadFailure>,
+    read_truncations: Vec<Truncation>,
 }
 
 impl TranscriptProjectionBuilder {
@@ -211,12 +253,14 @@ impl TranscriptProjectionBuilder {
         source_identifier: SourceIdentifier,
         records: Vec<TranscriptRecord>,
         read_failures: Vec<signal_aggregator::ReadFailure>,
+        read_truncations: Vec<Truncation>,
     ) -> Self {
         Self {
             source,
             source_identifier,
             records,
             read_failures,
+            read_truncations,
         }
     }
 
@@ -235,7 +279,7 @@ impl TranscriptProjectionBuilder {
                 projection_state.observe(record);
             }
         }
-        projection_state.finish(self.read_failures)
+        projection_state.finish(self.read_failures, self.read_truncations)
     }
 }
 
@@ -294,6 +338,7 @@ impl TranscriptProjectionState {
     pub fn finish(
         mut self,
         read_failures: Vec<signal_aggregator::ReadFailure>,
+        read_truncations: Vec<Truncation>,
     ) -> TranscriptReadOutcome {
         if matches!(
             self.segment_limit_truncated,
@@ -307,6 +352,7 @@ impl TranscriptProjectionState {
                 reason: TruncationReason::RequestLimit,
             });
         }
+        self.truncations.extend(read_truncations);
         let source_volumes = self.source_volume.finish();
         TranscriptReadOutcome {
             source_volumes,
@@ -448,17 +494,22 @@ impl SourceVolumeAccumulator {
         self.item_count += 1;
         self.byte_count += record.byte_count();
         if let Some(timestamp) = &record.timestamp {
+            let Ok(candidate) = CanonicalTimestamp::parse(timestamp) else {
+                return;
+            };
             if self
                 .earliest_timestamp
                 .as_ref()
-                .is_none_or(|value| timestamp.as_str() < value.as_str())
+                .and_then(|value| CanonicalTimestamp::parse(value).ok())
+                .is_none_or(|value| candidate.is_before(&value))
             {
                 self.earliest_timestamp = Some(timestamp.clone());
             }
             if self
                 .latest_timestamp
                 .as_ref()
-                .is_none_or(|value| timestamp.as_str() > value.as_str())
+                .and_then(|value| CanonicalTimestamp::parse(value).ok())
+                .is_none_or(|value| candidate.is_after(&value))
             {
                 self.latest_timestamp = Some(timestamp.clone());
             }
@@ -482,40 +533,356 @@ impl SourceVolumeAccumulator {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptScanLimits {
+    maximum_scan_entries: u64,
+    maximum_files: u64,
+    maximum_file_bytes: u64,
+    maximum_line_bytes: u64,
+    maximum_failures: u64,
+}
+
+impl TranscriptScanLimits {
+    pub fn default_runtime() -> Self {
+        Self {
+            maximum_scan_entries: 4096,
+            maximum_files: 1024,
+            maximum_file_bytes: 8 * 1024 * 1024,
+            maximum_line_bytes: 256 * 1024,
+            maximum_failures: 128,
+        }
+    }
+
+    pub fn new(
+        maximum_scan_entries: u64,
+        maximum_files: u64,
+        maximum_file_bytes: u64,
+        maximum_line_bytes: u64,
+        maximum_failures: u64,
+    ) -> Self {
+        Self {
+            maximum_scan_entries,
+            maximum_files,
+            maximum_file_bytes,
+            maximum_line_bytes,
+            maximum_failures,
+        }
+    }
+
+    pub fn maximum_file_bytes(&self) -> u64 {
+        self.maximum_file_bytes
+    }
+
+    pub fn maximum_line_bytes(&self) -> u64 {
+        self.maximum_line_bytes
+    }
+
+    pub fn maximum_failures(&self) -> u64 {
+        self.maximum_failures
+    }
+}
+
+impl Default for TranscriptScanLimits {
+    fn default() -> Self {
+        Self::default_runtime()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptLimitTruncation {
+    pub path: Option<PathBuf>,
+    pub original_bytes: Option<u64>,
+    pub projected_bytes: u64,
+}
+
+impl TranscriptLimitTruncation {
+    pub fn new(path: Option<PathBuf>, original_bytes: Option<u64>, projected_bytes: u64) -> Self {
+        Self {
+            path,
+            original_bytes,
+            projected_bytes,
+        }
+    }
+
+    pub fn into_truncation(self, source: SourceKind) -> Truncation {
+        Truncation {
+            source,
+            path: self
+                .path
+                .map(|value| FilesystemPath::new(value.display().to_string())),
+            original_bytes: self.original_bytes.map(ByteCount::new),
+            projected_bytes: ByteCount::new(self.projected_bytes),
+            reason: TruncationReason::RequestLimit,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptDiscoveryOutcome {
+    pub files: Vec<PathBuf>,
+    pub truncations: Vec<TranscriptLimitTruncation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptFileDiscovery {
     root: PathBuf,
+    limits: TranscriptScanLimits,
 }
 
 impl TranscriptFileDiscovery {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self::with_limits(root, TranscriptScanLimits::default_runtime())
+    }
+
+    pub fn with_limits(root: PathBuf, limits: TranscriptScanLimits) -> Self {
+        Self { root, limits }
     }
 
     pub fn jsonl_files(&self) -> std::io::Result<Vec<PathBuf>> {
-        let mut files = Vec::new();
-        self.collect_jsonl_files(&self.root, &mut files)?;
-        files.sort();
-        Ok(files)
+        Ok(self.discover_jsonl_files()?.files)
+    }
+
+    pub fn discover_jsonl_files(&self) -> std::io::Result<TranscriptDiscoveryOutcome> {
+        let mut state = TranscriptDiscoveryState::new(self.limits.clone());
+        self.collect_jsonl_files(&self.root, &mut state)?;
+        state.finish()
     }
 
     pub fn collect_jsonl_files(
         &self,
         directory: &Path,
-        files: &mut Vec<PathBuf>,
+        state: &mut TranscriptDiscoveryState,
     ) -> std::io::Result<()> {
-        let mut entries = std::fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
+        if state.is_complete() {
+            return Ok(());
+        }
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(directory)? {
+            if !state.observe_scan_entry(directory.to_path_buf()) {
+                break;
+            }
+            entries.push(entry?);
+            if state.is_complete() {
+                break;
+            }
+        }
         entries.sort_by_key(|entry| entry.path());
         for entry in entries {
+            if state.is_complete() {
+                break;
+            }
             let path = entry.path();
             if path.is_dir() {
-                self.collect_jsonl_files(&path, files)?;
+                self.collect_jsonl_files(&path, state)?;
             } else if path
                 .extension()
                 .is_some_and(|extension| extension == "jsonl")
             {
-                files.push(path);
+                state.observe_jsonl_file(path);
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptDiscoveryState {
+    limits: TranscriptScanLimits,
+    scanned_entries: u64,
+    files: Vec<PathBuf>,
+    truncations: Vec<TranscriptLimitTruncation>,
+    scan_limit_reported: bool,
+    file_limit_reported: bool,
+}
+
+impl TranscriptDiscoveryState {
+    pub fn new(limits: TranscriptScanLimits) -> Self {
+        Self {
+            limits,
+            scanned_entries: 0,
+            files: Vec::new(),
+            truncations: Vec::new(),
+            scan_limit_reported: false,
+            file_limit_reported: false,
+        }
+    }
+
+    pub fn observe_scan_entry(&mut self, directory: PathBuf) -> bool {
+        if self.scanned_entries >= self.limits.maximum_scan_entries {
+            if !self.scan_limit_reported {
+                self.truncations
+                    .push(TranscriptLimitTruncation::new(Some(directory), None, 0));
+                self.scan_limit_reported = true;
+            }
+            return false;
+        }
+        self.scanned_entries += 1;
+        true
+    }
+
+    pub fn observe_jsonl_file(&mut self, path: PathBuf) {
+        if self.files.len() as u64 >= self.limits.maximum_files {
+            if !self.file_limit_reported {
+                self.truncations
+                    .push(TranscriptLimitTruncation::new(Some(path), None, 0));
+                self.file_limit_reported = true;
+            }
+            return;
+        }
+        self.files.push(path);
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.scan_limit_reported || self.file_limit_reported
+    }
+
+    pub fn finish(mut self) -> std::io::Result<TranscriptDiscoveryOutcome> {
+        self.files.sort();
+        Ok(TranscriptDiscoveryOutcome {
+            files: self.files,
+            truncations: self.truncations,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptBoundedFile {
+    path: PathBuf,
+    limits: TranscriptScanLimits,
+}
+
+impl TranscriptBoundedFile {
+    pub fn new(path: PathBuf, limits: TranscriptScanLimits) -> Self {
+        Self { path, limits }
+    }
+
+    pub fn read_to_string(&self) -> std::io::Result<TranscriptBoundedFileRead> {
+        let metadata = std::fs::metadata(&self.path)?;
+        let byte_count = metadata.len();
+        if byte_count > self.limits.maximum_file_bytes() {
+            return Ok(TranscriptBoundedFileRead::Truncated(
+                TranscriptLimitTruncation::new(
+                    Some(self.path.clone()),
+                    Some(byte_count),
+                    self.limits.maximum_file_bytes(),
+                ),
+            ));
+        }
+        Ok(TranscriptBoundedFileRead::Text(std::fs::read_to_string(
+            &self.path,
+        )?))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptBoundedFileRead {
+    Text(String),
+    Truncated(TranscriptLimitTruncation),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptLineText<'a> {
+    path: &'a Path,
+    line_number: u64,
+    text: &'a str,
+    limits: TranscriptScanLimits,
+}
+
+impl<'a> TranscriptLineText<'a> {
+    pub fn new(
+        path: &'a Path,
+        line_number: u64,
+        text: &'a str,
+        limits: TranscriptScanLimits,
+    ) -> Self {
+        Self {
+            path,
+            line_number,
+            text,
+            limits,
+        }
+    }
+
+    pub fn bounded_text(&self) -> TranscriptLineTextOutcome<'a> {
+        if self.text.len() as u64 > self.limits.maximum_line_bytes() {
+            TranscriptLineTextOutcome::Truncated(TranscriptLimitTruncation::new(
+                Some(TranscriptLineLocator::new(self.path.to_path_buf(), self.line_number).path()),
+                Some(self.text.len() as u64),
+                self.limits.maximum_line_bytes(),
+            ))
+        } else {
+            TranscriptLineTextOutcome::Text(self.text)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptLineTextOutcome<'a> {
+    Text(&'a str),
+    Truncated(TranscriptLimitTruncation),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptFailureAccumulator {
+    failures: Vec<ReadFailure>,
+    limit: u64,
+    source: SourceKind,
+    limit_path: Option<PathBuf>,
+    truncated: bool,
+}
+
+impl TranscriptFailureAccumulator {
+    pub fn new(source: SourceKind, limit_path: Option<PathBuf>, limit: u64) -> Self {
+        Self {
+            failures: Vec::new(),
+            limit,
+            source,
+            limit_path,
+            truncated: false,
+        }
+    }
+
+    pub fn push(&mut self, failure: ReadFailure) {
+        if self.failures.len() as u64 >= self.limit {
+            self.truncated = true;
+            return;
+        }
+        self.failures.push(failure);
+    }
+
+    pub fn finish(self) -> TranscriptFailureOutcome {
+        let truncations = if self.truncated {
+            vec![
+                TranscriptLimitTruncation::new(self.limit_path, None, 0)
+                    .into_truncation(self.source),
+            ]
+        } else {
+            Vec::new()
+        };
+        TranscriptFailureOutcome {
+            failures: self.failures,
+            truncations,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptFailureOutcome {
+    pub failures: Vec<ReadFailure>,
+    pub truncations: Vec<Truncation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptLineLocator {
+    path: PathBuf,
+    line_number: u64,
+}
+
+impl TranscriptLineLocator {
+    pub fn new(path: PathBuf, line_number: u64) -> Self {
+        Self { path, line_number }
+    }
+
+    pub fn path(&self) -> PathBuf {
+        PathBuf::from(format!("{}:{}", self.path.display(), self.line_number))
     }
 }

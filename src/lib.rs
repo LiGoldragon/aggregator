@@ -12,6 +12,7 @@ pub mod error;
 pub mod nexus;
 pub mod sema;
 pub mod signal;
+pub mod time_model;
 
 pub use adapter::AdapterKind;
 pub use client::{
