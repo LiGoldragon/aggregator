@@ -18,7 +18,9 @@ use aggregator::{
     RuntimeConfigurationValidation, SemaPlane, SignalPlane, TranscriptAdapterConfiguration,
     TranscriptRootConfiguration,
     adapter::{
-        TranscriptReadOutcome, TranscriptReadRequest, TranscriptRecord, TranscriptScanLimits,
+        MaximumDiscoveredFiles, MaximumFileBytes, MaximumLineBytes, MaximumReadFailures,
+        MaximumScanEntries, TranscriptReadOutcome, TranscriptReadRequest, TranscriptRecord,
+        TranscriptScanLimitConfiguration, TranscriptScanLimits,
         claude::{ClaudeJsonlRootReader, ClaudeTranscriptAdapter},
         codex::{CodexSessionRootReader, CodexTranscriptAdapter},
         pi::PiTranscriptAdapter,
@@ -441,7 +443,13 @@ fn transcript_reader_reports_file_limit_without_unbounded_read() {
     .expect("write oversized fixture transcript");
     let reader = ClaudeJsonlRootReader::with_limits(
         root.path().to_path_buf(),
-        TranscriptScanLimits::new(16, 16, 32, 1024, 8),
+        TranscriptScanLimits::new(TranscriptScanLimitConfiguration::new(
+            MaximumScanEntries::new(16),
+            MaximumDiscoveredFiles::new(16),
+            MaximumFileBytes::new(32),
+            MaximumLineBytes::new(1024),
+            MaximumReadFailures::new(8),
+        )),
     );
     let outcome = reader.collect(&read_request(
         TimeWindow::Since(Timestamp::new("2026-01-01T00:00:00Z")),
@@ -485,7 +493,13 @@ fn transcript_reader_caps_file_discovery_line_size_and_failure_reports() {
     .expect("write second fixture transcript");
     let reader = ClaudeJsonlRootReader::with_limits(
         root.path().to_path_buf(),
-        TranscriptScanLimits::new(16, 1, 4096, 32, 1),
+        TranscriptScanLimits::new(TranscriptScanLimitConfiguration::new(
+            MaximumScanEntries::new(16),
+            MaximumDiscoveredFiles::new(1),
+            MaximumFileBytes::new(4096),
+            MaximumLineBytes::new(32),
+            MaximumReadFailures::new(1),
+        )),
     );
     let outcome = reader.collect(&read_request(
         TimeWindow::Since(Timestamp::new("2026-01-01T00:00:00Z")),
@@ -1010,12 +1024,81 @@ fn codex_adapter_reports_index_paths_that_escape_root_as_read_failure() {
 }
 
 #[test]
+fn codex_adapter_reports_absolute_parent_traversal_missing_index_paths_with_context() {
+    let root = TempDir::new().expect("temporary root");
+    let first_escape = root.path().join("..").join("outside").join("missing.jsonl");
+    let second_escape = root
+        .path()
+        .join("sessions")
+        .join("..")
+        .join("..")
+        .join("outside")
+        .join("missing.jsonl");
+    let index_text = format!(
+        "{{\"path\":{}}}\n{{\"path\":{}}}\n",
+        serde_json::to_string(&first_escape.display().to_string()).expect("first path json"),
+        serde_json::to_string(&second_escape.display().to_string()).expect("second path json"),
+    );
+    fs::write(root.path().join("index.jsonl"), index_text).expect("write escaping index");
+    let adapter =
+        CodexTranscriptAdapter::new(TranscriptRootConfiguration::new(root.path().to_path_buf()));
+    let outcome = adapter.collect(&read_request(
+        TimeWindow::Since(Timestamp::new("2026-01-01T00:00:00Z")),
+        Projection::MetadataOnly,
+        8,
+    ));
+
+    assert_eq!(outcome.read_failures.len(), 2);
+    assert!(
+        outcome
+            .read_failures
+            .iter()
+            .all(|failure| failure.reason == ReadFailureReason::PermissionDenied)
+    );
+    assert!(outcome.read_failures.iter().any(|failure| {
+        failure
+            .path
+            .as_ref()
+            .is_some_and(|path| path.as_str().contains("index.jsonl:1"))
+            && failure
+                .source_identifier
+                .as_ref()
+                .is_some_and(|identifier| {
+                    identifier.as_str().contains("locator:")
+                        && identifier.as_str().contains("../outside/missing.jsonl")
+                })
+    }));
+    assert!(outcome.read_failures.iter().any(|failure| {
+        failure
+            .path
+            .as_ref()
+            .is_some_and(|path| path.as_str().contains("index.jsonl:2"))
+            && failure
+                .source_identifier
+                .as_ref()
+                .is_some_and(|identifier| {
+                    identifier.as_str().contains("locator:")
+                        && identifier
+                            .as_str()
+                            .contains("sessions/../../outside/missing.jsonl")
+                })
+    }));
+    assert!(outcome.transcript_segments.is_empty());
+}
+
+#[test]
 fn codex_adapter_reports_malformed_index_lines_with_index_line_context() {
     let root = TempDir::new().expect("temporary root");
     fs::write(root.path().join("index.jsonl"), "not-json\n{}").expect("write malformed index");
     let reader = CodexSessionRootReader::with_limits(
         root.path().to_path_buf(),
-        TranscriptScanLimits::new(16, 16, 4096, 128, 8),
+        TranscriptScanLimits::new(TranscriptScanLimitConfiguration::new(
+            MaximumScanEntries::new(16),
+            MaximumDiscoveredFiles::new(16),
+            MaximumFileBytes::new(4096),
+            MaximumLineBytes::new(128),
+            MaximumReadFailures::new(8),
+        )),
     );
     let outcome = reader.collect(&read_request(
         TimeWindow::Since(Timestamp::new("2026-01-01T00:00:00Z")),

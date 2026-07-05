@@ -532,52 +532,146 @@ impl SourceVolumeAccumulator {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaximumScanEntries(u64);
+
+impl MaximumScanEntries {
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub fn into_u64(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaximumDiscoveredFiles(u64);
+
+impl MaximumDiscoveredFiles {
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub fn into_u64(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaximumFileBytes(u64);
+
+impl MaximumFileBytes {
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub fn into_u64(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaximumLineBytes(u64);
+
+impl MaximumLineBytes {
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub fn into_u64(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaximumReadFailures(u64);
+
+impl MaximumReadFailures {
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub fn into_u64(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptScanLimitConfiguration {
+    maximum_scan_entries: MaximumScanEntries,
+    maximum_discovered_files: MaximumDiscoveredFiles,
+    maximum_file_bytes: MaximumFileBytes,
+    maximum_line_bytes: MaximumLineBytes,
+    maximum_read_failures: MaximumReadFailures,
+}
+
+impl TranscriptScanLimitConfiguration {
+    pub fn new(
+        maximum_scan_entries: MaximumScanEntries,
+        maximum_discovered_files: MaximumDiscoveredFiles,
+        maximum_file_bytes: MaximumFileBytes,
+        maximum_line_bytes: MaximumLineBytes,
+        maximum_read_failures: MaximumReadFailures,
+    ) -> Self {
+        Self {
+            maximum_scan_entries,
+            maximum_discovered_files,
+            maximum_file_bytes,
+            maximum_line_bytes,
+            maximum_read_failures,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptScanLimits {
-    maximum_scan_entries: u64,
-    maximum_files: u64,
-    maximum_file_bytes: u64,
-    maximum_line_bytes: u64,
-    maximum_failures: u64,
+    maximum_scan_entries: MaximumScanEntries,
+    maximum_discovered_files: MaximumDiscoveredFiles,
+    maximum_file_bytes: MaximumFileBytes,
+    maximum_line_bytes: MaximumLineBytes,
+    maximum_read_failures: MaximumReadFailures,
 }
 
 impl TranscriptScanLimits {
     pub fn default_runtime() -> Self {
+        Self::new(TranscriptScanLimitConfiguration::new(
+            MaximumScanEntries::new(4096),
+            MaximumDiscoveredFiles::new(1024),
+            MaximumFileBytes::new(8 * 1024 * 1024),
+            MaximumLineBytes::new(256 * 1024),
+            MaximumReadFailures::new(128),
+        ))
+    }
+
+    pub fn new(configuration: TranscriptScanLimitConfiguration) -> Self {
         Self {
-            maximum_scan_entries: 4096,
-            maximum_files: 1024,
-            maximum_file_bytes: 8 * 1024 * 1024,
-            maximum_line_bytes: 256 * 1024,
-            maximum_failures: 128,
+            maximum_scan_entries: configuration.maximum_scan_entries,
+            maximum_discovered_files: configuration.maximum_discovered_files,
+            maximum_file_bytes: configuration.maximum_file_bytes,
+            maximum_line_bytes: configuration.maximum_line_bytes,
+            maximum_read_failures: configuration.maximum_read_failures,
         }
     }
 
-    pub fn new(
-        maximum_scan_entries: u64,
-        maximum_files: u64,
-        maximum_file_bytes: u64,
-        maximum_line_bytes: u64,
-        maximum_failures: u64,
-    ) -> Self {
-        Self {
-            maximum_scan_entries,
-            maximum_files,
-            maximum_file_bytes,
-            maximum_line_bytes,
-            maximum_failures,
-        }
+    pub fn maximum_scan_entries(&self) -> u64 {
+        self.maximum_scan_entries.into_u64()
+    }
+
+    pub fn maximum_discovered_files(&self) -> u64 {
+        self.maximum_discovered_files.into_u64()
     }
 
     pub fn maximum_file_bytes(&self) -> u64 {
-        self.maximum_file_bytes
+        self.maximum_file_bytes.into_u64()
     }
 
     pub fn maximum_line_bytes(&self) -> u64 {
-        self.maximum_line_bytes
+        self.maximum_line_bytes.into_u64()
     }
 
     pub fn maximum_failures(&self) -> u64 {
-        self.maximum_failures
+        self.maximum_read_failures.into_u64()
     }
 }
 
@@ -707,7 +801,7 @@ impl TranscriptDiscoveryState {
     }
 
     pub fn observe_scan_entry(&mut self, directory: PathBuf) -> bool {
-        if self.scanned_entries >= self.limits.maximum_scan_entries {
+        if self.scanned_entries >= self.limits.maximum_scan_entries() {
             if !self.scan_limit_reported {
                 self.truncations
                     .push(TranscriptLimitTruncation::new(Some(directory), None, 0));
@@ -720,7 +814,7 @@ impl TranscriptDiscoveryState {
     }
 
     pub fn observe_jsonl_file(&mut self, path: PathBuf) {
-        if self.files.len() as u64 >= self.limits.maximum_files {
+        if self.files.len() as u64 >= self.limits.maximum_discovered_files() {
             if !self.file_limit_reported {
                 self.truncations
                     .push(TranscriptLimitTruncation::new(Some(path), None, 0));

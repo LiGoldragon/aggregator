@@ -330,11 +330,10 @@ impl CodexIndexPath {
     pub fn session_path(&self) -> std::io::Result<PathBuf> {
         let path = Path::new(&self.path);
         let candidate = if path.is_absolute() {
-            if path.starts_with(&self.root) {
-                path.to_path_buf()
-            } else {
+            if self.has_parent_component(path) || !path.starts_with(&self.root) {
                 return Err(self.outside_root_error());
             }
+            path.to_path_buf()
         } else {
             if path
                 .components()
@@ -358,6 +357,11 @@ impl CodexIndexPath {
         } else {
             Err(self.outside_root_error())
         }
+    }
+
+    pub fn has_parent_component(&self, path: &Path) -> bool {
+        path.components()
+            .any(|component| matches!(component, Component::ParentDir))
     }
 
     pub fn outside_root_error(&self) -> std::io::Error {
