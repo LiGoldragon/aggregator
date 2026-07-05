@@ -1,0 +1,1 @@
+@~/primary/AGENTS.md

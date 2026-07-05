@@ -1,0 +1,27 @@
+{}
+
+[
+  (Signal [OrdinarySocket MetaSocket])
+  (Nexus [CollectEvidence ValidateConfiguration])
+  (Sema [ConfigurationState CollectionState])
+]
+
+[]
+
+[]
+
+{
+  OrdinarySocket (Path Mode)
+  MetaSocket (Path Mode)
+  CollectEvidence (EvidenceRequest)
+  ValidateConfiguration (AggregatorConfiguration)
+  ConfigurationState (AggregatorConfiguration)
+  CollectionState (RequestIdentifier TimeWindow)
+  Path (String)
+  Mode (u32)
+}
+
+[
+  (Version 0 1)
+  (Status Scaffold)
+]
