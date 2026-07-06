@@ -1005,6 +1005,210 @@ fn output_interface_paginates_enforces_limits_and_rejects_stale_references() {
 }
 
 #[test]
+fn output_interface_rejects_cursors_when_listing_shape_changes() {
+    let root = TempDir::new().expect("temporary root");
+    let configuration = accepted_configuration(&root);
+    fs::write(
+        root.path().join("claude/session-a.jsonl"),
+        concat!(
+            "{\"timestamp\":\"2026-01-02T00:00:00Z\",\"subagent_name\":\"writer\",\"role\":\"assistant\",\"text\":\"agent output\"}\n",
+            "{\"timestamp\":\"2026-01-02T00:10:00Z\",\"subagent_name\":\"reviewer\",\"role\":\"user\",\"text\":\"human output\"}\n",
+        ),
+    )
+    .expect("write first transcript");
+    fs::write(
+        root.path().join("claude/session-b.jsonl"),
+        "{\"timestamp\":\"2026-01-02T00:20:00Z\",\"text\":\"later output\"}\n",
+    )
+    .expect("write second transcript");
+    let runtime = RuntimeConfiguration::validate_from_meta(&configuration)
+        .accepted_configuration()
+        .expect("accepted configuration")
+        .clone();
+    let clock = CollectionClock::fixed(
+        ReferenceTime::from_timestamp(Timestamp::new("2026-01-02T01:00:00Z"))
+            .expect("reference timestamp"),
+    );
+    let nexus = NexusPlane::with_runtime_configuration(runtime, clock);
+
+    let first_sessions = nexus
+        .list_sessions(SessionListRequest {
+            request_identifier: RequestIdentifier::new("first-sessions-shape"),
+            filter: SessionListFilter {
+                source_selection: SourceSelection::AllConfigured,
+                time_window: None,
+            },
+            page: PageRequest {
+                limit: PageLimit::new(1),
+                cursor: None,
+                order: ListingOrder::OldestFirst,
+            },
+        })
+        .expect("first sessions page");
+    let sessions_cursor = first_sessions
+        .page
+        .next_cursor
+        .clone()
+        .expect("sessions cursor");
+    let stale_sessions = nexus
+        .list_sessions(SessionListRequest {
+            request_identifier: RequestIdentifier::new("stale-sessions-shape"),
+            filter: SessionListFilter {
+                source_selection: SourceSelection::AllConfigured,
+                time_window: Some(TimeWindow::Since(Timestamp::new("2026-01-02T00:15:00Z"))),
+            },
+            page: PageRequest {
+                limit: PageLimit::new(1),
+                cursor: Some(sessions_cursor),
+                order: ListingOrder::OldestFirst,
+            },
+        })
+        .expect_err("session cursor is bound to the original time filter");
+    assert_eq!(
+        stale_sessions.reason,
+        OperationRejectionReason::FragileReferenceStale
+    );
+
+    let all_sessions = nexus
+        .list_sessions(SessionListRequest {
+            request_identifier: RequestIdentifier::new("all-sessions-for-shape"),
+            filter: SessionListFilter {
+                source_selection: SourceSelection::AllConfigured,
+                time_window: None,
+            },
+            page: PageRequest {
+                limit: PageLimit::new(10),
+                cursor: None,
+                order: ListingOrder::OldestFirst,
+            },
+        })
+        .expect("all sessions");
+    let session_with_subagents = all_sessions
+        .sessions
+        .iter()
+        .find(|session| {
+            session
+                .output_count
+                .as_ref()
+                .is_some_and(|count| count.into_u64() == 2)
+        })
+        .expect("session with two outputs")
+        .reference
+        .clone();
+
+    let first_subagents = nexus
+        .list_subagents(SubagentListRequest {
+            request_identifier: RequestIdentifier::new("first-subagents-shape"),
+            filter: SubagentListFilter {
+                session_reference: session_with_subagents.clone(),
+                authored_status: AuthoredStatusFilter::AnyAuthoredStatus,
+            },
+            page: PageRequest {
+                limit: PageLimit::new(1),
+                cursor: None,
+                order: ListingOrder::OldestFirst,
+            },
+        })
+        .expect("first subagents page");
+    let subagents_cursor = first_subagents
+        .page
+        .next_cursor
+        .clone()
+        .expect("subagents cursor");
+    let stale_subagents = nexus
+        .list_subagents(SubagentListRequest {
+            request_identifier: RequestIdentifier::new("stale-subagents-shape"),
+            filter: SubagentListFilter {
+                session_reference: session_with_subagents.clone(),
+                authored_status: AuthoredStatusFilter::OnlyAuthoredStatus(
+                    AuthoredStatus::HumanAuthored,
+                ),
+            },
+            page: PageRequest {
+                limit: PageLimit::new(1),
+                cursor: Some(subagents_cursor),
+                order: ListingOrder::OldestFirst,
+            },
+        })
+        .expect_err("subagent cursor is bound to the original authorship filter");
+    assert_eq!(
+        stale_subagents.reason,
+        OperationRejectionReason::FragileReferenceStale
+    );
+
+    let first_outputs = nexus
+        .list_outputs(OutputListRequest {
+            request_identifier: RequestIdentifier::new("first-outputs-shape"),
+            filter: OutputListFilter {
+                source_selection: SourceSelection::AllConfigured,
+                session_reference: Some(session_with_subagents.clone()),
+                subagent_reference: None,
+                authored_status: AuthoredStatusFilter::AnyAuthoredStatus,
+                time_window: None,
+            },
+            page: PageRequest {
+                limit: PageLimit::new(1),
+                cursor: None,
+                order: ListingOrder::OldestFirst,
+            },
+            projection: CardProjection::MetadataOnly,
+        })
+        .expect("first outputs page");
+    let outputs_cursor = first_outputs
+        .page
+        .next_cursor
+        .clone()
+        .expect("outputs cursor");
+    let stale_outputs = nexus
+        .list_outputs(OutputListRequest {
+            request_identifier: RequestIdentifier::new("stale-outputs-shape"),
+            filter: OutputListFilter {
+                source_selection: SourceSelection::AllConfigured,
+                session_reference: Some(session_with_subagents.clone()),
+                subagent_reference: None,
+                authored_status: AuthoredStatusFilter::OnlyAuthoredStatus(
+                    AuthoredStatus::HumanAuthored,
+                ),
+                time_window: None,
+            },
+            page: PageRequest {
+                limit: PageLimit::new(1),
+                cursor: Some(outputs_cursor.clone()),
+                order: ListingOrder::OldestFirst,
+            },
+            projection: CardProjection::MetadataOnly,
+        })
+        .expect_err("output cursor is bound to the original authorship filter");
+    assert_eq!(
+        stale_outputs.reason,
+        OperationRejectionReason::FragileReferenceStale
+    );
+
+    let stale_output_page_shape = nexus
+        .list_outputs(OutputListRequest {
+            request_identifier: RequestIdentifier::new("stale-output-page-shape"),
+            filter: OutputListFilter {
+                source_selection: SourceSelection::AllConfigured,
+                session_reference: Some(session_with_subagents),
+                subagent_reference: None,
+                authored_status: AuthoredStatusFilter::AnyAuthoredStatus,
+                time_window: None,
+            },
+            page: PageRequest {
+                limit: PageLimit::new(2),
+                cursor: Some(outputs_cursor),
+                order: ListingOrder::OldestFirst,
+            },
+            projection: CardProjection::MetadataOnly,
+        })
+        .expect_err("output cursor is bound to the original page limit");
+    assert_eq!(
+        stale_output_page_shape.reason,
+        OperationRejectionReason::FragileReferenceStale
+    );
+}
+
+#[test]
 fn output_interface_accepts_legacy_roots_as_read_only_and_rejects_index_under_them() {
     let root = TempDir::new().expect("temporary root");
     let legacy_root = root.path().join("reports");

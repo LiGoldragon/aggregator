@@ -10,16 +10,17 @@ use std::{
 use serde_json::{Value, json};
 use signal_aggregator::{
     AuthoredStatus, AuthoredStatusFilter, ByteCount, ByteLimit, ByteRange, CardProjection,
-    FilesystemPath, FragileOutputReference, FragileOutputSegmentReference, FragilePageCursor,
-    FragileSessionReference, FragileSubagentReference, ItemCount, LineCount, LineNumber, LineRange,
-    ListingOrder, OperationKind, OperationRejected, OperationRejectionReason, OutputCard,
-    OutputEstimateRequest, OutputEstimated, OutputListRequest, OutputProvenance, OutputRead,
-    OutputReadRange, OutputReadRequest, OutputSegmentCard, OutputSegmentListRequest,
-    OutputSegmentsListed, OutputText, OutputTextExcerpt, OutputsListed, PageLimit, PageMetadata,
-    PageRequest, RejectedFragileReference, RequestIdentifier, SegmentIndex, SessionCard,
+    DurationUnit, FilesystemPath, FragileOutputReference, FragileOutputSegmentReference,
+    FragilePageCursor, FragileSessionReference, FragileSubagentReference, ItemCount, LineCount,
+    LineNumber, LineRange, ListingOrder, OperationKind, OperationRejected,
+    OperationRejectionReason, OutputCard, OutputEstimateRequest, OutputEstimated, OutputListFilter,
+    OutputListRequest, OutputProvenance, OutputRead, OutputReadRange, OutputReadRequest,
+    OutputSegmentCard, OutputSegmentListFilter, OutputSegmentListRequest, OutputSegmentsListed,
+    OutputText, OutputTextExcerpt, OutputsListed, PageLimit, PageMetadata, PageRequest,
+    RejectedFragileReference, RequestIdentifier, SegmentIndex, SessionCard, SessionListFilter,
     SessionListRequest, SessionsListed, SizeCertainty, SizeMetadata, SourceKind, SourceSelection,
-    SubagentCard, SubagentListRequest, SubagentsListed, TimeWindow, Timestamp, Truncation,
-    TruncationReason,
+    SubagentCard, SubagentListFilter, SubagentListRequest, SubagentsListed, TimeWindow, Timestamp,
+    Truncation, TruncationReason,
 };
 
 use crate::{
@@ -84,7 +85,7 @@ impl OutputInterfaceRuntime {
             OperationKind::ListSessions,
             PageCollectionKind::Sessions,
             request.page.clone(),
-            index.collection_signature(),
+            PaginationQueryShape::sessions(&request.filter, lowered_time_window.as_ref()),
         )
         .select(&sessions)?;
         Ok(SessionsListed {
@@ -129,7 +130,7 @@ impl OutputInterfaceRuntime {
             OperationKind::ListSubagents,
             PageCollectionKind::Subagents,
             request.page.clone(),
-            index.collection_signature(),
+            PaginationQueryShape::subagents(&request.filter),
         )
         .select(&subagents)?;
         Ok(SubagentsListed {
@@ -215,7 +216,7 @@ impl OutputInterfaceRuntime {
             OperationKind::ListOutputs,
             PageCollectionKind::Outputs,
             request.page.clone(),
-            index.collection_signature(),
+            PaginationQueryShape::outputs(&request.filter, lowered_time_window.as_ref()),
         )
         .select(&outputs)?;
         Ok(OutputsListed {
@@ -271,7 +272,7 @@ impl OutputInterfaceRuntime {
             OperationKind::ListOutputSegments,
             PageCollectionKind::Segments,
             request.page.clone(),
-            index.collection_signature(),
+            PaginationQueryShape::segments(&request.filter),
         )
         .select(&segments)?;
         Ok(OutputSegmentsListed {
@@ -2196,6 +2197,318 @@ impl ReadLimitValidator {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaginationQueryShape {
+    material: String,
+}
+
+impl PaginationQueryShape {
+    pub fn sessions(filter: &SessionListFilter, lowered_time_window: Option<&TimeWindow>) -> Self {
+        Self {
+            material: StableSignatureMaterial::new("sessions-query")
+                .field(
+                    "source_selection",
+                    SourceSelectionSignature::new(&filter.source_selection).material(),
+                )
+                .field(
+                    "time_window",
+                    OptionalTimeWindowSignature::new(lowered_time_window).material(),
+                )
+                .finish(),
+        }
+    }
+
+    pub fn subagents(filter: &SubagentListFilter) -> Self {
+        Self {
+            material: StableSignatureMaterial::new("subagents-query")
+                .field("session_reference", filter.session_reference.as_str())
+                .field(
+                    "authored_status",
+                    AuthoredStatusFilterSignature::new(&filter.authored_status).material(),
+                )
+                .finish(),
+        }
+    }
+
+    pub fn outputs(filter: &OutputListFilter, lowered_time_window: Option<&TimeWindow>) -> Self {
+        Self {
+            material: StableSignatureMaterial::new("outputs-query")
+                .field(
+                    "source_selection",
+                    SourceSelectionSignature::new(&filter.source_selection).material(),
+                )
+                .field(
+                    "session_reference",
+                    OptionalSignatureText::new(
+                        filter
+                            .session_reference
+                            .as_ref()
+                            .map(|reference| reference.as_str()),
+                    )
+                    .material(),
+                )
+                .field(
+                    "subagent_reference",
+                    OptionalSignatureText::new(
+                        filter
+                            .subagent_reference
+                            .as_ref()
+                            .map(|reference| reference.as_str()),
+                    )
+                    .material(),
+                )
+                .field(
+                    "authored_status",
+                    AuthoredStatusFilterSignature::new(&filter.authored_status).material(),
+                )
+                .field(
+                    "time_window",
+                    OptionalTimeWindowSignature::new(lowered_time_window).material(),
+                )
+                .finish(),
+        }
+    }
+
+    pub fn segments(filter: &OutputSegmentListFilter) -> Self {
+        Self {
+            material: StableSignatureMaterial::new("segments-query")
+                .field("output_reference", filter.output_reference.as_str())
+                .finish(),
+        }
+    }
+
+    pub fn material(&self) -> &str {
+        &self.material
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceSelectionSignature<'a> {
+    selection: &'a SourceSelection,
+}
+
+impl<'a> SourceSelectionSignature<'a> {
+    pub fn new(selection: &'a SourceSelection) -> Self {
+        Self { selection }
+    }
+
+    pub fn material(&self) -> String {
+        match self.selection {
+            SourceSelection::AllConfigured => StableSignatureMaterial::new("source-selection")
+                .field("kind", "all-configured")
+                .finish(),
+            SourceSelection::Only(selected) => {
+                let sources = selected
+                    .sources
+                    .iter()
+                    .map(|source| SourceKindName::new(*source).as_str().to_string())
+                    .collect::<BTreeSet<_>>();
+                let mut material = StableSignatureMaterial::new("source-selection")
+                    .field("kind", "only")
+                    .field("source_count", sources.len().to_string());
+                for source in sources {
+                    material = material.field("source", source);
+                }
+                material.finish()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthoredStatusFilterSignature<'a> {
+    filter: &'a AuthoredStatusFilter,
+}
+
+impl<'a> AuthoredStatusFilterSignature<'a> {
+    pub fn new(filter: &'a AuthoredStatusFilter) -> Self {
+        Self { filter }
+    }
+
+    pub fn material(&self) -> String {
+        match self.filter {
+            AuthoredStatusFilter::AnyAuthoredStatus => {
+                StableSignatureMaterial::new("authored-status-filter")
+                    .field("kind", "any")
+                    .finish()
+            }
+            AuthoredStatusFilter::OnlyAuthoredStatus(status) => {
+                StableSignatureMaterial::new("authored-status-filter")
+                    .field("kind", "only")
+                    .field("status", AuthoredStatusName::new(*status).as_str())
+                    .finish()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OptionalTimeWindowSignature<'a> {
+    time_window: Option<&'a TimeWindow>,
+}
+
+impl<'a> OptionalTimeWindowSignature<'a> {
+    pub fn new(time_window: Option<&'a TimeWindow>) -> Self {
+        Self { time_window }
+    }
+
+    pub fn material(&self) -> String {
+        match self.time_window {
+            Some(time_window) => TimeWindowSignature::new(time_window).material(),
+            None => StableSignatureMaterial::new("time-window")
+                .field("kind", "none")
+                .finish(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeWindowSignature<'a> {
+    time_window: &'a TimeWindow,
+}
+
+impl<'a> TimeWindowSignature<'a> {
+    pub fn new(time_window: &'a TimeWindow) -> Self {
+        Self { time_window }
+    }
+
+    pub fn material(&self) -> String {
+        match self.time_window {
+            TimeWindow::Recent(duration) => StableSignatureMaterial::new("time-window")
+                .field("kind", "recent")
+                .field("amount", duration.amount.into_u64().to_string())
+                .field("unit", DurationUnitName::new(duration.unit).as_str())
+                .finish(),
+            TimeWindow::Range(range) => StableSignatureMaterial::new("time-window")
+                .field("kind", "range")
+                .field("start", range.start.as_str())
+                .field("end", range.end.as_str())
+                .finish(),
+            TimeWindow::Since(timestamp) => StableSignatureMaterial::new("time-window")
+                .field("kind", "since")
+                .field("start", timestamp.as_str())
+                .finish(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OptionalSignatureText<'a> {
+    value: Option<&'a str>,
+}
+
+impl<'a> OptionalSignatureText<'a> {
+    pub fn new(value: Option<&'a str>) -> Self {
+        Self { value }
+    }
+
+    pub fn material(&self) -> String {
+        match self.value {
+            Some(value) => StableSignatureMaterial::new("optional-text")
+                .field("kind", "some")
+                .field("value", value)
+                .finish(),
+            None => StableSignatureMaterial::new("optional-text")
+                .field("kind", "none")
+                .finish(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StableSignatureMaterial {
+    material: String,
+}
+
+impl StableSignatureMaterial {
+    pub fn new(label: &'static str) -> Self {
+        Self {
+            material: String::new(),
+        }
+        .field("label", label)
+    }
+
+    pub fn field(mut self, name: &'static str, value: impl AsRef<str>) -> Self {
+        let value = value.as_ref();
+        self.material.push_str(name);
+        self.material.push('=');
+        self.material.push_str(&value.len().to_string());
+        self.material.push(':');
+        self.material.push_str(value);
+        self.material.push(';');
+        self
+    }
+
+    pub fn finish(self) -> String {
+        self.material
+    }
+}
+
+pub trait PaginatedItemReference {
+    fn pagination_reference(&self) -> &str;
+}
+
+impl PaginatedItemReference for IndexedSession {
+    fn pagination_reference(&self) -> &str {
+        self.reference.as_str()
+    }
+}
+
+impl PaginatedItemReference for IndexedSubagent {
+    fn pagination_reference(&self) -> &str {
+        self.reference.as_str()
+    }
+}
+
+impl PaginatedItemReference for IndexedOutput {
+    fn pagination_reference(&self) -> &str {
+        self.reference.as_str()
+    }
+}
+
+impl PaginatedItemReference for IndexedOutputSegment {
+    fn pagination_reference(&self) -> &str {
+        self.reference.as_str()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaginationCursorBinding {
+    collection: PageCollectionKind,
+    order: ListingOrder,
+    limit: PageLimit,
+    query: PaginationQueryShape,
+}
+
+impl PaginationCursorBinding {
+    pub fn new(
+        collection: PageCollectionKind,
+        page: &PageRequest,
+        query: PaginationQueryShape,
+    ) -> Self {
+        Self {
+            collection,
+            order: page.order,
+            limit: page.limit,
+            query,
+        }
+    }
+
+    pub fn signature<T: PaginatedItemReference>(&self, items: &[T]) -> String {
+        let mut material = StableSignatureMaterial::new("pagination-cursor-binding")
+            .field("signature_version", "2")
+            .field("collection", self.collection.as_str())
+            .field("order", ListingOrderName::new(self.order).as_str())
+            .field("limit", self.limit.into_u64().to_string())
+            .field("query", self.query.material())
+            .field("item_count", items.len().to_string());
+        for item in items {
+            material = material.field("item_reference", item.pagination_reference());
+        }
+        StableHash::new(material.finish()).hex()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaginatedItems<T> {
     items: Vec<T>,
     metadata: PageMetadata,
@@ -2207,30 +2520,32 @@ pub struct PaginationWindow<T> {
     operation: OperationKind,
     collection: PageCollectionKind,
     page: PageRequest,
-    signature: String,
+    binding: PaginationCursorBinding,
     phantom: std::marker::PhantomData<T>,
 }
 
-impl<T: Clone> PaginationWindow<T> {
+impl<T: Clone + PaginatedItemReference> PaginationWindow<T> {
     pub fn new(
         request_identifier: RequestIdentifier,
         operation: OperationKind,
         collection: PageCollectionKind,
         page: PageRequest,
-        signature: String,
+        query: PaginationQueryShape,
     ) -> Self {
+        let binding = PaginationCursorBinding::new(collection, &page, query);
         Self {
             request_identifier,
             operation,
             collection,
             page,
-            signature,
+            binding,
             phantom: std::marker::PhantomData,
         }
     }
 
     pub fn select(&self, items: &[T]) -> OutputOperationResult<PaginatedItems<T>> {
-        let offset = self.cursor_offset(items.len())?;
+        let signature = self.binding.signature(items);
+        let offset = self.cursor_offset(items.len(), &signature)?;
         let limit = self.page.limit.into_u64() as usize;
         let selected = items
             .iter()
@@ -2241,13 +2556,8 @@ impl<T: Clone> PaginationWindow<T> {
         let next_offset = offset + selected.len();
         let next_cursor = if next_offset < items.len() {
             Some(
-                PageCursor::new(
-                    self.collection,
-                    self.page.order,
-                    next_offset,
-                    self.signature.clone(),
-                )
-                .to_reference(),
+                PageCursor::new(self.collection, self.page.order, next_offset, signature)
+                    .to_reference(),
             )
         } else {
             None
@@ -2264,7 +2574,11 @@ impl<T: Clone> PaginationWindow<T> {
         })
     }
 
-    pub fn cursor_offset(&self, item_count: usize) -> OutputOperationResult<usize> {
+    pub fn cursor_offset(
+        &self,
+        item_count: usize,
+        signature: &str,
+    ) -> OutputOperationResult<usize> {
         let Some(cursor) = &self.page.cursor else {
             return Ok(0);
         };
@@ -2275,7 +2589,7 @@ impl<T: Clone> PaginationWindow<T> {
         })?;
         if parsed.collection != self.collection
             || parsed.order != self.page.order
-            || parsed.signature != self.signature
+            || parsed.signature != signature
             || parsed.offset > item_count
         {
             return Err(factory.stale(Some(RejectedFragileReference::PageCursor(cursor.clone()))));
@@ -2338,7 +2652,7 @@ impl PageCursor {
 
     pub fn to_reference(&self) -> FragilePageCursor {
         FragilePageCursor::new(format!(
-            "cursor:v1:{}:{}:{}:{}",
+            "cursor:v2:{}:{}:{}:{}",
             self.collection.as_str(),
             ListingOrderName::new(self.order).as_str(),
             self.offset,
@@ -2348,7 +2662,7 @@ impl PageCursor {
 
     pub fn parse(reference: &FragilePageCursor) -> Option<Self> {
         let parts = reference.as_str().split(':').collect::<Vec<_>>();
-        if parts.len() != 6 || parts[0] != "cursor" || parts[1] != "v1" {
+        if parts.len() != 6 || parts[0] != "cursor" || parts[1] != "v2" {
             return None;
         }
         Some(Self {
@@ -2384,6 +2698,25 @@ impl ListingOrderName {
             "newest" => Some(ListingOrder::NewestFirst),
             "reference" => Some(ListingOrder::ReferenceAscending),
             _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurationUnitName {
+    unit: DurationUnit,
+}
+
+impl DurationUnitName {
+    pub fn new(unit: DurationUnit) -> Self {
+        Self { unit }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self.unit {
+            DurationUnit::Minutes => "minutes",
+            DurationUnit::Hours => "hours",
+            DurationUnit::Days => "days",
         }
     }
 }
