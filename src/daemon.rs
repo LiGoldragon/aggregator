@@ -14,7 +14,8 @@ use meta_signal_aggregator::{
     MetaAggregatorRequest, SocketMode,
 };
 use signal_aggregator::{
-    AggregatorFrame, AggregatorFrameBody, AggregatorReply, AggregatorRequest, RejectionReason,
+    AggregatorFrame, AggregatorFrameBody, AggregatorReply, AggregatorRequest, OperationKind,
+    OperationRejectionReason, RejectionReason,
 };
 use signal_frame::{NonEmpty, Reply as FrameReply, RequestRejectionReason, SubReply};
 
@@ -418,47 +419,129 @@ impl OrdinaryRequestHandler {
     pub fn handle(&self, request: AggregatorRequest) -> AggregatorReply {
         match request {
             AggregatorRequest::Version(_) => self.signal.version_report(),
-            AggregatorRequest::Collect(request) => {
-                if let Some(rejection) = self.signal.collect_rejection(&request) {
-                    return rejection;
-                }
-                let configuration = match self
-                    .sema
-                    .lock()
-                    .ok()
-                    .and_then(|sema| sema.active_configuration())
+            AggregatorRequest::Collect(request) => self.handle_collect(request),
+            AggregatorRequest::ListSessions(request) => {
+                match self
+                    .nexus_for_operation(&request.request_identifier, OperationKind::ListSessions)
                 {
-                    Some(configuration) => configuration,
-                    None => {
-                        return self.signal.reject_collect(
-                            request.request_identifier,
-                            RejectionReason::ConfigurationUnavailable,
-                        );
-                    }
-                };
-                let runtime_configuration =
-                    match RuntimeConfiguration::validate_from_meta(&configuration) {
-                        RuntimeConfigurationValidation::Accepted(configuration) => configuration,
-                        RuntimeConfigurationValidation::Rejected(_) => {
-                            return self.signal.reject_collect(
-                                request.request_identifier,
-                                RejectionReason::ConfigurationUnavailable,
-                            );
-                        }
-                    };
-                let request_identifier = request.request_identifier.clone();
-                match NexusPlane::with_runtime_configuration(
-                    runtime_configuration,
-                    self.clock.clone(),
-                )
-                .collect(request)
-                {
-                    Ok(package) => AggregatorReply::EvidenceCollected(package),
-                    Err(_) => self
-                        .signal
-                        .reject_collect(request_identifier, RejectionReason::CollectionUnavailable),
+                    Ok(nexus) => match nexus.list_sessions(request) {
+                        Ok(reply) => AggregatorReply::SessionsListed(reply),
+                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    },
+                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
                 }
             }
+            AggregatorRequest::ListSubagents(request) => {
+                match self
+                    .nexus_for_operation(&request.request_identifier, OperationKind::ListSubagents)
+                {
+                    Ok(nexus) => match nexus.list_subagents(request) {
+                        Ok(reply) => AggregatorReply::SubagentsListed(reply),
+                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    },
+                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                }
+            }
+            AggregatorRequest::ListOutputs(request) => {
+                match self
+                    .nexus_for_operation(&request.request_identifier, OperationKind::ListOutputs)
+                {
+                    Ok(nexus) => match nexus.list_outputs(request) {
+                        Ok(reply) => AggregatorReply::OutputsListed(reply),
+                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    },
+                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                }
+            }
+            AggregatorRequest::ListOutputSegments(request) => {
+                match self.nexus_for_operation(
+                    &request.request_identifier,
+                    OperationKind::ListOutputSegments,
+                ) {
+                    Ok(nexus) => match nexus.list_output_segments(request) {
+                        Ok(reply) => AggregatorReply::OutputSegmentsListed(reply),
+                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    },
+                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                }
+            }
+            AggregatorRequest::EstimateOutput(request) => {
+                match self
+                    .nexus_for_operation(&request.request_identifier, OperationKind::EstimateOutput)
+                {
+                    Ok(nexus) => match nexus.estimate_output(request) {
+                        Ok(reply) => AggregatorReply::OutputEstimated(reply),
+                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    },
+                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                }
+            }
+            AggregatorRequest::ReadOutput(request) => {
+                match self
+                    .nexus_for_operation(&request.request_identifier, OperationKind::ReadOutput)
+                {
+                    Ok(nexus) => match nexus.read_output(request) {
+                        Ok(reply) => AggregatorReply::OutputRead(reply),
+                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    },
+                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                }
+            }
+        }
+    }
+
+    pub fn handle_collect(&self, request: signal_aggregator::EvidenceRequest) -> AggregatorReply {
+        if let Some(rejection) = self.signal.collect_rejection(&request) {
+            return rejection;
+        }
+        let runtime_configuration = match self.runtime_configuration() {
+            Some(configuration) => configuration,
+            None => {
+                return self.signal.reject_collect(
+                    request.request_identifier,
+                    RejectionReason::ConfigurationUnavailable,
+                );
+            }
+        };
+        let request_identifier = request.request_identifier.clone();
+        match NexusPlane::with_runtime_configuration(runtime_configuration, self.clock.clone())
+            .collect(request)
+        {
+            Ok(package) => AggregatorReply::EvidenceCollected(package),
+            Err(_) => self
+                .signal
+                .reject_collect(request_identifier, RejectionReason::CollectionUnavailable),
+        }
+    }
+
+    pub fn nexus_for_operation(
+        &self,
+        request_identifier: &signal_aggregator::RequestIdentifier,
+        operation: OperationKind,
+    ) -> std::result::Result<NexusPlane, signal_aggregator::OperationRejected> {
+        let Some(runtime_configuration) = self.runtime_configuration() else {
+            return Err(signal_aggregator::OperationRejected {
+                request_identifier: request_identifier.clone(),
+                operation,
+                reason: OperationRejectionReason::Unsupported,
+                reference: None,
+            });
+        };
+        Ok(NexusPlane::with_runtime_configuration(
+            runtime_configuration,
+            self.clock.clone(),
+        ))
+    }
+
+    pub fn runtime_configuration(&self) -> Option<RuntimeConfiguration> {
+        let configuration = self
+            .sema
+            .lock()
+            .ok()
+            .and_then(|sema| sema.active_configuration())?;
+        match RuntimeConfiguration::validate_from_meta(&configuration) {
+            RuntimeConfigurationValidation::Accepted(configuration) => Some(configuration),
+            RuntimeConfigurationValidation::Rejected(_) => None,
         }
     }
 }

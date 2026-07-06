@@ -5,11 +5,13 @@ pub mod repository;
 
 use std::path::{Path, PathBuf};
 
+use serde_json::Value;
 use signal_aggregator::{
-    ByteCount, ByteLimit, ByteRange, FilesystemPath, ItemCount, LimitPolicy, LineNumber, LineRange,
-    Projection, ReadFailure, ReadFailureReason, SegmentProjection, SourceIdentifier, SourceKind,
-    SourceVolume, TimeWindow, Timestamp, TranscriptSegment, TranscriptSegmentIdentifier,
-    TranscriptText, TranscriptTextExcerpt, Truncation, TruncationReason,
+    AuthoredStatus, ByteCount, ByteLimit, ByteRange, FilesystemPath, ItemCount, LimitPolicy,
+    LineNumber, LineRange, OutputTitle, Projection, ReadFailure, ReadFailureReason,
+    SegmentProjection, SourceIdentifier, SourceKind, SourceVolume, SubagentName, TimeWindow,
+    Timestamp, TranscriptSegment, TranscriptSegmentIdentifier, TranscriptText,
+    TranscriptTextExcerpt, Truncation, TruncationReason,
 };
 
 use crate::time_model::CanonicalTimestamp;
@@ -136,6 +138,54 @@ pub struct TranscriptReadOutcome {
     pub read_failures: Vec<signal_aggregator::ReadFailure>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptRawReadOutcome {
+    pub source: SourceKind,
+    pub source_identifier: SourceIdentifier,
+    pub records: Vec<TranscriptRecord>,
+    pub truncations: Vec<Truncation>,
+    pub read_failures: Vec<signal_aggregator::ReadFailure>,
+}
+
+impl TranscriptRawReadOutcome {
+    pub fn new(
+        source: SourceKind,
+        source_identifier: SourceIdentifier,
+        records: Vec<TranscriptRecord>,
+        truncations: Vec<Truncation>,
+        read_failures: Vec<signal_aggregator::ReadFailure>,
+    ) -> Self {
+        Self {
+            source,
+            source_identifier,
+            records,
+            truncations,
+            read_failures,
+        }
+    }
+
+    pub fn empty(source: SourceKind, source_identifier: SourceIdentifier) -> Self {
+        Self::new(
+            source,
+            source_identifier,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    pub fn project(self, request: &TranscriptReadRequest) -> TranscriptReadOutcome {
+        TranscriptReadOutcome::from_records_and_truncations(
+            self.source,
+            self.source_identifier,
+            self.records,
+            self.read_failures,
+            self.truncations,
+            request,
+        )
+    }
+}
+
 impl TranscriptReadOutcome {
     pub fn empty() -> Self {
         Self {
@@ -190,6 +240,9 @@ pub struct TranscriptRecord {
     pub line_number: u64,
     pub timestamp: Option<Timestamp>,
     pub text: String,
+    pub title: Option<OutputTitle>,
+    pub subagent_name: Option<SubagentName>,
+    pub authored_status: AuthoredStatus,
 }
 
 impl TranscriptRecord {
@@ -208,11 +261,33 @@ impl TranscriptRecord {
             line_number,
             timestamp,
             text,
+            title: None,
+            subagent_name: None,
+            authored_status: AuthoredStatus::AgentAuthored,
         }
+    }
+
+    pub fn with_title(mut self, title: Option<OutputTitle>) -> Self {
+        self.title = title;
+        self
+    }
+
+    pub fn with_subagent_name(mut self, subagent_name: Option<SubagentName>) -> Self {
+        self.subagent_name = subagent_name;
+        self
+    }
+
+    pub fn with_authored_status(mut self, authored_status: AuthoredStatus) -> Self {
+        self.authored_status = authored_status;
+        self
     }
 
     pub fn byte_count(&self) -> u64 {
         self.text.len() as u64
+    }
+
+    pub fn line_count(&self) -> u64 {
+        OutputLineCounter::new(&self.text).count()
     }
 
     pub fn segment_identifier(&self) -> TranscriptSegmentIdentifier {
@@ -226,7 +301,7 @@ impl TranscriptRecord {
     pub fn line_range(&self) -> LineRange {
         LineRange {
             start: LineNumber::new(self.line_number),
-            end: LineNumber::new(self.line_number),
+            end: LineNumber::new(self.line_number + 1),
         }
     }
 
@@ -234,6 +309,92 @@ impl TranscriptRecord {
         ByteRange {
             start: ByteCount::new(0),
             end: ByteCount::new(self.byte_count()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputLineCounter<'a> {
+    text: &'a str,
+}
+
+impl<'a> OutputLineCounter<'a> {
+    pub fn new(text: &'a str) -> Self {
+        Self { text }
+    }
+
+    pub fn count(&self) -> u64 {
+        if self.text.is_empty() {
+            0
+        } else {
+            self.text.lines().count() as u64
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TranscriptJsonMetadata<'a> {
+    value: &'a Value,
+}
+
+impl<'a> TranscriptJsonMetadata<'a> {
+    pub fn new(value: &'a Value) -> Self {
+        Self { value }
+    }
+
+    pub fn title(&self) -> Option<OutputTitle> {
+        self.string_field(&["title", "summary", "name"])
+            .map(OutputTitle::new)
+    }
+
+    pub fn subagent_name(&self) -> Option<SubagentName> {
+        self.string_field(&["subagent", "subagent_name", "agent_name"])
+            .map(SubagentName::new)
+    }
+
+    pub fn authored_status(&self) -> AuthoredStatus {
+        self.string_field(&["authored_status", "authorship"])
+            .and_then(|value| AuthoredStatusName::new(value).authored_status())
+            .or_else(|| {
+                self.string_field(&["role", "type", "author"])
+                    .and_then(|value| AuthoredStatusName::new(value).authored_status())
+            })
+            .unwrap_or(AuthoredStatus::AgentAuthored)
+    }
+
+    pub fn string_field(&self, names: &[&str]) -> Option<&'a str> {
+        names
+            .iter()
+            .find_map(|name| self.value.get(*name).and_then(Value::as_str))
+            .filter(|value| !value.trim().is_empty())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AuthoredStatusName<'a> {
+    value: &'a str,
+}
+
+impl<'a> AuthoredStatusName<'a> {
+    pub fn new(value: &'a str) -> Self {
+        Self { value }
+    }
+
+    pub fn authored_status(&self) -> Option<AuthoredStatus> {
+        match self.value.to_ascii_lowercase().as_str() {
+            "agent" | "agent-authored" | "agentauthored" | "assistant" | "tool" | "subagent" => {
+                Some(AuthoredStatus::AgentAuthored)
+            }
+            "human" | "human-authored" | "humanauthored" | "user" => {
+                Some(AuthoredStatus::HumanAuthored)
+            }
+            "mixed" | "mixed-authorship" | "mixedauthorship" => {
+                Some(AuthoredStatus::MixedAuthorship)
+            }
+            "unknown" | "unknown-authorship" | "unknownauthorship" => {
+                Some(AuthoredStatus::UnknownAuthorship)
+            }
+            _ => None,
         }
     }
 }

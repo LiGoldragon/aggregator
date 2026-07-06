@@ -9,9 +9,9 @@ use crate::{
     AdapterKind,
     adapter::{
         TranscriptBoundedFile, TranscriptBoundedFileRead, TranscriptFailureAccumulator,
-        TranscriptFileDiscovery, TranscriptLineLocator, TranscriptLineText,
-        TranscriptLineTextOutcome, TranscriptReadOutcome, TranscriptReadRequest, TranscriptRecord,
-        TranscriptScanLimits,
+        TranscriptFileDiscovery, TranscriptJsonMetadata, TranscriptLineLocator, TranscriptLineText,
+        TranscriptLineTextOutcome, TranscriptRawReadOutcome, TranscriptReadOutcome,
+        TranscriptReadRequest, TranscriptRecord, TranscriptScanLimits,
     },
     configuration::TranscriptRootConfiguration,
     time_model::CanonicalTimestamp,
@@ -59,13 +59,18 @@ impl ClaudeJsonlRootReader {
         {
             return outcome;
         }
+        self.read_records().project(request)
+    }
+
+    pub fn read_records(&self) -> TranscriptRawReadOutcome {
+        let source_identifier = self.source_identifier();
         if !self.root.exists() {
-            return TranscriptReadOutcome::from_records(
+            return TranscriptRawReadOutcome::new(
                 SourceKind::Claude,
                 source_identifier.clone(),
                 Vec::new(),
+                Vec::new(),
                 vec![self.failure(ReadFailureReason::Missing, Some(self.root.clone()))],
-                request,
             );
         }
         let discovery =
@@ -74,12 +79,12 @@ impl ClaudeJsonlRootReader {
             {
                 Ok(discovery) => discovery,
                 Err(error) => {
-                    return TranscriptReadOutcome::from_records(
+                    return TranscriptRawReadOutcome::new(
                         SourceKind::Claude,
                         source_identifier.clone(),
                         Vec::new(),
+                        Vec::new(),
                         vec![self.failure_from_io(error, Some(self.root.clone()))],
-                        request,
                     );
                 }
             };
@@ -111,13 +116,12 @@ impl ClaudeJsonlRootReader {
         }
         let failure_outcome = failures.finish();
         truncations.extend(failure_outcome.truncations);
-        TranscriptReadOutcome::from_records_and_truncations(
+        TranscriptRawReadOutcome::new(
             SourceKind::Claude,
             source_identifier,
             records,
-            failure_outcome.failures,
             truncations,
-            request,
+            failure_outcome.failures,
         )
     }
 
@@ -216,14 +220,20 @@ impl<'a> ClaudeJsonlRecord<'a> {
             }
             None => None,
         };
-        ClaudeJsonlRecordResult::Record(TranscriptRecord::new(
-            SourceKind::Claude,
-            source_identifier,
-            path,
-            line_number,
-            timestamp,
-            text,
-        ))
+        let metadata = TranscriptJsonMetadata::new(&value);
+        ClaudeJsonlRecordResult::Record(
+            TranscriptRecord::new(
+                SourceKind::Claude,
+                source_identifier,
+                path,
+                line_number,
+                timestamp,
+                text,
+            )
+            .with_title(metadata.title())
+            .with_subagent_name(metadata.subagent_name())
+            .with_authored_status(metadata.authored_status()),
+        )
     }
 }
 

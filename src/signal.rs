@@ -1,6 +1,7 @@
 use signal_aggregator::{
     AggregatorOperationKind, AggregatorReply, ContractName, ContractVersion, EvidenceRejected,
-    EvidenceRequest, RejectionReason, RequestIdentifier, TimeWindow, VersionReport,
+    EvidenceRequest, OperationKind, OperationRejected, OperationRejectionReason,
+    RejectedFragileReference, RejectionReason, RequestIdentifier, TimeWindow, VersionReport,
 };
 
 use crate::time_model::CanonicalTimestamp;
@@ -12,7 +13,7 @@ impl SignalPlane {
     pub fn version_report(&self) -> AggregatorReply {
         AggregatorReply::VersionReported(VersionReport {
             contract_name: ContractName::new("signal-aggregator"),
-            contract_version: ContractVersion::new("0.1.0"),
+            contract_version: ContractVersion::new("0.2.0"),
         })
     }
 
@@ -25,6 +26,21 @@ impl SignalPlane {
             request_identifier,
             operation: AggregatorOperationKind::Collect,
             reason,
+        })
+    }
+
+    pub fn reject_operation(
+        &self,
+        request_identifier: RequestIdentifier,
+        operation: OperationKind,
+        reason: OperationRejectionReason,
+        reference: Option<RejectedFragileReference>,
+    ) -> AggregatorReply {
+        AggregatorReply::OperationRejected(OperationRejected {
+            request_identifier,
+            operation,
+            reason,
+            reference,
         })
     }
 

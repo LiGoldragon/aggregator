@@ -10,6 +10,7 @@ pub mod configuration;
 pub mod daemon;
 pub mod error;
 pub mod nexus;
+pub mod output_index;
 pub mod sema;
 pub mod signal;
 pub mod time_model;
@@ -20,12 +21,14 @@ pub use client::{
 };
 pub use clock::{CollectionClock, ReferenceTime};
 pub use configuration::{
-    ConfigurationFixture, ConfigurationStore, RepositoryAdapterConfiguration, RuntimeConfiguration,
-    RuntimeConfigurationValidation, RuntimeSourceSelection, TranscriptAdapterConfiguration,
-    TranscriptRootConfiguration,
+    ConfigurationFixture, ConfigurationStore, LegacyRecoveryKind, RepositoryAdapterConfiguration,
+    RuntimeConfiguration, RuntimeConfigurationValidation, RuntimeLegacyRecoveryRoot,
+    RuntimeOutputInterfaceConfiguration, RuntimeSourceSelection, RuntimeStorePath,
+    TranscriptAdapterConfiguration, TranscriptRootConfiguration,
 };
 pub use daemon::AggregatorDaemonCommand;
 pub use error::{Error, Result};
 pub use nexus::NexusPlane;
+pub use output_index::{FragileIndexStore, OutputInterfaceRuntime};
 pub use sema::SemaPlane;
 pub use signal::SignalPlane;

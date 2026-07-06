@@ -1,5 +1,9 @@
 use signal_aggregator::{
-    EvidencePackage, EvidenceRequest, PackageIdentifier, SourceKind, TimeWindow,
+    EvidencePackage, EvidenceRequest, OperationKind, OperationRejectionReason,
+    OutputEstimateRequest, OutputEstimated, OutputListRequest, OutputRead, OutputReadRequest,
+    OutputSegmentListRequest, OutputSegmentsListed, OutputsListed, PackageIdentifier,
+    RequestIdentifier, SessionListRequest, SessionsListed, SourceKind, SubagentListRequest,
+    SubagentsListed, TimeWindow,
 };
 
 use crate::{
@@ -15,6 +19,7 @@ use crate::{
         },
     },
     configuration::TranscriptAdapterConfiguration,
+    output_index::{OperationRejectedFactory, OutputInterfaceRuntime, OutputOperationResult},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +96,68 @@ impl NexusPlane {
                 .merge_repository(self.collect_repository_sources(selection.repositories));
         }
         Ok(package_builder.finish())
+    }
+
+    pub fn list_sessions(
+        &self,
+        request: SessionListRequest,
+    ) -> OutputOperationResult<SessionsListed> {
+        self.output_interface(&request.request_identifier, OperationKind::ListSessions)?
+            .list_sessions(request)
+    }
+
+    pub fn list_subagents(
+        &self,
+        request: SubagentListRequest,
+    ) -> OutputOperationResult<SubagentsListed> {
+        self.output_interface(&request.request_identifier, OperationKind::ListSubagents)?
+            .list_subagents(request)
+    }
+
+    pub fn list_outputs(&self, request: OutputListRequest) -> OutputOperationResult<OutputsListed> {
+        self.output_interface(&request.request_identifier, OperationKind::ListOutputs)?
+            .list_outputs(request)
+    }
+
+    pub fn list_output_segments(
+        &self,
+        request: OutputSegmentListRequest,
+    ) -> OutputOperationResult<OutputSegmentsListed> {
+        self.output_interface(
+            &request.request_identifier,
+            OperationKind::ListOutputSegments,
+        )?
+        .list_output_segments(request)
+    }
+
+    pub fn estimate_output(
+        &self,
+        request: OutputEstimateRequest,
+    ) -> OutputOperationResult<OutputEstimated> {
+        self.output_interface(&request.request_identifier, OperationKind::EstimateOutput)?
+            .estimate_output(request)
+    }
+
+    pub fn read_output(&self, request: OutputReadRequest) -> OutputOperationResult<OutputRead> {
+        self.output_interface(&request.request_identifier, OperationKind::ReadOutput)?
+            .read_output(request)
+    }
+
+    pub fn output_interface(
+        &self,
+        request_identifier: &RequestIdentifier,
+        operation: OperationKind,
+    ) -> OutputOperationResult<OutputInterfaceRuntime> {
+        let Some(configuration) = &self.runtime_configuration else {
+            return Err(
+                OperationRejectedFactory::new(request_identifier.clone(), operation)
+                    .rejected(OperationRejectionReason::Unsupported, None),
+            );
+        };
+        Ok(OutputInterfaceRuntime::new(
+            configuration.clone(),
+            self.clock.clone(),
+        ))
     }
 
     pub fn repository_command_policy(&self) -> RepositoryCommandPolicy {

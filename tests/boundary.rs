@@ -13,10 +13,10 @@ use std::{
 };
 
 use aggregator::{
-    AdapterKind, CollectionClock, ConfigurationFixture, ConfigurationStore, Error, NexusPlane,
-    ReferenceTime, RepositoryAdapterConfiguration, RuntimeConfiguration,
-    RuntimeConfigurationValidation, SemaPlane, SignalPlane, TranscriptAdapterConfiguration,
-    TranscriptRootConfiguration,
+    AdapterKind, CollectionClock, ConfigurationFixture, ConfigurationStore, Error,
+    FragileIndexStore, NexusPlane, ReferenceTime, RepositoryAdapterConfiguration,
+    RuntimeConfiguration, RuntimeConfigurationValidation, SemaPlane, SignalPlane,
+    TranscriptAdapterConfiguration, TranscriptRootConfiguration,
     adapter::{
         MaximumDiscoveredFiles, MaximumFileBytes, MaximumLineBytes, MaximumReadFailures,
         MaximumScanEntries, TranscriptReadOutcome, TranscriptReadRequest, TranscriptRecord,
@@ -29,21 +29,28 @@ use aggregator::{
             RepositoryEvidenceFixture,
         },
     },
+    configuration::LegacyAggregatorConfiguration,
     daemon::{PrototypeDaemon, PrototypeSocket},
 };
 use meta_signal_aggregator::{
     ActiveRepository, AggregatorConfiguration, ConfigurationCandidate, ConfigurationChange,
-    ConfigurationObservation, FilesystemPath, MetaAggregatorReply, MetaAggregatorRequest,
-    ObserveConfiguration, RepositoryName, SocketMode, TranscriptRoot, TranscriptSource,
+    ConfigurationObservation, FilesystemPath, LegacyRecoveryAccess, LegacyRecoveryRoot,
+    LegacyRecoverySource, MetaAggregatorReply, MetaAggregatorRequest, ObserveConfiguration,
+    OutputInterfaceConfiguration, RepositoryName, SocketMode, TranscriptRoot, TranscriptSource,
 };
 use nota::{NotaEncode, NotaSource};
 use signal_aggregator::{
-    AggregatorReply, AggregatorRequest, BoundedTextProjection, ByteLimit, ContractName,
+    AggregatorReply, AggregatorRequest, AuthoredStatus, AuthoredStatusFilter,
+    BoundedTextProjection, ByteCount, ByteLimit, ByteRange, CardProjection, ContractName,
     DurationAmount, DurationUnit, EvidenceRequest, FilesystemPath as SignalFilesystemPath,
-    LimitPolicy, Projection, ReadFailureReason, RejectionReason, RelativeDuration,
-    RepositoryIdentifier, RepositoryPath, RepositoryWorktreeState, RequestIdentifier, SegmentLimit,
-    SegmentProjection, SelectedSources, SourceIdentifier, SourceKind, SourceSelection, TimeRange,
-    TimeWindow, Timestamp, TruncationReason, Version,
+    FragileOutputReference, LimitPolicy, ListingOrder, OperationRejectionReason, OutputListFilter,
+    OutputListRequest, OutputReadRange, OutputReadRequest, OutputSegmentListFilter,
+    OutputSegmentListRequest, PageLimit, PageRequest, Projection, ReadFailureReason,
+    RejectionReason, RelativeDuration, RepositoryIdentifier, RepositoryPath,
+    RepositoryWorktreeState, RequestIdentifier, SegmentLimit, SegmentProjection, SelectedSources,
+    SessionListFilter, SessionListRequest, SourceIdentifier, SourceKind, SourceSelection,
+    SubagentListFilter, SubagentListRequest, TimeRange, TimeWindow, Timestamp, TruncationReason,
+    Version,
 };
 use tempfile::TempDir;
 
@@ -119,6 +126,7 @@ fn accepted_configuration(root: &TempDir) -> AggregatorConfiguration {
             maximum_segments: SegmentLimit::new(16),
             maximum_bytes: ByteLimit::new(4096),
         },
+        output_interfaces: OutputInterfaceConfiguration::default(),
     }
 }
 
@@ -694,6 +702,379 @@ fn nexus_lowers_recent_window_before_transcript_adapters() {
 }
 
 #[test]
+fn output_interface_lists_subagents_outputs_segments_and_bounded_reads() {
+    let root = TempDir::new().expect("temporary root");
+    let configuration = accepted_configuration(&root);
+    fs::write(
+        root.path().join("claude/session.jsonl"),
+        concat!(
+            "{\"timestamp\":\"2026-01-02T00:10:00Z\",\"title\":\"first\",\"subagent_name\":\"writer\",\"role\":\"assistant\",\"text\":\"alpha one\"}\n",
+            "{\"timestamp\":\"2026-01-02T00:20:00Z\",\"title\":\"second\",\"subagent_name\":\"writer\",\"role\":\"assistant\",\"text\":\"beta two\"}\n",
+        ),
+    )
+    .expect("write transcript");
+    let runtime = RuntimeConfiguration::validate_from_meta(&configuration)
+        .accepted_configuration()
+        .expect("accepted configuration")
+        .clone();
+    let index_store = FragileIndexStore::from_store_path(runtime.store_path());
+    let clock = CollectionClock::fixed(
+        ReferenceTime::from_timestamp(Timestamp::new("2026-01-02T01:00:00Z"))
+            .expect("reference timestamp"),
+    );
+    let nexus = NexusPlane::with_runtime_configuration(runtime, clock);
+
+    let sessions = nexus
+        .list_sessions(SessionListRequest {
+            request_identifier: RequestIdentifier::new("list-sessions"),
+            filter: SessionListFilter {
+                source_selection: SourceSelection::Only(SelectedSources {
+                    sources: vec![SourceKind::Claude],
+                }),
+                time_window: Some(TimeWindow::Since(Timestamp::new("2026-01-01T00:00:00Z"))),
+            },
+            page: PageRequest {
+                limit: PageLimit::new(10),
+                cursor: None,
+                order: ListingOrder::OldestFirst,
+            },
+        })
+        .expect("list sessions");
+    assert_eq!(sessions.sessions.len(), 1);
+    assert_eq!(
+        sessions.sessions[0]
+            .output_count
+            .as_ref()
+            .map(|count| count.into_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        sessions.sessions[0]
+            .last_observed_at
+            .as_ref()
+            .map(|timestamp| timestamp.as_str()),
+        Some("2026-01-02T00:20:00Z")
+    );
+    assert!(index_store.path().exists());
+
+    let subagents = nexus
+        .list_subagents(SubagentListRequest {
+            request_identifier: RequestIdentifier::new("list-subagents"),
+            filter: SubagentListFilter {
+                session_reference: sessions.sessions[0].reference.clone(),
+                authored_status: AuthoredStatusFilter::AnyAuthoredStatus,
+            },
+            page: PageRequest {
+                limit: PageLimit::new(10),
+                cursor: None,
+                order: ListingOrder::OldestFirst,
+            },
+        })
+        .expect("list subagents");
+    assert_eq!(subagents.subagents.len(), 1);
+    assert_eq!(subagents.subagents[0].name.as_str(), "writer");
+    assert_eq!(
+        subagents.subagents[0].authored_status,
+        AuthoredStatus::AgentAuthored
+    );
+
+    let outputs = nexus
+        .list_outputs(OutputListRequest {
+            request_identifier: RequestIdentifier::new("list-outputs"),
+            filter: OutputListFilter {
+                source_selection: SourceSelection::Only(SelectedSources {
+                    sources: vec![SourceKind::Claude],
+                }),
+                session_reference: Some(sessions.sessions[0].reference.clone()),
+                subagent_reference: Some(subagents.subagents[0].reference.clone()),
+                authored_status: AuthoredStatusFilter::OnlyAuthoredStatus(
+                    AuthoredStatus::AgentAuthored,
+                ),
+                time_window: Some(TimeWindow::Since(Timestamp::new("2026-01-01T00:00:00Z"))),
+            },
+            page: PageRequest {
+                limit: PageLimit::new(10),
+                cursor: None,
+                order: ListingOrder::OldestFirst,
+            },
+            projection: CardProjection::BoundedPreview(BoundedTextProjection {
+                maximum_bytes: ByteLimit::new(5),
+            }),
+        })
+        .expect("list outputs");
+    assert_eq!(outputs.outputs.len(), 2);
+    assert_eq!(
+        outputs.outputs[0]
+            .preview
+            .as_ref()
+            .map(|preview| preview.text.as_str()),
+        Some("alpha")
+    );
+    assert_eq!(
+        outputs.outputs[0]
+            .size
+            .byte_count
+            .as_ref()
+            .map(|count| count.into_u64()),
+        Some(9)
+    );
+
+    let segments = nexus
+        .list_output_segments(OutputSegmentListRequest {
+            request_identifier: RequestIdentifier::new("list-segments"),
+            filter: OutputSegmentListFilter {
+                output_reference: outputs.outputs[0].reference.clone(),
+            },
+            page: PageRequest {
+                limit: PageLimit::new(10),
+                cursor: None,
+                order: ListingOrder::OldestFirst,
+            },
+            projection: CardProjection::MetadataOnly,
+        })
+        .expect("list output segments");
+    assert_eq!(segments.segments.len(), 1);
+    assert_eq!(
+        segments.segments[0]
+            .byte_range
+            .as_ref()
+            .map(|range| (range.start.into_u64(), range.end.into_u64())),
+        Some((0, 9))
+    );
+    assert_eq!(
+        segments.segments[0]
+            .line_range
+            .as_ref()
+            .map(|range| (range.start.into_u64(), range.end.into_u64())),
+        Some((1, 2))
+    );
+
+    let estimated = nexus
+        .estimate_output(signal_aggregator::OutputEstimateRequest {
+            request_identifier: RequestIdentifier::new("estimate-output"),
+            output_reference: outputs.outputs[0].reference.clone(),
+            range: OutputReadRange::Bytes(ByteRange {
+                start: ByteCount::new(0),
+                end: ByteCount::new(5),
+            }),
+        })
+        .expect("estimate output");
+    assert_eq!(
+        estimated
+            .size
+            .byte_count
+            .as_ref()
+            .map(|count| count.into_u64()),
+        Some(5)
+    );
+
+    let read = nexus
+        .read_output(OutputReadRequest {
+            request_identifier: RequestIdentifier::new("read-output"),
+            output_reference: outputs.outputs[0].reference.clone(),
+            range: OutputReadRange::Bytes(ByteRange {
+                start: ByteCount::new(0),
+                end: ByteCount::new(5),
+            }),
+            maximum_bytes: ByteLimit::new(5),
+        })
+        .expect("read output");
+    assert_eq!(read.excerpt.text.as_str(), "alpha");
+    assert!(read.excerpt.truncation.is_none());
+}
+
+#[test]
+fn output_interface_paginates_enforces_limits_and_rejects_stale_references() {
+    let root = TempDir::new().expect("temporary root");
+    let configuration = accepted_configuration(&root);
+    let transcript = root.path().join("claude/session.jsonl");
+    fs::write(
+        &transcript,
+        concat!(
+            "{\"timestamp\":\"2026-01-02T00:10:00Z\",\"text\":\"first output\"}\n",
+            "{\"timestamp\":\"2026-01-02T00:20:00Z\",\"text\":\"second output\"}\n",
+        ),
+    )
+    .expect("write transcript");
+    let runtime = RuntimeConfiguration::validate_from_meta(&configuration)
+        .accepted_configuration()
+        .expect("accepted configuration")
+        .clone();
+    let clock = CollectionClock::fixed(
+        ReferenceTime::from_timestamp(Timestamp::new("2026-01-02T01:00:00Z"))
+            .expect("reference timestamp"),
+    );
+    let nexus = NexusPlane::with_runtime_configuration(runtime, clock);
+
+    let first_page = nexus
+        .list_outputs(OutputListRequest {
+            request_identifier: RequestIdentifier::new("first-page"),
+            filter: OutputListFilter {
+                source_selection: SourceSelection::Only(SelectedSources {
+                    sources: vec![SourceKind::Claude],
+                }),
+                session_reference: None,
+                subagent_reference: None,
+                authored_status: AuthoredStatusFilter::AnyAuthoredStatus,
+                time_window: None,
+            },
+            page: PageRequest {
+                limit: PageLimit::new(1),
+                cursor: None,
+                order: ListingOrder::OldestFirst,
+            },
+            projection: CardProjection::MetadataOnly,
+        })
+        .expect("first page");
+    assert_eq!(first_page.outputs.len(), 1);
+    let cursor = first_page.page.next_cursor.clone().expect("next cursor");
+    let second_page = nexus
+        .list_outputs(OutputListRequest {
+            request_identifier: RequestIdentifier::new("second-page"),
+            filter: OutputListFilter {
+                source_selection: SourceSelection::Only(SelectedSources {
+                    sources: vec![SourceKind::Claude],
+                }),
+                session_reference: None,
+                subagent_reference: None,
+                authored_status: AuthoredStatusFilter::AnyAuthoredStatus,
+                time_window: None,
+            },
+            page: PageRequest {
+                limit: PageLimit::new(1),
+                cursor: Some(cursor),
+                order: ListingOrder::OldestFirst,
+            },
+            projection: CardProjection::MetadataOnly,
+        })
+        .expect("second page");
+    assert_eq!(second_page.outputs.len(), 1);
+    assert_ne!(
+        first_page.outputs[0].reference,
+        second_page.outputs[0].reference
+    );
+
+    let oversized_page = nexus
+        .list_outputs(OutputListRequest {
+            request_identifier: RequestIdentifier::new("oversized-page"),
+            filter: OutputListFilter {
+                source_selection: SourceSelection::AllConfigured,
+                session_reference: None,
+                subagent_reference: None,
+                authored_status: AuthoredStatusFilter::AnyAuthoredStatus,
+                time_window: None,
+            },
+            page: PageRequest {
+                limit: PageLimit::new(65),
+                cursor: None,
+                order: ListingOrder::OldestFirst,
+            },
+            projection: CardProjection::MetadataOnly,
+        })
+        .expect_err("page limit must be enforced");
+    assert_eq!(oversized_page.reason, OperationRejectionReason::Oversized);
+
+    let missing = nexus
+        .read_output(OutputReadRequest {
+            request_identifier: RequestIdentifier::new("missing-output"),
+            output_reference: FragileOutputReference::new("missing-output-reference"),
+            range: OutputReadRange::EntireOutput,
+            maximum_bytes: ByteLimit::new(16),
+        })
+        .expect_err("unknown reference rejected");
+    assert_eq!(missing.reason, OperationRejectionReason::Missing);
+
+    let stale_reference = first_page.outputs[0].reference.clone();
+    fs::write(
+        &transcript,
+        "{\"timestamp\":\"2026-01-02T00:10:00Z\",\"text\":\"changed output with different bytes\"}\n",
+    )
+    .expect("rewrite transcript");
+    let stale = nexus
+        .read_output(OutputReadRequest {
+            request_identifier: RequestIdentifier::new("stale-output"),
+            output_reference: stale_reference,
+            range: OutputReadRange::EntireOutput,
+            maximum_bytes: ByteLimit::new(16),
+        })
+        .expect_err("stale reference rejected");
+    assert_eq!(
+        stale.reason,
+        OperationRejectionReason::FragileReferenceStale
+    );
+}
+
+#[test]
+fn output_interface_accepts_legacy_roots_as_read_only_and_rejects_index_under_them() {
+    let root = TempDir::new().expect("temporary root");
+    let legacy_root = root.path().join("reports");
+    fs::create_dir_all(&legacy_root).expect("legacy root");
+    fs::write(legacy_root.join("report.md"), "legacy recovery text").expect("legacy report");
+    let mut configuration = accepted_configuration(&root);
+    configuration.output_interfaces.legacy_recovery_sources =
+        vec![LegacyRecoverySource::LegacyReports(LegacyRecoveryRoot {
+            path: FilesystemPath::new(legacy_root.display().to_string()),
+            access: LegacyRecoveryAccess::ReadOnlyRecovery,
+        })];
+    let accepted = RuntimeConfiguration::validate_from_meta(&configuration);
+    assert!(matches!(
+        accepted,
+        RuntimeConfigurationValidation::Accepted(_)
+    ));
+
+    let mut rejected_configuration = configuration.clone();
+    rejected_configuration.store_path =
+        FilesystemPath::new(legacy_root.join("store.sema").display().to_string());
+    let rejected = RuntimeConfiguration::validate_from_meta(&rejected_configuration);
+    let report = match rejected {
+        RuntimeConfigurationValidation::Accepted(_) => panic!("index under legacy root accepted"),
+        RuntimeConfigurationValidation::Rejected(report) => report,
+    };
+    assert!(report.issues.iter().any(|issue| issue.kind
+        == meta_signal_aggregator::ConfigurationValidationIssueKind::InvalidFragileIndexConfiguration));
+    assert_eq!(
+        fs::read_to_string(legacy_root.join("report.md")).expect("legacy report unchanged"),
+        "legacy recovery text"
+    );
+}
+
+#[test]
+fn configuration_store_migrates_legacy_zero_one_configuration_with_default_output_interfaces() {
+    let root = TempDir::new().expect("temporary root");
+    let configuration = accepted_configuration(&root);
+    let legacy = LegacyAggregatorConfiguration {
+        ordinary_socket_path: configuration.ordinary_socket_path.clone(),
+        ordinary_socket_mode: configuration.ordinary_socket_mode,
+        meta_socket_path: configuration.meta_socket_path.clone(),
+        meta_socket_mode: configuration.meta_socket_mode,
+        store_path: configuration.store_path.clone(),
+        active_repositories: configuration.active_repositories.clone(),
+        transcript_sources: configuration.transcript_sources.clone(),
+        default_projection: configuration.default_projection.clone(),
+        default_limit_policy: configuration.default_limit_policy.clone(),
+    };
+    let configuration_path = root.path().join("legacy-configuration.nota");
+    fs::write(&configuration_path, legacy.to_nota()).expect("write legacy configuration");
+    let migrated = ConfigurationStore::at_path(&configuration_path)
+        .read_configuration()
+        .expect("migrate legacy configuration");
+    assert_eq!(
+        migrated
+            .output_interfaces
+            .limits
+            .maximum_page_items
+            .into_u64(),
+        64
+    );
+    assert!(
+        migrated
+            .output_interfaces
+            .legacy_recovery_sources
+            .is_empty()
+    );
+}
+
+#[test]
 fn daemon_cli_boundary_handles_collect_version_and_meta_configuration() {
     let root = TempDir::new().expect("temporary root");
     let configuration = accepted_configuration(&root);
@@ -779,6 +1160,37 @@ fn daemon_cli_boundary_handles_collect_version_and_meta_configuration() {
     assert!(matches!(
         configure_reply,
         MetaAggregatorReply::ConfigurationConfigured(_)
+    ));
+
+    let list_outputs_output = run_binary_with_input(
+        env!("CARGO_BIN_EXE_aggregator"),
+        &configuration_path,
+        &AggregatorRequest::ListOutputs(OutputListRequest {
+            request_identifier: RequestIdentifier::new("daemon-list-outputs"),
+            filter: OutputListFilter {
+                source_selection: SourceSelection::Only(SelectedSources {
+                    sources: vec![SourceKind::Claude],
+                }),
+                session_reference: None,
+                subagent_reference: None,
+                authored_status: AuthoredStatusFilter::AnyAuthoredStatus,
+                time_window: Some(TimeWindow::Since(Timestamp::new("2026-01-02T00:00:00Z"))),
+            },
+            page: PageRequest {
+                limit: PageLimit::new(10),
+                cursor: None,
+                order: ListingOrder::OldestFirst,
+            },
+            projection: CardProjection::MetadataOnly,
+        })
+        .to_nota(),
+    );
+    let list_outputs_reply = NotaSource::new(&list_outputs_output)
+        .parse::<AggregatorReply>()
+        .expect("parse list outputs reply");
+    assert!(matches!(
+        list_outputs_reply,
+        AggregatorReply::OutputsListed(listed) if listed.outputs.len() == 1
     ));
 
     let collect_request = EvidenceRequest {
