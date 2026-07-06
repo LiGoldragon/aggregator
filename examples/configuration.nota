@@ -1,1 +1,1 @@
-(/run/aggregator/aggregator.sock 432 /run/aggregator/aggregator-meta.sock 384 /var/lib/aggregator/aggregator.sema ([]) ([]) MetadataOnly (32 4096))
+(/run/aggregator/aggregator.sock 432 /run/aggregator/aggregator-meta.sock 384 /var/lib/aggregator/aggregator.sema [(example-repository /srv/aggregator/repositories/example)] [(Claude (/srv/aggregator/transcripts/claude))] MetadataOnly (32 4096) ((DaemonLocalStorePath OpaqueStaleCapable FragileReferenceAscending) (64 4096 65536 1024) []))

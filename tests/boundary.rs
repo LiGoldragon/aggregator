@@ -70,6 +70,88 @@ fn evidence_request() -> EvidenceRequest {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ExampleNotaFile {
+    name: &'static str,
+    text: &'static str,
+}
+
+impl ExampleNotaFile {
+    fn new(name: &'static str, text: &'static str) -> Self {
+        Self { name, text }
+    }
+
+    fn parse_as_requests(&self) {
+        self.for_each_non_empty_line(|line_number, line| {
+            NotaSource::new(line)
+                .parse::<AggregatorRequest>()
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{}:{} must parse as AggregatorRequest: {}",
+                        self.name, line_number, error
+                    )
+                });
+        });
+    }
+
+    fn parse_as_replies(&self) {
+        self.for_each_non_empty_line(|line_number, line| {
+            NotaSource::new(line)
+                .parse::<AggregatorReply>()
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{}:{} must parse as AggregatorReply: {}",
+                        self.name, line_number, error
+                    )
+                });
+        });
+    }
+
+    fn parse_as_configuration(&self) {
+        NotaSource::new(self.text.trim())
+            .parse::<AggregatorConfiguration>()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{} must parse as AggregatorConfiguration: {}",
+                    self.name, error
+                )
+            });
+    }
+
+    fn for_each_non_empty_line(&self, mut parse_line: impl FnMut(usize, &str)) {
+        for (line_index, line) in self.text.lines().enumerate() {
+            let line = line.trim();
+            if !line.is_empty() {
+                parse_line(line_index + 1, line);
+            }
+        }
+    }
+}
+
+#[test]
+fn example_nota_files_match_contract_shapes() {
+    ExampleNotaFile::new(
+        "examples/collect.nota",
+        include_str!("../examples/collect.nota"),
+    )
+    .parse_as_requests();
+    ExampleNotaFile::new(
+        "examples/output-interface-requests.nota",
+        include_str!("../examples/output-interface-requests.nota"),
+    )
+    .parse_as_requests();
+    ExampleNotaFile::new(
+        "examples/output-interface-replies.nota",
+        include_str!("../examples/output-interface-replies.nota"),
+    )
+    .parse_as_replies();
+    ExampleNotaFile::new(
+        "examples/configuration.nota",
+        include_str!("../examples/configuration.nota"),
+    )
+    .parse_as_configuration();
+}
+
 fn read_request(
     time_window: TimeWindow,
     projection: Projection,
