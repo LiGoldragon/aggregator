@@ -150,6 +150,16 @@ fn example_nota_files_match_contract_shapes() {
     )
     .parse_as_replies();
     ExampleNotaFile::new(
+        "examples/transcript-block-search-requests.nota",
+        include_str!("../examples/transcript-block-search-requests.nota"),
+    )
+    .parse_as_requests();
+    ExampleNotaFile::new(
+        "examples/transcript-block-search-replies.nota",
+        include_str!("../examples/transcript-block-search-replies.nota"),
+    )
+    .parse_as_replies();
+    ExampleNotaFile::new(
         "examples/configuration.nota",
         include_str!("../examples/configuration.nota"),
     )

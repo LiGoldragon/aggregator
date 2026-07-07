@@ -70,13 +70,24 @@ The ordinary contract exposes metadata-first output operations:
 - `ListOutputs` lists output cards with `MetadataOnly` or bounded-preview
   projection.
 - `ListOutputSegments` lists segment cards for a selected output.
+- `ListTranscriptBlocks` lists whole logical transcript-block cards with grounded kind selection and optional bounded previews.
+- `SearchTranscriptBlocks` applies `nota-text-query` over readable transcript blocks and returns query evidence with matching cards.
+- `EstimateTranscriptBlock` estimates a selected block before text projection.
+- `ReadTranscriptBlock` reads a selected whole block only with an explicit `maximum_bytes` bounded by the configured read cap.
 - `EstimateOutput` estimates an explicit output range.
 - `ReadOutput` reads only an explicit range bounded by the configured read cap.
 
 UIs and agents should consume cards first, then request bounded reads only for
 selected references. Page cursors are bound to the collection, filters, order,
 page limit, canonical query material, item count, and sorted reference list.
-Changing the listing shape makes the cursor stale.
+Changing the listing or transcript-block search shape makes the cursor stale.
+
+The grounded `TranscriptBlockKind` vocabulary is `UserPrompt`, `AgentResponse`,
+`ToolCall`, `ToolResult`, `Inference`, `SystemInstruction`, `Attachment`,
+`SessionEvent`, and `Unclassified`. The runtime does not infer a generic final
+response kind; current Codex caveats are represented as data by falling back to
+`SessionEvent` for some additional payload categories and `Unclassified` for
+current developer-role messages.
 
 Fragile references are daemon-local opaque identifiers into backing runtime
 evidence. The durable sidecar index stores references, metadata, fingerprints,
@@ -122,6 +133,8 @@ examples/collect.nota                     coarse evidence collection request exa
 examples/configuration.nota               current configuration example
 examples/output-interface-requests.nota   metadata-first output operation request examples
 examples/output-interface-replies.nota    output operation reply and rejection examples
+examples/transcript-block-search-requests.nota  transcript block scrape/search/read request examples
+examples/transcript-block-search-replies.nota   transcript block reply, evidence, and rejection examples
 ```
 
 ## Current status
@@ -129,10 +142,11 @@ examples/output-interface-replies.nota    output operation reply and rejection e
 The configured runtime path implements collection over configured transcript and
 repository evidence, and the daemon serves ordinary and meta frame requests over
 Unix sockets. The output interface implementation is present: session,
-subagent, output, and segment listings; size estimates; bounded reads; durable
+subagent, output, segment, and transcript-block listings; transcript-block
+search with `nota-text-query` evidence; size estimates; bounded reads; durable
 store-derived fragile index; metadata-first cards; typed stale, missing, broken,
-oversized, invalid-range, and invalid-request rejections; and query-bound page
-cursors.
+oversized, invalid-range, invalid-query, and invalid-request rejections; and
+query-bound page cursors.
 
 The legacy no-runtime-configuration Nexus constructor still returns typed
 not-implemented errors and exists only for scaffold-era boundary coverage. The
