@@ -543,6 +543,16 @@ impl<'a> TranscriptBlockTextJoiner<'a> {
             Some(readable.join("\n"))
         }
     }
+
+    pub fn record_text(&self) -> Option<String> {
+        self.text().or_else(|| {
+            if self.blocks.is_empty() {
+                None
+            } else {
+                Some(String::new())
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

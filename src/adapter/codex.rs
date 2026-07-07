@@ -448,7 +448,7 @@ impl<'a> CodexJsonlRecord<'a> {
         let blocks = CodexJsonValue::new(&value).blocks(&context, metadata);
         let Some(text) = CodexJsonValue::new(&value)
             .text()
-            .or_else(|| TranscriptBlockTextJoiner::new(&blocks).text())
+            .or_else(|| TranscriptBlockTextJoiner::new(&blocks).record_text())
         else {
             return CodexJsonlRecordResult::Malformed;
         };
@@ -578,9 +578,11 @@ impl<'a> CodexRole<'a> {
         match self.role.map(str::to_ascii_lowercase).as_deref() {
             Some("user") => TranscriptBlockKind::UserPrompt,
             Some("system") => TranscriptBlockKind::SystemInstruction,
-            Some("tool") => TranscriptBlockKind::ToolResult,
+            Some("tool") | Some("tool_result") | Some("toolresult") => {
+                TranscriptBlockKind::ToolResult
+            }
             Some("assistant") => TranscriptBlockKind::AgentResponse,
-            _ => TranscriptBlockKind::AgentResponse,
+            _ => TranscriptBlockKind::Unclassified,
         }
     }
 }
@@ -603,10 +605,18 @@ impl<'a> CodexPayload<'a> {
     pub fn push_blocks(&self, collector: &mut TranscriptBlockCollector<'_, 'a>) {
         match self.payload_type().to_ascii_lowercase().as_str() {
             "message" => self.push_message(collector),
-            "function_call" | "functioncall" => {
+            "user_message" | "usermessage" => self.push_user_message(collector),
+            "agent_message" | "agentmessage" => self.push_agent_message(collector),
+            "function_call" | "functioncall" | "custom_tool_call" | "customtoolcall"
+            | "tool_search_call" | "toolsearchcall" => {
                 self.push_serialized(collector, TranscriptBlockKind::ToolCall)
             }
-            "function_call_output" | "functioncalloutput" => self.push_tool_result(collector),
+            "function_call_output"
+            | "functioncalloutput"
+            | "custom_tool_call_output"
+            | "customtoolcalloutput"
+            | "tool_search_output"
+            | "toolsearchoutput" => self.push_tool_result(collector),
             "reasoning" => self.push_reasoning(collector),
             _ => self.push_fallback(collector),
         }
@@ -615,7 +625,14 @@ impl<'a> CodexPayload<'a> {
     pub fn text(&self) -> Option<String> {
         match self.payload_type().to_ascii_lowercase().as_str() {
             "message" => self.message_text(),
-            "function_call_output" | "functioncalloutput" => self.tool_result_text(),
+            "user_message" | "usermessage" => self.user_message_text(),
+            "agent_message" | "agentmessage" => self.agent_message_text(),
+            "function_call_output"
+            | "functioncalloutput"
+            | "custom_tool_call_output"
+            | "customtoolcalloutput"
+            | "tool_search_output"
+            | "toolsearchoutput" => self.tool_result_text(),
             "reasoning" => self.reasoning_text(),
             _ => self
                 .value
@@ -628,6 +645,19 @@ impl<'a> CodexPayload<'a> {
         let kind = CodexRole::new(self.message_role()).text_kind();
         if let Some(content) = self.message_content() {
             CodexContent::new(content).push_readable(collector, kind);
+        }
+    }
+
+    pub fn push_user_message(&self, collector: &mut TranscriptBlockCollector<'_, 'a>) {
+        if let Some(text) = self.user_message_text() {
+            collector.push_readable(TranscriptBlockKind::UserPrompt, text);
+        }
+        self.push_user_attachments(collector);
+    }
+
+    pub fn push_agent_message(&self, collector: &mut TranscriptBlockCollector<'_, 'a>) {
+        if let Some(text) = self.agent_message_text() {
+            collector.push_readable(TranscriptBlockKind::AgentResponse, text);
         }
     }
 
@@ -648,6 +678,8 @@ impl<'a> CodexPayload<'a> {
     pub fn push_fallback(&self, collector: &mut TranscriptBlockCollector<'_, 'a>) {
         if let Some(text) = self.text() {
             collector.push_readable(CodexRole::new(self.role).text_kind(), text);
+        } else if !self.payload_type().is_empty() {
+            self.push_serialized(collector, TranscriptBlockKind::SessionEvent);
         }
     }
 
@@ -685,6 +717,44 @@ impl<'a> CodexPayload<'a> {
     pub fn message_text(&self) -> Option<String> {
         self.message_content()
             .and_then(|content| CodexContent::new(content).text())
+    }
+
+    pub fn user_message_text(&self) -> Option<String> {
+        self.value
+            .get("message")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                self.value
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .or_else(|| {
+                self.value
+                    .get("text_elements")
+                    .and_then(|value| CodexContent::new(value).text())
+            })
+            .or_else(|| self.message_text())
+    }
+
+    pub fn agent_message_text(&self) -> Option<String> {
+        self.value
+            .get("message")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| self.message_text())
+    }
+
+    pub fn push_user_attachments(&self, collector: &mut TranscriptBlockCollector<'_, 'a>) {
+        if ["images", "local_images"].iter().any(|field| {
+            self.value
+                .get(field)
+                .and_then(Value::as_array)
+                .is_some_and(|items| !items.is_empty())
+        }) {
+            collector.push_unavailable(TranscriptBlockKind::Attachment);
+        }
     }
 
     pub fn tool_result_text(&self) -> Option<String> {

@@ -228,7 +228,7 @@ impl<'a> PiJsonlRecord<'a> {
         let blocks = PiJsonValue::new(&value).blocks(&context, metadata);
         let Some(text) = PiJsonValue::new(&value)
             .text()
-            .or_else(|| TranscriptBlockTextJoiner::new(&blocks).text())
+            .or_else(|| TranscriptBlockTextJoiner::new(&blocks).record_text())
         else {
             return PiJsonlRecordResult::Malformed;
         };
@@ -281,6 +281,10 @@ impl<'a> PiJsonValue<'a> {
         })
     }
 
+    pub fn record_type(&self) -> Option<&'a str> {
+        self.value.get("type").and_then(Value::as_str)
+    }
+
     pub fn blocks(
         &self,
         context: &TranscriptBlockSourceContext,
@@ -289,15 +293,20 @@ impl<'a> PiJsonValue<'a> {
         let mut blocks = Vec::new();
         {
             let mut collector = TranscriptBlockCollector::new(context, metadata, &mut blocks);
-            if let Some(message) = self.value.get("message") {
-                PiMessage::new(message, self.role()).push_blocks(&mut collector);
-            }
-            if let Some(content) = self.value.get("content") {
-                PiContent::new(content, self.role()).push_blocks(&mut collector);
-            }
-            for field in ["text", "output"] {
-                if let Some(text) = self.value.get(field).and_then(Value::as_str) {
-                    collector.push_readable(PiRole::new(self.role()).text_kind(), text);
+            match self.record_type().map(str::to_ascii_lowercase).as_deref() {
+                Some("custom_message") => self.push_custom_message(&mut collector),
+                _ => {
+                    if let Some(message) = self.value.get("message") {
+                        PiMessage::new(message, self.role()).push_blocks(&mut collector);
+                    }
+                    if let Some(content) = self.value.get("content") {
+                        PiContent::new(content, self.role()).push_blocks(&mut collector);
+                    }
+                    for field in ["text", "output"] {
+                        if let Some(text) = self.value.get(field).and_then(Value::as_str) {
+                            collector.push_readable(PiRole::new(self.role()).text_kind(), text);
+                        }
+                    }
                 }
             }
         }
@@ -321,6 +330,12 @@ impl<'a> PiJsonValue<'a> {
                     .and_then(|message| PiMessage::new(message, self.role()).text())
             })
     }
+
+    pub fn push_custom_message(&self, collector: &mut TranscriptBlockCollector<'_, 'a>) {
+        if let Some(text) = self.value.get("content").and_then(Value::as_str) {
+            collector.push_readable(TranscriptBlockKind::SessionEvent, text);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -341,7 +356,7 @@ impl<'a> PiRole<'a> {
                 TranscriptBlockKind::ToolResult
             }
             Some("assistant") => TranscriptBlockKind::AgentResponse,
-            _ => TranscriptBlockKind::AgentResponse,
+            _ => TranscriptBlockKind::Unclassified,
         }
     }
 }

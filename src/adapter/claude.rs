@@ -230,7 +230,7 @@ impl<'a> ClaudeJsonlRecord<'a> {
         let blocks = ClaudeJsonValue::new(&value).blocks(&context, metadata);
         let Some(text) = ClaudeJsonValue::new(&value)
             .text()
-            .or_else(|| TranscriptBlockTextJoiner::new(&blocks).text())
+            .or_else(|| TranscriptBlockTextJoiner::new(&blocks).record_text())
         else {
             return ClaudeJsonlRecordResult::Malformed;
         };
@@ -275,12 +275,23 @@ impl<'a> ClaudeJsonValue<'a> {
     }
 
     pub fn role(&self) -> Option<&'a str> {
-        self.value.get("role").and_then(Value::as_str).or_else(|| {
-            self.value
-                .get("message")
-                .and_then(|message| message.get("role"))
-                .and_then(Value::as_str)
-        })
+        self.value
+            .get("role")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                self.value
+                    .get("message")
+                    .and_then(|message| message.get("role"))
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| match self.record_type() {
+                Some("user" | "assistant" | "system") => self.record_type(),
+                _ => None,
+            })
+    }
+
+    pub fn record_type(&self) -> Option<&'a str> {
+        self.value.get("type").and_then(Value::as_str)
     }
 
     pub fn blocks(
@@ -291,21 +302,27 @@ impl<'a> ClaudeJsonValue<'a> {
         let mut blocks = Vec::new();
         {
             let mut collector = TranscriptBlockCollector::new(context, metadata, &mut blocks);
-            if let Some(thinking) = self.value.get("thinking").and_then(Value::as_str) {
-                collector.push_readable(TranscriptBlockKind::Inference, thinking);
-            }
-            if let Some(text) = self.value.get("text").and_then(Value::as_str) {
-                collector.push_readable(ClaudeRole::new(self.role()).text_kind(), text);
-            }
-            if let Some(content) = self
-                .value
-                .get("message")
-                .and_then(|message| message.get("content"))
-            {
-                ClaudeJsonContent::new(content, self.role()).push_blocks(&mut collector);
-            }
-            if let Some(content) = self.value.get("content") {
-                ClaudeJsonContent::new(content, self.role()).push_blocks(&mut collector);
+            match self.record_type().map(str::to_ascii_lowercase).as_deref() {
+                Some("queue-operation") => self.push_queue_operation(&mut collector),
+                Some("attachment") => collector.push_unavailable(TranscriptBlockKind::Attachment),
+                _ => {
+                    if let Some(thinking) = self.value.get("thinking").and_then(Value::as_str) {
+                        collector.push_readable(TranscriptBlockKind::Inference, thinking);
+                    }
+                    if let Some(text) = self.value.get("text").and_then(Value::as_str) {
+                        collector.push_readable(ClaudeRole::new(self.role()).text_kind(), text);
+                    }
+                    if let Some(content) = self
+                        .value
+                        .get("message")
+                        .and_then(|message| message.get("content"))
+                    {
+                        ClaudeJsonContent::new(content, self.role()).push_blocks(&mut collector);
+                    }
+                    if let Some(content) = self.value.get("content") {
+                        ClaudeJsonContent::new(content, self.role()).push_blocks(&mut collector);
+                    }
+                }
             }
         }
         blocks
@@ -318,6 +335,12 @@ impl<'a> ClaudeJsonValue<'a> {
             .map(ToOwned::to_owned)
             .or_else(|| self.message_content_text())
             .or_else(|| self.content_text())
+    }
+
+    pub fn push_queue_operation(&self, collector: &mut TranscriptBlockCollector<'_, 'a>) {
+        if let Some(text) = self.value.get("content").and_then(Value::as_str) {
+            collector.push_readable(TranscriptBlockKind::SessionEvent, text);
+        }
     }
 
     pub fn message_content_text(&self) -> Option<String> {
@@ -389,7 +412,7 @@ impl<'a> ClaudeRole<'a> {
                 TranscriptBlockKind::ToolResult
             }
             Some("assistant") => TranscriptBlockKind::AgentResponse,
-            _ => TranscriptBlockKind::AgentResponse,
+            _ => TranscriptBlockKind::Unclassified,
         }
     }
 }

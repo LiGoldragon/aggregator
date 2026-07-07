@@ -1929,11 +1929,23 @@ fn transcript_adapters_extract_observed_logical_block_kinds() {
         concat!(
             r#"{"timestamp":"2026-04-01T00:00:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"codex prompt"}]}}
 "#,
-            r#"{"timestamp":"2026-04-01T00:00:01Z","payload":{"type":"reasoning","summary":[{"text":"codex reasoning"}]}}
+            r#"{"timestamp":"2026-04-01T00:00:01Z","payload":{"type":"user_message","message":"codex observed user prompt","images":[],"local_images":[],"text_elements":[]}}
 "#,
-            r#"{"timestamp":"2026-04-01T00:00:02Z","payload":{"type":"function_call","name":"shell","arguments":"{}"}}
+            r#"{"timestamp":"2026-04-01T00:00:02Z","payload":{"type":"agent_message","message":"codex observed answer","phase":"final_answer","memory_citation":null}}
 "#,
-            r#"{"timestamp":"2026-04-01T00:00:03Z","payload":{"type":"function_call_output","output":"codex tool result"}}
+            r#"{"timestamp":"2026-04-01T00:00:03Z","payload":{"type":"reasoning","summary":[{"text":"codex reasoning"}]}}
+"#,
+            r#"{"timestamp":"2026-04-01T00:00:04Z","payload":{"type":"function_call","name":"shell","arguments":"{}"}}
+"#,
+            r#"{"timestamp":"2026-04-01T00:00:05Z","payload":{"type":"custom_tool_call","call_id":"call-redacted","name":"shell","input":"{}","status":"completed"}}
+"#,
+            r#"{"timestamp":"2026-04-01T00:00:06Z","payload":{"type":"tool_search_call","call_id":"search-redacted","status":"completed","execution":"approved","arguments":{"query":"redacted","limit":1}}}
+"#,
+            r#"{"timestamp":"2026-04-01T00:00:07Z","payload":{"type":"function_call_output","output":"codex tool result"}}
+"#,
+            r#"{"timestamp":"2026-04-01T00:00:08Z","payload":{"type":"custom_tool_call_output","call_id":"call-redacted","output":"codex custom tool result"}}
+"#,
+            r#"{"timestamp":"2026-04-01T00:00:09Z","payload":{"type":"tool_search_output","call_id":"search-redacted","status":"completed","execution":"approved","tools":[]}}
 "#,
         ),
     )
@@ -1974,30 +1986,24 @@ fn transcript_adapters_extract_observed_logical_block_kinds() {
         claude_records[0].blocks[4].text_availability,
         TranscriptBlockTextAvailability::UnavailableText
     );
-    assert!(codex_records.iter().any(|record| {
-        record
-            .blocks
+    assert_eq!(
+        codex_records
             .iter()
-            .any(|block| block.kind == TranscriptBlockKind::UserPrompt)
-    }));
-    assert!(codex_records.iter().any(|record| {
-        record
-            .blocks
-            .iter()
-            .any(|block| block.kind == TranscriptBlockKind::Inference)
-    }));
-    assert!(codex_records.iter().any(|record| {
-        record
-            .blocks
-            .iter()
-            .any(|block| block.kind == TranscriptBlockKind::ToolCall)
-    }));
-    assert!(codex_records.iter().any(|record| {
-        record
-            .blocks
-            .iter()
-            .any(|block| block.kind == TranscriptBlockKind::ToolResult)
-    }));
+            .flat_map(|record| record.blocks.iter().map(|block| block.kind))
+            .collect::<Vec<_>>(),
+        vec![
+            TranscriptBlockKind::UserPrompt,
+            TranscriptBlockKind::UserPrompt,
+            TranscriptBlockKind::AgentResponse,
+            TranscriptBlockKind::Inference,
+            TranscriptBlockKind::ToolCall,
+            TranscriptBlockKind::ToolCall,
+            TranscriptBlockKind::ToolCall,
+            TranscriptBlockKind::ToolResult,
+            TranscriptBlockKind::ToolResult,
+            TranscriptBlockKind::ToolResult,
+        ]
+    );
     assert_eq!(
         pi_records[0]
             .blocks
@@ -2010,6 +2016,106 @@ fn transcript_adapters_extract_observed_logical_block_kinds() {
             TranscriptBlockKind::ToolCall,
             TranscriptBlockKind::ToolResult,
         ]
+    );
+}
+
+#[test]
+fn transcript_adapters_do_not_infer_agent_response_from_untyped_or_event_records() {
+    let root = TempDir::new().expect("temporary root");
+    let claude = root.path().join("claude");
+    let codex = root.path().join("codex");
+    let pi = root.path().join("pi");
+    fs::create_dir_all(&claude).expect("claude directory");
+    fs::create_dir_all(&codex).expect("codex directory");
+    fs::create_dir_all(&pi).expect("pi directory");
+    fs::write(
+        claude.join("session.jsonl"),
+        concat!(
+            r#"{"timestamp":"2026-04-04T00:00:00Z","type":"queue-operation","operation":"enqueue","sessionId":"redacted-session","content":"claude queued event"}
+"#,
+            r#"{"timestamp":"2026-04-04T00:00:01Z","type":"attachment","attachment":{"type":"selected-files","addedNames":["redacted.rs"]}}
+"#,
+            r#"{"timestamp":"2026-04-04T00:00:02Z","text":"claude untyped text"}
+"#,
+        ),
+    )
+    .expect("write claude event blocks");
+    fs::write(
+        codex.join("session.jsonl"),
+        concat!(
+            r#"{"timestamp":"2026-04-04T00:00:00Z","payload":{"type":"message","content":"codex no role message"}}
+"#,
+            r#"{"timestamp":"2026-04-04T00:00:01Z","payload":{"type":"context_compacted"}}
+"#,
+        ),
+    )
+    .expect("write codex event blocks");
+    fs::write(
+        pi.join("run-history.jsonl"),
+        concat!(
+            r#"{"timestamp":"2026-04-04T00:00:00Z","type":"custom_message","customType":"agent-result","content":"pi custom event","display":true,"details":{"status":"redacted"}}
+"#,
+            r#"{"timestamp":"2026-04-04T00:00:01Z","output":"pi untyped output"}
+"#,
+        ),
+    )
+    .expect("write pi event blocks");
+
+    let claude_outcome = ClaudeJsonlRootReader::new(claude).read_records();
+    let codex_outcome = CodexSessionRootReader::new(codex).read_records();
+    let pi_outcome = PiRunHistoryRootReader::new(pi).read_records();
+    assert!(claude_outcome.read_failures.is_empty());
+    assert!(codex_outcome.read_failures.is_empty());
+    assert!(pi_outcome.read_failures.is_empty());
+
+    let claude_kinds = claude_outcome
+        .records
+        .iter()
+        .flat_map(|record| record.blocks.iter().map(|block| block.kind))
+        .collect::<Vec<_>>();
+    let codex_kinds = codex_outcome
+        .records
+        .iter()
+        .flat_map(|record| record.blocks.iter().map(|block| block.kind))
+        .collect::<Vec<_>>();
+    let pi_kinds = pi_outcome
+        .records
+        .iter()
+        .flat_map(|record| record.blocks.iter().map(|block| block.kind))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        claude_kinds,
+        vec![
+            TranscriptBlockKind::SessionEvent,
+            TranscriptBlockKind::Attachment,
+            TranscriptBlockKind::Unclassified,
+        ]
+    );
+    assert_eq!(
+        claude_outcome.records[1].blocks[0].text_availability,
+        TranscriptBlockTextAvailability::UnavailableText
+    );
+    assert_eq!(
+        codex_kinds,
+        vec![
+            TranscriptBlockKind::Unclassified,
+            TranscriptBlockKind::SessionEvent,
+        ]
+    );
+    assert_eq!(
+        pi_kinds,
+        vec![
+            TranscriptBlockKind::SessionEvent,
+            TranscriptBlockKind::Unclassified,
+        ]
+    );
+    assert!(
+        claude_kinds
+            .iter()
+            .chain(codex_kinds.iter())
+            .chain(pi_kinds.iter())
+            .all(|kind| *kind != TranscriptBlockKind::AgentResponse)
     );
 }
 
