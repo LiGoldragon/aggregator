@@ -3,7 +3,10 @@ pub mod codex;
 pub mod pi;
 pub mod repository;
 
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::OsStr,
+    path::{Path, PathBuf},
+};
 
 use serde_json::Value;
 use signal_aggregator::{
@@ -1226,12 +1229,41 @@ impl TranscriptLimitTruncation {
 pub struct TranscriptDiscoveryOutcome {
     pub files: Vec<PathBuf>,
     pub truncations: Vec<TranscriptLimitTruncation>,
+    pub failures: Vec<TranscriptDiscoveryFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptDiscoveryFailure {
+    pub path: PathBuf,
+    pub reason: ReadFailureReason,
+}
+
+impl TranscriptDiscoveryFailure {
+    pub fn new(path: PathBuf, reason: ReadFailureReason) -> Self {
+        Self { path, reason }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptFileShape {
+    Jsonl,
+    ClaudeSubagentOutput,
+}
+
+impl TranscriptFileShape {
+    pub fn accepts_extension(self, extension: &OsStr) -> bool {
+        match self {
+            Self::Jsonl => extension == "jsonl",
+            Self::ClaudeSubagentOutput => extension == "output",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptFileDiscovery {
     root: PathBuf,
     limits: TranscriptScanLimits,
+    file_shape: TranscriptFileShape,
 }
 
 impl TranscriptFileDiscovery {
@@ -1240,7 +1272,19 @@ impl TranscriptFileDiscovery {
     }
 
     pub fn with_limits(root: PathBuf, limits: TranscriptScanLimits) -> Self {
-        Self { root, limits }
+        Self::with_limits_and_file_shape(root, limits, TranscriptFileShape::Jsonl)
+    }
+
+    pub fn with_limits_and_file_shape(
+        root: PathBuf,
+        limits: TranscriptScanLimits,
+        file_shape: TranscriptFileShape,
+    ) -> Self {
+        Self {
+            root,
+            limits,
+            file_shape,
+        }
     }
 
     pub fn jsonl_files(&self) -> std::io::Result<Vec<PathBuf>> {
@@ -1248,13 +1292,41 @@ impl TranscriptFileDiscovery {
     }
 
     pub fn discover_jsonl_files(&self) -> std::io::Result<TranscriptDiscoveryOutcome> {
+        let discovery = Self::with_limits_and_file_shape(
+            self.root.clone(),
+            self.limits.clone(),
+            TranscriptFileShape::Jsonl,
+        );
+        discovery.discover_files()
+    }
+
+    pub fn discover_files(&self) -> std::io::Result<TranscriptDiscoveryOutcome> {
+        let canonical_root = self.root.canonicalize()?;
         let mut state = TranscriptDiscoveryState::new(self.limits.clone());
-        self.collect_jsonl_files(&self.root, &mut state)?;
+        self.collect_files(&canonical_root, &canonical_root, &mut state)?;
         state.finish()
     }
 
     pub fn collect_jsonl_files(
         &self,
+        directory: &Path,
+        state: &mut TranscriptDiscoveryState,
+    ) -> std::io::Result<()> {
+        let canonical_root = self.root.canonicalize()?;
+        let canonical_directory = directory.canonicalize()?;
+        if !canonical_directory.starts_with(&canonical_root) {
+            state.observe_discovery_failure(TranscriptDiscoveryFailure::new(
+                directory.to_path_buf(),
+                ReadFailureReason::PermissionDenied,
+            ));
+            return Ok(());
+        }
+        self.collect_files(&canonical_root, &canonical_directory, state)
+    }
+
+    pub fn collect_files(
+        &self,
+        canonical_root: &Path,
         directory: &Path,
         state: &mut TranscriptDiscoveryState,
     ) -> std::io::Result<()> {
@@ -1277,13 +1349,37 @@ impl TranscriptFileDiscovery {
                 break;
             }
             let path = entry.path();
-            if path.is_dir() {
-                self.collect_jsonl_files(&path, state)?;
-            } else if path
+            let canonical_path = match path.canonicalize() {
+                Ok(path) => path,
+                Err(error) => {
+                    state.observe_discovery_failure(TranscriptDiscoveryFailure::new(
+                        path,
+                        match error.kind() {
+                            std::io::ErrorKind::NotFound => ReadFailureReason::Missing,
+                            std::io::ErrorKind::PermissionDenied => {
+                                ReadFailureReason::PermissionDenied
+                            }
+                            _ => ReadFailureReason::IoFailure,
+                        },
+                    ));
+                    continue;
+                }
+            };
+            if !canonical_path.starts_with(canonical_root) {
+                state.observe_discovery_failure(TranscriptDiscoveryFailure::new(
+                    path,
+                    ReadFailureReason::PermissionDenied,
+                ));
+                continue;
+            }
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() || file_type.is_symlink() && canonical_path.is_dir() {
+                self.collect_files(canonical_root, &canonical_path, state)?;
+            } else if canonical_path
                 .extension()
-                .is_some_and(|extension| extension == "jsonl" || extension == "output")
+                .is_some_and(|extension| self.file_shape.accepts_extension(extension))
             {
-                state.observe_jsonl_file(path);
+                state.observe_transcript_file(canonical_path);
             }
         }
         Ok(())
@@ -1296,6 +1392,7 @@ pub struct TranscriptDiscoveryState {
     scanned_entries: u64,
     files: Vec<PathBuf>,
     truncations: Vec<TranscriptLimitTruncation>,
+    failures: Vec<TranscriptDiscoveryFailure>,
     scan_limit_reported: bool,
     file_limit_reported: bool,
 }
@@ -1307,6 +1404,7 @@ impl TranscriptDiscoveryState {
             scanned_entries: 0,
             files: Vec::new(),
             truncations: Vec::new(),
+            failures: Vec::new(),
             scan_limit_reported: false,
             file_limit_reported: false,
         }
@@ -1325,7 +1423,7 @@ impl TranscriptDiscoveryState {
         true
     }
 
-    pub fn observe_jsonl_file(&mut self, path: PathBuf) {
+    pub fn observe_transcript_file(&mut self, path: PathBuf) {
         if self.files.len() as u64 >= self.limits.maximum_discovered_files() {
             if !self.file_limit_reported {
                 self.truncations
@@ -1337,6 +1435,10 @@ impl TranscriptDiscoveryState {
         self.files.push(path);
     }
 
+    pub fn observe_discovery_failure(&mut self, failure: TranscriptDiscoveryFailure) {
+        self.failures.push(failure);
+    }
+
     pub fn is_complete(&self) -> bool {
         self.scan_limit_reported || self.file_limit_reported
     }
@@ -1346,6 +1448,7 @@ impl TranscriptDiscoveryState {
         Ok(TranscriptDiscoveryOutcome {
             files: self.files,
             truncations: self.truncations,
+            failures: self.failures,
         })
     }
 }

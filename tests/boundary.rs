@@ -655,6 +655,100 @@ fn transcript_reader_caps_file_discovery_line_size_and_failure_reports() {
 }
 
 #[test]
+fn claude_reader_reports_symlinked_discovery_paths_that_escape_root_as_read_failure() {
+    let root = TempDir::new().expect("temporary root");
+    let outside_root = TempDir::new().expect("outside temporary root");
+    let outside_directory = outside_root.path().join("outside-directory");
+    fs::create_dir_all(&outside_directory).expect("outside directory");
+    let outside_file = outside_root.path().join("outside-session.jsonl");
+    fs::write(
+        &outside_file,
+        "{\"timestamp\":\"2026-02-01T00:00:00Z\",\"text\":\"outside claude answer\"}\n",
+    )
+    .expect("write outside file");
+    fs::write(
+        outside_directory.join("nested.jsonl"),
+        "{\"timestamp\":\"2026-02-01T00:00:00Z\",\"text\":\"outside nested answer\"}\n",
+    )
+    .expect("write outside nested file");
+    symlink(&outside_file, root.path().join("escape.jsonl")).expect("file symlink");
+    symlink(&outside_directory, root.path().join("escape-directory")).expect("directory symlink");
+
+    let outcome = ClaudeJsonlRootReader::new(root.path().to_path_buf()).collect(&read_request(
+        TimeWindow::Since(Timestamp::new("2026-01-01T00:00:00Z")),
+        Projection::MetadataOnly,
+        8,
+    ));
+
+    assert_eq!(outcome.read_failures.len(), 2);
+    assert!(outcome.read_failures.iter().all(|failure| {
+        failure.reason == ReadFailureReason::PermissionDenied
+            && failure
+                .path
+                .as_ref()
+                .is_some_and(|path| path.as_str().contains("escape"))
+    }));
+    assert!(outcome.transcript_segments.is_empty());
+}
+
+#[test]
+fn claude_subagent_output_reader_reports_symlinked_output_paths_that_escape_root_as_read_failure() {
+    let root = TempDir::new().expect("temporary root");
+    let outside_root = TempDir::new().expect("outside temporary root");
+    let outside_file = outside_root.path().join("task.output");
+    fs::write(
+        &outside_file,
+        "{\"timestamp\":\"2026-02-01T00:00:00Z\",\"text\":\"outside subagent answer\"}\n",
+    )
+    .expect("write outside output");
+    symlink(&outside_file, root.path().join("escape.output")).expect("output symlink");
+
+    let outcome =
+        ClaudeJsonlRootReader::subagent_output(root.path().to_path_buf()).collect(&read_request(
+            TimeWindow::Since(Timestamp::new("2026-01-01T00:00:00Z")),
+            Projection::MetadataOnly,
+            8,
+        ));
+
+    assert_eq!(outcome.read_failures.len(), 1);
+    assert_eq!(
+        outcome.read_failures[0].reason,
+        ReadFailureReason::PermissionDenied
+    );
+    assert!(outcome.transcript_segments.is_empty());
+}
+
+#[test]
+fn claude_output_extension_is_exclusive_to_subagent_output_roots() {
+    let root = TempDir::new().expect("temporary root");
+    fs::write(
+        root.path().join("task.output"),
+        "{\"timestamp\":\"2026-02-01T00:00:00Z\",\"text\":\"subagent-only output\"}\n",
+    )
+    .expect("write output fixture");
+
+    let ordinary = ClaudeJsonlRootReader::new(root.path().to_path_buf()).collect(&read_request(
+        TimeWindow::Since(Timestamp::new("2026-01-01T00:00:00Z")),
+        Projection::MetadataOnly,
+        8,
+    ));
+    assert!(ordinary.transcript_segments.is_empty());
+    assert!(ordinary.read_failures.is_empty());
+
+    let subagent =
+        ClaudeJsonlRootReader::subagent_output(root.path().to_path_buf()).collect(&read_request(
+            TimeWindow::Since(Timestamp::new("2026-01-01T00:00:00Z")),
+            Projection::MetadataOnly,
+            8,
+        ));
+    assert_eq!(subagent.transcript_segments.len(), 1);
+    assert_eq!(
+        subagent.transcript_segments[0].source,
+        SourceKind::ClaudeSubagentOutput
+    );
+}
+
+#[test]
 fn canonical_timestamp_model_rejects_non_z_offsets_as_malformed_input() {
     let root = TempDir::new().expect("temporary root");
     fs::write(
@@ -2670,6 +2764,42 @@ fn health_and_subagent_output_recovery_use_configured_fixture_roots() {
         })
         .expect("read block");
     assert!(read.excerpt.text.as_str().contains("quota"));
+}
+
+#[test]
+fn health_reports_unreadable_durable_index_store() {
+    let temp = TempDir::new().expect("tempdir");
+    let (_, _, empty, _) = materialize_recovery_fixtures(temp.path());
+    let store_path = temp.path().join("store");
+    let index_store = FragileIndexStore::from_store_path(&store_path);
+    fs::write(index_store.path(), "not-json").expect("write unreadable index fixture");
+    let mut configuration = ConfigurationFixture::minimal();
+    configuration.store_path = FilesystemPath::new(store_path.display().to_string());
+    configuration.active_repositories = Vec::new();
+    configuration.transcript_sources = vec![TranscriptSource::Claude(TranscriptRoot {
+        path: FilesystemPath::new(empty),
+    })];
+    let runtime_configuration = match RuntimeConfiguration::validate_from_meta(&configuration) {
+        RuntimeConfigurationValidation::Accepted(configuration) => configuration,
+        other => panic!("expected accepted configuration, got {other:?}"),
+    };
+
+    let health = NexusPlane::with_runtime_configuration(
+        runtime_configuration,
+        CollectionClock::fixed(
+            ReferenceTime::from_timestamp(Timestamp::new("2026-07-05T13:00:00Z"))
+                .expect("reference time"),
+        ),
+    )
+    .observe_health(RuntimeHealthRequest {
+        request_identifier: RequestIdentifier::new("health-index-store-unreadable"),
+    })
+    .expect("health");
+
+    assert_eq!(
+        health.index.status,
+        SourceHealthStatus::IndexStoreUnreadable
+    );
 }
 
 #[test]

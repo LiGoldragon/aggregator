@@ -95,6 +95,9 @@ impl PiRunHistoryRootReader {
             Some(self.root.clone()),
             self.limits.maximum_failures(),
         );
+        for failure in discovery.failures {
+            failures.push(self.failure(failure.reason, Some(failure.path)));
+        }
         let mut truncations = discovery
             .truncations
             .into_iter()

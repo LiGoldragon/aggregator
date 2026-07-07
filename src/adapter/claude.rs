@@ -12,9 +12,10 @@ use crate::{
     adapter::{
         TranscriptBlockCollector, TranscriptBlockSourceContext, TranscriptBlockTextJoiner,
         TranscriptBoundedFile, TranscriptBoundedFileRead, TranscriptFailureAccumulator,
-        TranscriptFileDiscovery, TranscriptJsonMetadata, TranscriptLineLocator, TranscriptLineText,
-        TranscriptLineTextOutcome, TranscriptRawReadOutcome, TranscriptReadOutcome,
-        TranscriptReadRequest, TranscriptRecord, TranscriptScanLimits,
+        TranscriptFileDiscovery, TranscriptFileShape, TranscriptJsonMetadata,
+        TranscriptLineLocator, TranscriptLineText, TranscriptLineTextOutcome,
+        TranscriptRawReadOutcome, TranscriptReadOutcome, TranscriptReadRequest, TranscriptRecord,
+        TranscriptScanLimits,
     },
     configuration::TranscriptRootConfiguration,
     time_model::CanonicalTimestamp,
@@ -40,11 +41,34 @@ impl ClaudeTranscriptAdapter {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeTranscriptFileShape {
+    SessionJsonl,
+    SubagentOutput,
+}
+
+impl ClaudeTranscriptFileShape {
+    pub fn new(source: SourceKind) -> Self {
+        match source {
+            SourceKind::ClaudeSubagentOutput => Self::SubagentOutput,
+            _ => Self::SessionJsonl,
+        }
+    }
+
+    pub fn discovery_file_shape(self) -> TranscriptFileShape {
+        match self {
+            Self::SessionJsonl => TranscriptFileShape::Jsonl,
+            Self::SubagentOutput => TranscriptFileShape::ClaudeSubagentOutput,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeJsonlRootReader {
     root: PathBuf,
     limits: TranscriptScanLimits,
     source: SourceKind,
+    file_shape: ClaudeTranscriptFileShape,
 }
 
 impl ClaudeJsonlRootReader {
@@ -77,6 +101,7 @@ impl ClaudeJsonlRootReader {
             root,
             limits,
             source,
+            file_shape: ClaudeTranscriptFileShape::new(source),
         }
     }
 
@@ -101,27 +126,33 @@ impl ClaudeJsonlRootReader {
                 vec![self.failure(ReadFailureReason::Missing, Some(self.root.clone()))],
             );
         }
-        let discovery =
-            match TranscriptFileDiscovery::with_limits(self.root.clone(), self.limits.clone())
-                .discover_jsonl_files()
-            {
-                Ok(discovery) => discovery,
-                Err(error) => {
-                    return TranscriptRawReadOutcome::new(
-                        self.source,
-                        source_identifier.clone(),
-                        Vec::new(),
-                        Vec::new(),
-                        vec![self.failure_from_io(error, Some(self.root.clone()))],
-                    );
-                }
-            };
+        let discovery = match TranscriptFileDiscovery::with_limits_and_file_shape(
+            self.root.clone(),
+            self.limits.clone(),
+            self.file_shape.discovery_file_shape(),
+        )
+        .discover_files()
+        {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                return TranscriptRawReadOutcome::new(
+                    self.source,
+                    source_identifier.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                    vec![self.failure_from_io(error, Some(self.root.clone()))],
+                );
+            }
+        };
         let mut records = Vec::new();
         let mut failures = TranscriptFailureAccumulator::new(
             self.source,
             Some(self.root.clone()),
             self.limits.maximum_failures(),
         );
+        for failure in discovery.failures {
+            failures.push(self.failure(failure.reason, Some(failure.path)));
+        }
         let mut truncations = discovery
             .truncations
             .into_iter()

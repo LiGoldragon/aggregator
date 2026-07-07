@@ -135,7 +135,11 @@ impl CodexSessionRootReader {
         files.retain(|path| path.file_name().is_none_or(|name| name != "index.jsonl"));
         Ok(CodexSessionFiles {
             files,
-            read_failures: Vec::new(),
+            read_failures: discovery
+                .failures
+                .into_iter()
+                .map(|failure| self.failure(failure.reason, Some(failure.path)))
+                .collect(),
             truncations: discovery
                 .truncations
                 .into_iter()

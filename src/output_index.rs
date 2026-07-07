@@ -61,6 +61,8 @@ impl OutputInterfaceRuntime {
 
     pub fn observe_health(&self, request: RuntimeHealthRequest) -> RuntimeHealthObserved {
         let current = CurrentIndexBuilder::new(self.configuration.clone()).build();
+        let index_status =
+            FragileIndexStore::from_store_path(self.configuration.store_path()).health_status();
         let sources = self
             .configuration
             .transcript_sources()
@@ -76,7 +78,7 @@ impl OutputInterfaceRuntime {
             },
             sources,
             index: IndexHealth {
-                status: SourceHealthStatus::ReadableIndexed,
+                status: index_status,
                 session_count: ItemCount::new(current.sessions.len() as u64),
                 subagent_count: ItemCount::new(current.subagents.len() as u64),
                 output_count: ItemCount::new(current.outputs.len() as u64),
@@ -2083,6 +2085,13 @@ impl FragileIndexStore {
         let value = serde_json::from_str::<Value>(&text)
             .map_err(|error| Error::protocol("fragile output index decode", error.to_string()))?;
         Ok(DurableFragileIndex::from_json(&value))
+    }
+
+    pub fn health_status(&self) -> SourceHealthStatus {
+        match self.read_or_empty() {
+            Ok(_) => SourceHealthStatus::ReadableIndexed,
+            Err(_) => SourceHealthStatus::IndexStoreUnreadable,
+        }
     }
 
     pub fn write(&self, index: &DurableFragileIndex) -> Result<()> {
