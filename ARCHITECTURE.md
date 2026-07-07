@@ -1,83 +1,141 @@
 # aggregator — architecture
 
-`aggregator` is the runtime component for collecting recent work evidence over
-requested time windows. It reads configured Claude, Codex, Pi, and repository
-sources, normalizes what it observes, and returns an evidence package through
-`signal-aggregator`.
+`aggregator` is a typed observation and projection layer over configured work
+evidence. It exists to make harness, session, subagent transcript, and event
+evidence navigable without asking agents to write routine handoff reports.
+`reports/` and `agent-outputs/` are not normal source roots, and the component
+is not a markdown report archive.
 
-## Role
+## Role and authority
 
-The component owns runtime collection and normalization only. It reports source
-volumes, timestamps, paths or identifiers, repository changes and commits,
-transcript segment locators, bounded projected excerpts when requested,
-truncation facts, and read-failure facts. It does not produce summaries,
-reviews, recommendations, scores, or judgments. Agents synthesize from the
-returned evidence package.
+The component owns runtime observation, indexing, and bounded projection only.
+It returns evidence packages, metadata cards, fragile references, size facts,
+bounded text excerpts, truncation facts, and typed read or reference failures.
+It does not produce summaries, reviews, recommendations, scores, or judgments.
 
-## Triad runtime shape
+Agent output observed through this component is provenance and evidence, not
+authority. Accepted decisions still land in their owning durable surfaces: code,
+schema, architecture docs, README content, tracker items, Spirit records, or
+other project-specific state.
 
-The daemon is split into the standard runtime planes:
+Routine "write a report so another agent can read it" handoff should disappear.
+The pickup object is an aggregator reference plus an explicit bounded read, not
+a filesystem path to a newly authored markdown artifact.
 
-- **Signal** admits framed ordinary and meta requests, authenticates the caller
-  shape when the real daemon lands, and emits typed replies.
-- **Nexus** owns collection orchestration, adapter calls, time-window lowering,
-  limits, truncation accounting, and effect failures.
-- **SEMA** owns durable configuration and collection state once persistence
-  lands.
+## Runtime planes
+
+The daemon follows the standard runtime split:
+
+- **Signal** admits framed ordinary and meta requests, validates request shape,
+  and emits typed replies and typed rejections.
+- **Nexus** owns collection orchestration, adapter calls, output-interface
+  operations, time-window lowering, limits, pagination, truncation accounting,
+  and effect failures.
+- **SEMA** owns active configuration state and persisted configuration through
+  `ConfigurationStore`.
 
 The request flow is `Signal -> Nexus -> SEMA when state is needed -> Nexus ->
-Signal -> client`. The ordinary CLI `aggregator` is a client of the daemon. The
-meta CLI `meta-aggregator` is a client of the meta socket. Configuration is
-changed through `meta-signal-aggregator`; ordinary collection cannot mutate
-configuration.
+Signal -> client`. The ordinary CLI `aggregator` and the meta CLI
+`meta-aggregator` are thin Unix-socket clients. Configuration is changed through
+the `meta-signal-aggregator` contract; ordinary collection and output reads
+cannot mutate configuration.
 
-## Sources and adapters
+## Source boundaries
 
-Active repositories come from configuration. Transcript locations and formats
-are adapter-specific records, not hard-coded daemon paths. The first adapter
-modules can read fixture/configured roots for Claude JSONL transcripts, Codex
-session roots and indexes, Pi run-history roots, and fixture or policy-backed
-repository evidence. They return normalized evidence plus typed read failures;
-daemon orchestration and durable persistence remain separate work.
+The source of truth is underlying runtime evidence: harness/session/subagent
+transcripts and event evidence, plus configured repository evidence for the
+collection surface. Current adapters read explicitly configured Claude JSONL,
+Codex session, Pi run-history, and repository roots. Transcript locations and
+formats are adapter records, not hard-coded private paths.
 
-## Time windows
+The output-interface index is derived from configured transcript evidence. It is
+not derived from agent-written reports as a normal workflow.
 
-The ordinary contract carries bounded windows as `Recent(RelativeDuration)`,
-`Range(TimeRange)`, and `Since(Timestamp)`. The runtime lowers these into
-adapter-specific reads and records read failures instead of synthesizing around
-missing data.
+Optional legacy recovery roots for old `reports/` or `agent-outputs/` material
+are read-only, opt-in recovery or migration inputs. They are not recommended as
+future normal architecture, are not authoritative live sources, and must not own
+the daemon-local fragile index. Remove them after the recovery or migration they
+serve.
+
+Long-term integration should prefer pushed transcript/event updates from the
+producer over polling or scanning roots. The current configured-root readers are
+an implementation bridge, not the desired final coupling.
+
+## Output interfaces and fragile references
+
+The ordinary contract exposes metadata-first output operations:
+
+- `ListSessions` lists session cards.
+- `ListSubagents` lists subagent cards for a selected session.
+- `ListOutputs` lists output cards with `MetadataOnly` or bounded-preview
+  projection.
+- `ListOutputSegments` lists segment cards for a selected output.
+- `EstimateOutput` estimates an explicit output range.
+- `ReadOutput` reads only an explicit range bounded by the configured read cap.
+
+UIs and agents should consume cards first, then request bounded reads only for
+selected references. Page cursors are bound to the collection, filters, order,
+page limit, canonical query material, item count, and sorted reference list.
+Changing the listing shape makes the cursor stale.
+
+Fragile references are daemon-local opaque identifiers into backing runtime
+evidence. The durable sidecar index stores references, metadata, fingerprints,
+page state, segment spans, and bounded card material needed for navigation. It
+is not canonical content storage and must not become a report archive. Backing
+evidence remains the read source, so references can become stale, missing, or
+broken when those files change; operations reject those cases with typed
+`OperationRejected` replies instead of guessing.
 
 ## Privacy and projection
 
-Raw transcript text can be private. Metadata-only and identifiers-only
-projections are first-class. Text projection is bounded by `LimitPolicy` and the
-segment-level projection records truncation facts. A truncated or unreadable
-source is reported as data in the package; it is not hidden behind prose.
+Raw transcript text can be private. Metadata-only cards and identifiers-only
+navigation are first-class. Text projection is always bounded by configured
+limits, and segment or output reads report truncation facts explicitly. An
+unreadable or truncated source is data in the reply; it is not hidden behind
+prose.
 
 ## Code map
 
 ```text
-src/bin/aggregator-daemon.rs              daemon entrypoint scaffold
-src/bin/aggregator.rs                     ordinary CLI scaffold
-src/bin/meta-aggregator.rs                meta CLI scaffold
-src/bin/aggregator-write-configuration.rs configuration writer scaffold
-src/signal.rs                             Signal plane boundary helpers
-src/nexus.rs                              Nexus collection orchestration scaffold
-src/sema.rs                               SEMA configuration/state scaffold
-src/adapter/claude.rs                     Claude transcript adapter scaffold
-src/adapter/codex.rs                      Codex transcript adapter scaffold
-src/adapter/pi.rs                         Pi transcript adapter scaffold
-src/adapter/repository.rs                 repository adapter scaffold
-src/configuration.rs                      configuration fixture/storage skeleton
+src/bin/aggregator-daemon.rs              daemon entrypoint for ordinary and meta sockets
+src/bin/aggregator.rs                     ordinary socket client CLI
+src/bin/meta-aggregator.rs                meta socket client CLI
+src/bin/aggregator-write-configuration.rs configuration file writer CLI
+src/client.rs                             Unix-socket client exchange helpers
+src/daemon.rs                             prototype Unix-socket daemon services and frame routing
+src/signal.rs                             Signal validation, version, and rejection helpers
+src/nexus.rs                              collection orchestration and output-interface routing
+src/sema.rs                               configuration state and meta operations
+src/output_index.rs                       durable fragile index, cards, cursors, estimates, reads, rejections
+src/configuration.rs                      configuration storage, validation, limits, legacy recovery boundaries
+src/adapter/claude.rs                     Claude JSONL transcript adapter
+src/adapter/codex.rs                      Codex session transcript adapter
+src/adapter/pi.rs                         Pi run-history transcript adapter
+src/adapter/repository.rs                 repository evidence adapter
+src/clock.rs                              collection reference time handling
+src/time_model.rs                         timestamp parsing and comparison
+src/error.rs                              typed crate error boundary
 schema/runtime.schema                     runtime triad schema sketch
 generated/README.md                       schema-generation placeholder
-tests/boundary.rs                         scaffold boundary witnesses
+tests/boundary.rs                         contract, daemon, adapter, and output-interface witnesses
+examples/collect.nota                     coarse evidence collection request example
+examples/configuration.nota               current configuration example
+examples/output-interface-requests.nota   metadata-first output operation request examples
+examples/output-interface-replies.nota    output operation reply and rejection examples
 ```
 
-## Status
+## Current status
 
-This is a foundation slice. It compiles and exposes the repo shape, current
-contract dependencies, binaries, configuration validation, adapter modules, and
-boundary tests. The adapters only read explicitly configured or fixture roots;
-the Nexus/daemon path still deliberately returns typed not-implemented errors
-rather than scanning local private sources.
+The configured runtime path implements collection over configured transcript and
+repository evidence, and the daemon serves ordinary and meta frame requests over
+Unix sockets. The output interface implementation is present: session,
+subagent, output, and segment listings; size estimates; bounded reads; durable
+store-derived fragile index; metadata-first cards; typed stale, missing, broken,
+oversized, invalid-range, and invalid-request rejections; and query-bound page
+cursors.
+
+The legacy no-runtime-configuration Nexus constructor still returns typed
+not-implemented errors and exists only for scaffold-era boundary coverage. The
+schema sketch under `schema/` remains a sketch; the Rust implementation and the
+`signal-aggregator` and `meta-signal-aggregator` contracts are the active
+runtime surfaces.
