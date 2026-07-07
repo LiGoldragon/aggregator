@@ -487,6 +487,54 @@ impl OrdinaryRequestHandler {
                     Err(rejection) => AggregatorReply::OperationRejected(rejection),
                 }
             }
+            AggregatorRequest::ListTranscriptBlocks(request) => {
+                match self.nexus_for_operation(
+                    &request.request_identifier,
+                    OperationKind::ListTranscriptBlocks,
+                ) {
+                    Ok(nexus) => match nexus.list_transcript_blocks(request) {
+                        Ok(reply) => AggregatorReply::TranscriptBlocksListed(reply),
+                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    },
+                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                }
+            }
+            AggregatorRequest::SearchTranscriptBlocks(request) => {
+                match self.nexus_for_operation(
+                    &request.request_identifier,
+                    OperationKind::SearchTranscriptBlocks,
+                ) {
+                    Ok(nexus) => match nexus.search_transcript_blocks(request) {
+                        Ok(reply) => AggregatorReply::TranscriptBlocksSearched(reply),
+                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    },
+                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                }
+            }
+            AggregatorRequest::EstimateTranscriptBlock(request) => {
+                match self.nexus_for_operation(
+                    &request.request_identifier,
+                    OperationKind::EstimateTranscriptBlock,
+                ) {
+                    Ok(nexus) => match nexus.estimate_transcript_block(request) {
+                        Ok(reply) => AggregatorReply::TranscriptBlockEstimated(reply),
+                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    },
+                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                }
+            }
+            AggregatorRequest::ReadTranscriptBlock(request) => {
+                match self.nexus_for_operation(
+                    &request.request_identifier,
+                    OperationKind::ReadTranscriptBlock,
+                ) {
+                    Ok(nexus) => match nexus.read_transcript_block(request) {
+                        Ok(reply) => AggregatorReply::TranscriptBlockRead(reply),
+                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    },
+                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                }
+            }
         }
     }
 

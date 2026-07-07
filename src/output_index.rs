@@ -7,27 +7,35 @@ use std::{
     time::UNIX_EPOCH,
 };
 
+use nota_text_query::{Query, QueryTerm, SearchText};
 use serde_json::{Value, json};
 use signal_aggregator::{
     AuthoredStatus, AuthoredStatusFilter, ByteCount, ByteLimit, ByteRange, CardProjection,
     DurationUnit, FilesystemPath, FragileOutputReference, FragileOutputSegmentReference,
-    FragilePageCursor, FragileSessionReference, FragileSubagentReference, ItemCount, LineCount,
-    LineNumber, LineRange, ListingOrder, OperationKind, OperationRejected,
-    OperationRejectionReason, OutputCard, OutputEstimateRequest, OutputEstimated, OutputListFilter,
-    OutputListRequest, OutputProvenance, OutputRead, OutputReadRange, OutputReadRequest,
-    OutputSegmentCard, OutputSegmentListFilter, OutputSegmentListRequest, OutputSegmentsListed,
-    OutputText, OutputTextExcerpt, OutputsListed, PageLimit, PageMetadata, PageRequest,
-    RejectedFragileReference, RequestIdentifier, SegmentIndex, SessionCard, SessionListFilter,
-    SessionListRequest, SessionsListed, SizeCertainty, SizeMetadata, SourceKind, SourceSelection,
-    SubagentCard, SubagentListFilter, SubagentListRequest, SubagentsListed, TimeWindow, Timestamp,
-    Truncation, TruncationReason,
+    FragilePageCursor, FragileSessionReference, FragileSubagentReference,
+    FragileTranscriptBlockReference, ItemCount, LineCount, LineNumber, LineRange, ListingOrder,
+    OperationKind, OperationRejected, OperationRejectionReason, OutputCard, OutputEstimateRequest,
+    OutputEstimated, OutputListFilter, OutputListRequest, OutputProvenance, OutputRead,
+    OutputReadRange, OutputReadRequest, OutputSegmentCard, OutputSegmentListFilter,
+    OutputSegmentListRequest, OutputSegmentsListed, OutputText, OutputTextExcerpt, OutputsListed,
+    PageLimit, PageMetadata, PageRequest, RejectedFragileReference, RequestIdentifier,
+    SegmentIndex, SessionCard, SessionListFilter, SessionListRequest, SessionsListed,
+    SizeCertainty, SizeMetadata, SourceKind, SourceSelection, SubagentCard, SubagentListFilter,
+    SubagentListRequest, SubagentsListed, TimeWindow, Timestamp, TranscriptBlockCard,
+    TranscriptBlockEstimateRequest, TranscriptBlockEstimated, TranscriptBlockFilter,
+    TranscriptBlockKind, TranscriptBlockKindSelection, TranscriptBlockListRequest,
+    TranscriptBlockProvenance, TranscriptBlockRead, TranscriptBlockReadRequest,
+    TranscriptBlockSearchEvidence, TranscriptBlockSearchMatch, TranscriptBlockSearchRequest,
+    TranscriptBlockTextAvailability, TranscriptBlockTextQuery, TranscriptBlocksListed,
+    TranscriptBlocksSearched, TranscriptText, TranscriptTextExcerpt, Truncation, TruncationReason,
 };
 
 use crate::{
     CollectionClock, Error, Result, RuntimeConfiguration, TranscriptAdapterConfiguration,
     adapter::{
-        OutputLineCounter, TimeWindowAcceptance, TimeWindowMatcher, TranscriptRawReadOutcome,
-        TranscriptRecord, claude::ClaudeJsonlRecord, codex::CodexJsonlRecord, pi::PiJsonlRecord,
+        OutputLineCounter, TimeWindowAcceptance, TimeWindowMatcher, TranscriptBlockRecord,
+        TranscriptRawReadOutcome, TranscriptRecord, claude::ClaudeJsonlRecord,
+        codex::CodexJsonlRecord, pi::PiJsonlRecord,
     },
     configuration::RuntimeStorePath,
 };
@@ -319,6 +327,7 @@ impl OutputInterfaceRuntime {
         )?;
         ReadLimitValidator::new(
             request.request_identifier.clone(),
+            OperationKind::ReadOutput,
             self.configuration
                 .output_interfaces()
                 .limits()
@@ -348,6 +357,207 @@ impl OutputInterfaceRuntime {
             request_identifier: request.request_identifier,
             output_reference: request.output_reference,
             range: request.range,
+            size: selected.size,
+            excerpt: selected.excerpt,
+        })
+    }
+
+    pub fn list_transcript_blocks(
+        &self,
+        request: TranscriptBlockListRequest,
+    ) -> OutputOperationResult<TranscriptBlocksListed> {
+        let index = self.refreshed_index(
+            &request.request_identifier,
+            OperationKind::ListTranscriptBlocks,
+        )?;
+        TranscriptBlockRequestValidator::new(
+            self.configuration
+                .output_interfaces()
+                .limits()
+                .maximum_page_items,
+            self.configuration
+                .output_interfaces()
+                .limits()
+                .maximum_preview_bytes,
+        )
+        .validate_listing(
+            &request.request_identifier,
+            OperationKind::ListTranscriptBlocks,
+            &request.page,
+            &request.projection,
+        )?;
+        TranscriptBlockReferenceFilterResolver::new(&index).resolve_filter_references(
+            &request.filter,
+            &request.request_identifier,
+            OperationKind::ListTranscriptBlocks,
+        )?;
+        let lowered_time_window = self.lower_optional_time_window(
+            request.filter.time_window.as_ref(),
+            &request.request_identifier,
+            OperationKind::ListTranscriptBlocks,
+        )?;
+        let mut blocks =
+            TranscriptBlockFilterMatcher::new(&request.filter, lowered_time_window.as_ref())
+                .matching_blocks(index.current_transcript_blocks());
+        IndexedTranscriptBlockSorter::new(request.page.order).sort(&mut blocks);
+        let page = PaginationWindow::new(
+            request.request_identifier.clone(),
+            OperationKind::ListTranscriptBlocks,
+            PageCollectionKind::TranscriptBlocks,
+            request.page.clone(),
+            PaginationQueryShape::transcript_blocks(&request.filter, lowered_time_window.as_ref()),
+        )
+        .select(&blocks)?;
+        Ok(TranscriptBlocksListed {
+            request_identifier: request.request_identifier,
+            blocks: page
+                .items
+                .iter()
+                .map(|block| block.card(&request.projection))
+                .collect(),
+            page: page.metadata,
+        })
+    }
+
+    pub fn search_transcript_blocks(
+        &self,
+        request: TranscriptBlockSearchRequest,
+    ) -> OutputOperationResult<TranscriptBlocksSearched> {
+        let index = self.refreshed_index(
+            &request.request_identifier,
+            OperationKind::SearchTranscriptBlocks,
+        )?;
+        TranscriptBlockRequestValidator::new(
+            self.configuration
+                .output_interfaces()
+                .limits()
+                .maximum_page_items,
+            self.configuration
+                .output_interfaces()
+                .limits()
+                .maximum_preview_bytes,
+        )
+        .validate_listing(
+            &request.request_identifier,
+            OperationKind::SearchTranscriptBlocks,
+            &request.page,
+            &request.projection,
+        )?;
+        TranscriptBlockQueryValidator::new(&request.query).validate(
+            &request.request_identifier,
+            OperationKind::SearchTranscriptBlocks,
+        )?;
+        TranscriptBlockReferenceFilterResolver::new(&index).resolve_filter_references(
+            &request.filter,
+            &request.request_identifier,
+            OperationKind::SearchTranscriptBlocks,
+        )?;
+        let lowered_time_window = self.lower_optional_time_window(
+            request.filter.time_window.as_ref(),
+            &request.request_identifier,
+            OperationKind::SearchTranscriptBlocks,
+        )?;
+        let mut blocks =
+            TranscriptBlockFilterMatcher::new(&request.filter, lowered_time_window.as_ref())
+                .matching_blocks(index.current_transcript_blocks());
+        IndexedTranscriptBlockSorter::new(request.page.order).sort(&mut blocks);
+        let matches = TranscriptBlockSearcher::new(
+            request.query.clone(),
+            self.configuration
+                .output_interfaces()
+                .limits()
+                .maximum_read_bytes,
+        )
+        .search(
+            blocks,
+            &request.request_identifier,
+            OperationKind::SearchTranscriptBlocks,
+        )?;
+        let page = PaginationWindow::new(
+            request.request_identifier.clone(),
+            OperationKind::SearchTranscriptBlocks,
+            PageCollectionKind::TranscriptBlocks,
+            request.page.clone(),
+            PaginationQueryShape::transcript_block_search(
+                &request.filter,
+                lowered_time_window.as_ref(),
+                &request.query,
+            ),
+        )
+        .select(&matches)?;
+        Ok(TranscriptBlocksSearched {
+            request_identifier: request.request_identifier,
+            matches: page
+                .items
+                .iter()
+                .map(|match_record| match_record.reply_match(&request.projection))
+                .collect(),
+            page: page.metadata,
+        })
+    }
+
+    pub fn estimate_transcript_block(
+        &self,
+        request: TranscriptBlockEstimateRequest,
+    ) -> OutputOperationResult<TranscriptBlockEstimated> {
+        let index = self.index_for_reference_operation(
+            &request.request_identifier,
+            OperationKind::EstimateTranscriptBlock,
+        )?;
+        let block = ReferenceResolver::new(&index).resolve_transcript_block(
+            &request.block_reference,
+            &request.request_identifier,
+            OperationKind::EstimateTranscriptBlock,
+        )?;
+        Ok(TranscriptBlockEstimated {
+            request_identifier: request.request_identifier,
+            block_reference: request.block_reference,
+            size: block.size,
+        })
+    }
+
+    pub fn read_transcript_block(
+        &self,
+        request: TranscriptBlockReadRequest,
+    ) -> OutputOperationResult<TranscriptBlockRead> {
+        let index = self.index_for_reference_operation(
+            &request.request_identifier,
+            OperationKind::ReadTranscriptBlock,
+        )?;
+        ReadLimitValidator::new(
+            request.request_identifier.clone(),
+            OperationKind::ReadTranscriptBlock,
+            self.configuration
+                .output_interfaces()
+                .limits()
+                .maximum_read_bytes,
+        )
+        .validate(request.maximum_bytes)?;
+        let block = ReferenceResolver::new(&index).resolve_transcript_block(
+            &request.block_reference,
+            &request.request_identifier,
+            OperationKind::ReadTranscriptBlock,
+        )?;
+        let text = TranscriptBlockBackingReader::new(
+            block.clone(),
+            self.configuration
+                .output_interfaces()
+                .limits()
+                .maximum_read_bytes,
+        )
+        .read_text(
+            &request.request_identifier,
+            OperationKind::ReadTranscriptBlock,
+        )?;
+        let selected = SelectedTranscriptBlockText::new(
+            text,
+            block.provenance.source,
+            block.path.clone(),
+            request.maximum_bytes,
+        );
+        Ok(TranscriptBlockRead {
+            request_identifier: request.request_identifier,
+            block_reference: request.block_reference,
             size: selected.size,
             excerpt: selected.excerpt,
         })
@@ -409,10 +619,12 @@ pub struct DurableFragileIndex {
     subagents: Vec<IndexedSubagent>,
     outputs: Vec<IndexedOutput>,
     segments: Vec<IndexedOutputSegment>,
+    transcript_blocks: Vec<IndexedTranscriptBlock>,
     active_sessions: Vec<FragileSessionReference>,
     active_subagents: Vec<FragileSubagentReference>,
     active_outputs: Vec<FragileOutputReference>,
     active_segments: Vec<FragileOutputSegmentReference>,
+    active_transcript_blocks: Vec<FragileTranscriptBlockReference>,
 }
 
 impl DurableFragileIndex {
@@ -422,15 +634,17 @@ impl DurableFragileIndex {
             subagents: Vec::new(),
             outputs: Vec::new(),
             segments: Vec::new(),
+            transcript_blocks: Vec::new(),
             active_sessions: Vec::new(),
             active_subagents: Vec::new(),
             active_outputs: Vec::new(),
             active_segments: Vec::new(),
+            active_transcript_blocks: Vec::new(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.sessions.is_empty() && self.outputs.is_empty()
+        self.sessions.is_empty() && self.outputs.is_empty() && self.transcript_blocks.is_empty()
     }
 
     pub fn merge_current(&mut self, current: CurrentFragileIndex) {
@@ -442,6 +656,11 @@ impl DurableFragileIndex {
             IndexedOutputMerger::new(self.outputs.clone(), current.outputs.clone()).merge();
         self.segments =
             IndexedSegmentMerger::new(self.segments.clone(), current.segments.clone()).merge();
+        self.transcript_blocks = IndexedTranscriptBlockMerger::new(
+            self.transcript_blocks.clone(),
+            current.transcript_blocks.clone(),
+        )
+        .merge();
         self.active_sessions = current
             .sessions
             .into_iter()
@@ -461,6 +680,11 @@ impl DurableFragileIndex {
             .segments
             .into_iter()
             .map(|segment| segment.reference)
+            .collect();
+        self.active_transcript_blocks = current
+            .transcript_blocks
+            .into_iter()
+            .map(|block| block.reference)
             .collect();
     }
 
@@ -516,6 +740,19 @@ impl DurableFragileIndex {
             .collect()
     }
 
+    pub fn current_transcript_blocks(&self) -> Vec<IndexedTranscriptBlock> {
+        let active = self
+            .active_transcript_blocks
+            .iter()
+            .map(|reference| reference.as_str().to_string())
+            .collect::<BTreeSet<_>>();
+        self.transcript_blocks
+            .iter()
+            .filter(|block| active.contains(block.reference.as_str()))
+            .cloned()
+            .collect()
+    }
+
     pub fn session(&self, reference: &FragileSessionReference) -> Option<IndexedSession> {
         self.sessions
             .iter()
@@ -547,6 +784,16 @@ impl DurableFragileIndex {
             .cloned()
     }
 
+    pub fn transcript_block(
+        &self,
+        reference: &FragileTranscriptBlockReference,
+    ) -> Option<IndexedTranscriptBlock> {
+        self.transcript_blocks
+            .iter()
+            .find(|block| &block.reference == reference)
+            .cloned()
+    }
+
     pub fn collection_signature(&self) -> String {
         StableHash::new(
             self.active_sessions
@@ -567,6 +814,11 @@ impl DurableFragileIndex {
                         .iter()
                         .map(|reference| reference.as_str()),
                 )
+                .chain(
+                    self.active_transcript_blocks
+                        .iter()
+                        .map(|reference| reference.as_str()),
+                )
                 .collect::<Vec<_>>()
                 .join("|"),
         )
@@ -580,10 +832,12 @@ impl DurableFragileIndex {
             "active_subagents": self.active_subagents.iter().map(|reference| reference.as_str().to_string()).collect::<Vec<_>>(),
             "active_outputs": self.active_outputs.iter().map(|reference| reference.as_str().to_string()).collect::<Vec<_>>(),
             "active_segments": self.active_segments.iter().map(|reference| reference.as_str().to_string()).collect::<Vec<_>>(),
+            "active_transcript_blocks": self.active_transcript_blocks.iter().map(|reference| reference.as_str().to_string()).collect::<Vec<_>>(),
             "sessions": self.sessions.iter().map(IndexedSession::to_json).collect::<Vec<_>>(),
             "subagents": self.subagents.iter().map(IndexedSubagent::to_json).collect::<Vec<_>>(),
             "outputs": self.outputs.iter().map(IndexedOutput::to_json).collect::<Vec<_>>(),
             "segments": self.segments.iter().map(IndexedOutputSegment::to_json).collect::<Vec<_>>(),
+            "transcript_blocks": self.transcript_blocks.iter().map(IndexedTranscriptBlock::to_json).collect::<Vec<_>>(),
         })
     }
 
@@ -610,6 +864,11 @@ impl DurableFragileIndex {
                 .into_iter()
                 .map(FragileOutputSegmentReference::new)
                 .collect(),
+            active_transcript_blocks: reader
+                .strings("active_transcript_blocks")
+                .into_iter()
+                .map(FragileTranscriptBlockReference::new)
+                .collect(),
             sessions: reader
                 .array("sessions")
                 .into_iter()
@@ -630,6 +889,11 @@ impl DurableFragileIndex {
                 .into_iter()
                 .filter_map(IndexedOutputSegment::from_json)
                 .collect(),
+            transcript_blocks: reader
+                .array("transcript_blocks")
+                .into_iter()
+                .filter_map(IndexedTranscriptBlock::from_json)
+                .collect(),
         }
     }
 }
@@ -640,6 +904,7 @@ pub struct CurrentFragileIndex {
     subagents: Vec<IndexedSubagent>,
     outputs: Vec<IndexedOutput>,
     segments: Vec<IndexedOutputSegment>,
+    transcript_blocks: Vec<IndexedTranscriptBlock>,
 }
 
 impl CurrentFragileIndex {
@@ -648,12 +913,14 @@ impl CurrentFragileIndex {
         subagents: Vec<IndexedSubagent>,
         outputs: Vec<IndexedOutput>,
         segments: Vec<IndexedOutputSegment>,
+        transcript_blocks: Vec<IndexedTranscriptBlock>,
     ) -> Self {
         Self {
             sessions,
             subagents,
             outputs,
             segments,
+            transcript_blocks,
         }
     }
 }
@@ -739,18 +1006,22 @@ impl CurrentIndexAccumulator {
         let mut subagents = Vec::new();
         let mut outputs = Vec::new();
         let mut segments = Vec::new();
+        let mut transcript_blocks = Vec::new();
         for accumulator in self.sessions.into_values() {
             let indexed = accumulator.finish();
             sessions.push(indexed.session);
             subagents.extend(indexed.subagents);
             outputs.extend(indexed.outputs);
             segments.extend(indexed.segments);
+            transcript_blocks.extend(indexed.transcript_blocks);
         }
         sessions.sort_by(|left, right| left.reference.as_str().cmp(right.reference.as_str()));
         subagents.sort_by(|left, right| left.reference.as_str().cmp(right.reference.as_str()));
         outputs.sort_by(|left, right| left.reference.as_str().cmp(right.reference.as_str()));
         segments.sort_by(|left, right| left.reference.as_str().cmp(right.reference.as_str()));
-        CurrentFragileIndex::new(sessions, subagents, outputs, segments)
+        transcript_blocks
+            .sort_by(|left, right| left.reference.as_str().cmp(right.reference.as_str()));
+        CurrentFragileIndex::new(sessions, subagents, outputs, segments, transcript_blocks)
     }
 }
 
@@ -763,6 +1034,7 @@ pub struct SessionAccumulator {
     preview_limit: ByteLimit,
     outputs: Vec<IndexedOutput>,
     segments: Vec<IndexedOutputSegment>,
+    transcript_blocks: Vec<IndexedTranscriptBlock>,
     subagents: BTreeMap<String, SubagentAccumulator>,
     size: SizeAccumulator,
     started_at: Option<Timestamp>,
@@ -786,6 +1058,7 @@ impl SessionAccumulator {
             preview_limit,
             outputs: Vec::new(),
             segments: Vec::new(),
+            transcript_blocks: Vec::new(),
             subagents: BTreeMap::new(),
             size: SizeAccumulator::new(),
             started_at: None,
@@ -818,6 +1091,20 @@ impl SessionAccumulator {
                     SubagentAccumulator::new(session_reference.clone(), subagent_reference, name)
                 })
                 .observe(&output);
+        }
+        for block_record in record.transcript_blocks() {
+            let block_subagent_reference = block_record
+                .subagent_name
+                .as_ref()
+                .map(|name| self.subagent_reference(name));
+            self.transcript_blocks
+                .push(IndexedTranscriptBlock::from_record(
+                    block_record,
+                    session_reference.clone(),
+                    block_subagent_reference,
+                    self.fingerprint.clone(),
+                    self.preview_limit,
+                ));
         }
         self.segments.push(segment);
         self.outputs.push(output);
@@ -894,6 +1181,7 @@ impl SessionAccumulator {
             subagents,
             outputs: self.outputs,
             segments: self.segments,
+            transcript_blocks: self.transcript_blocks,
         }
     }
 }
@@ -904,6 +1192,7 @@ pub struct IndexedSessionBundle {
     subagents: Vec<IndexedSubagent>,
     outputs: Vec<IndexedOutput>,
     segments: Vec<IndexedOutputSegment>,
+    transcript_blocks: Vec<IndexedTranscriptBlock>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1354,6 +1643,189 @@ impl IndexedOutputSegment {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedTranscriptBlock {
+    reference: FragileTranscriptBlockReference,
+    session_reference: FragileSessionReference,
+    subagent_reference: Option<FragileSubagentReference>,
+    kind: TranscriptBlockKind,
+    block_index: signal_aggregator::TranscriptBlockIndex,
+    provenance: TranscriptBlockProvenance,
+    path: PathBuf,
+    fingerprint: SourceFingerprint,
+    source_line_number: u64,
+    text_hash: String,
+    size: SizeMetadata,
+    text_availability: TranscriptBlockTextAvailability,
+    preview_text: String,
+    preview_original_bytes: u64,
+}
+
+impl IndexedTranscriptBlock {
+    pub fn from_record(
+        record: TranscriptBlockRecord,
+        session_reference: FragileSessionReference,
+        subagent_reference: Option<FragileSubagentReference>,
+        fingerprint: SourceFingerprint,
+        preview_limit: ByteLimit,
+    ) -> Self {
+        let text_hash = record
+            .readable_text()
+            .map(StableHash::new)
+            .map(|hash| hash.hex())
+            .unwrap_or_else(|| StableHash::new("unavailable").hex());
+        let reference = FragileTranscriptBlockReference::new(
+            StableReference::new(
+                "transcript-block",
+                format!(
+                    "{}|{}|{}|{}|{}|{}|{}|{}",
+                    SourceKindName::new(record.source).as_str(),
+                    record.source_identifier.as_str(),
+                    record.path.display(),
+                    record.line_number,
+                    record.block_index,
+                    TranscriptBlockKindName::new(record.kind).as_str(),
+                    fingerprint.material(),
+                    text_hash
+                ),
+            )
+            .as_string(),
+        );
+        let size = record
+            .readable_text()
+            .map(|text| SizeMetadataFactory::from_text(text, None).exact())
+            .unwrap_or_else(SizeMetadataFactory::unknown);
+        let preview_text = record
+            .readable_text()
+            .map(|text| Utf8Prefix::new(text, preview_limit.into_u64()).into_string())
+            .unwrap_or_default();
+        let preview_original_bytes = record.byte_count().unwrap_or(0);
+        Self {
+            reference,
+            session_reference,
+            subagent_reference,
+            kind: record.kind,
+            block_index: signal_aggregator::TranscriptBlockIndex::new(record.block_index),
+            provenance: TranscriptBlockProvenance {
+                source: record.source,
+                source_identifier: record.source_identifier,
+                authored_status: record.authored_status,
+                observed_at: record.timestamp,
+            },
+            path: record.path,
+            fingerprint,
+            source_line_number: record.line_number,
+            text_hash,
+            size,
+            text_availability: record.text_availability,
+            preview_text,
+            preview_original_bytes,
+        }
+    }
+
+    pub fn card(&self, projection: &CardProjection) -> TranscriptBlockCard {
+        TranscriptBlockCard {
+            reference: self.reference.clone(),
+            session_reference: self.session_reference.clone(),
+            subagent_reference: self.subagent_reference.clone(),
+            kind: self.kind,
+            block_index: self.block_index,
+            provenance: self.provenance.clone(),
+            line_range: Some(LineRange {
+                start: LineNumber::new(self.source_line_number),
+                end: LineNumber::new(self.source_line_number + 1),
+            }),
+            byte_range: None,
+            size: self.size.clone(),
+            text_availability: self.text_availability,
+            preview: TranscriptBlockPreviewProjector::new(
+                self.preview_text.clone(),
+                self.preview_original_bytes,
+                self.provenance.source,
+                self.path.clone(),
+                self.text_availability,
+            )
+            .project(projection),
+        }
+    }
+
+    pub fn chronology_timestamp(&self) -> Option<&Timestamp> {
+        self.provenance.observed_at.as_ref()
+    }
+
+    pub fn source_sort_material(&self) -> String {
+        StableSignatureMaterial::new("transcript-block-source-sort")
+            .field(
+                "source",
+                SourceKindName::new(self.provenance.source).as_str(),
+            )
+            .field(
+                "source_identifier",
+                self.provenance.source_identifier.as_str(),
+            )
+            .field("path", self.path.display().to_string())
+            .finish()
+    }
+
+    pub fn size_byte_count(&self) -> u64 {
+        self.size.byte_count.map_or(0, ByteCount::into_u64)
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "reference": self.reference.as_str(),
+            "session_reference": self.session_reference.as_str(),
+            "subagent_reference": self.subagent_reference.as_ref().map(|value| value.as_str()),
+            "kind": TranscriptBlockKindName::new(self.kind).as_str(),
+            "block_index": self.block_index.into_u64(),
+            "source": SourceKindName::new(self.provenance.source).as_str(),
+            "source_identifier": self.provenance.source_identifier.as_str(),
+            "authored_status": AuthoredStatusName::new(self.provenance.authored_status).as_str(),
+            "observed_at": self.provenance.observed_at.as_ref().map(|value| value.as_str()),
+            "path": self.path.display().to_string(),
+            "fingerprint": self.fingerprint.to_json(),
+            "source_line_number": self.source_line_number,
+            "text_hash": self.text_hash,
+            "size": SizeMetadataJson::new(&self.size).to_json(),
+            "text_availability": TranscriptBlockTextAvailabilityName::new(self.text_availability).as_str(),
+            "preview_text": self.preview_text,
+            "preview_original_bytes": self.preview_original_bytes,
+        })
+    }
+
+    pub fn from_json(value: &Value) -> Option<Self> {
+        let reader = JsonReader::new(value);
+        let source = SourceKindName::parse(&reader.string("source")?)?;
+        Some(Self {
+            reference: FragileTranscriptBlockReference::new(reader.string("reference")?),
+            session_reference: FragileSessionReference::new(reader.string("session_reference")?),
+            subagent_reference: reader
+                .optional_string("subagent_reference")
+                .map(FragileSubagentReference::new),
+            kind: TranscriptBlockKindName::parse(&reader.string("kind")?)?,
+            block_index: signal_aggregator::TranscriptBlockIndex::new(reader.u64("block_index")?),
+            provenance: TranscriptBlockProvenance {
+                source,
+                source_identifier: signal_aggregator::SourceIdentifier::new(
+                    reader.string("source_identifier")?,
+                ),
+                authored_status: AuthoredStatusName::parse(&reader.string("authored_status")?)?,
+                observed_at: reader.optional_string("observed_at").map(Timestamp::new),
+            },
+            path: PathBuf::from(reader.string("path")?),
+            fingerprint: SourceFingerprint::from_json(reader.value("fingerprint")?)?,
+            source_line_number: reader.u64("source_line_number")?,
+            text_hash: reader.string("text_hash")?,
+            size: SizeMetadataJson::from_json(reader.value("size")?)?,
+            text_availability: TranscriptBlockTextAvailabilityName::parse(
+                &reader.string("text_availability")?,
+            )?,
+            preview_text: reader.string("preview_text")?,
+            preview_original_bytes: reader.u64("preview_original_bytes")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FragileIndexStore {
     path: PathBuf,
 }
@@ -1482,6 +1954,27 @@ impl<'a> ReferenceResolver<'a> {
         self.resolve_output(&segment.output_reference, request_identifier, operation)?;
         Ok(segment)
     }
+
+    pub fn resolve_transcript_block(
+        &self,
+        reference: &FragileTranscriptBlockReference,
+        request_identifier: &RequestIdentifier,
+        operation: OperationKind,
+    ) -> OutputOperationResult<IndexedTranscriptBlock> {
+        let factory = OperationRejectedFactory::new(request_identifier.clone(), operation);
+        let Some(block) = self.index.transcript_block(reference) else {
+            return Err(
+                factory.missing(Some(RejectedFragileReference::TranscriptBlock(
+                    reference.clone(),
+                ))),
+            );
+        };
+        BackingFileState::new(block.path.clone(), block.fingerprint.clone()).ensure_available(
+            &factory,
+            Some(RejectedFragileReference::TranscriptBlock(reference.clone())),
+        )?;
+        Ok(block)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1531,6 +2024,79 @@ impl OutputBackingReader {
             ))));
         }
         Ok(record.text)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptBlockBackingReader {
+    block: IndexedTranscriptBlock,
+    maximum_line_bytes: ByteLimit,
+}
+
+impl TranscriptBlockBackingReader {
+    pub fn new(block: IndexedTranscriptBlock, maximum_line_bytes: ByteLimit) -> Self {
+        Self {
+            block,
+            maximum_line_bytes,
+        }
+    }
+
+    pub fn read_text(
+        &self,
+        request_identifier: &RequestIdentifier,
+        operation: OperationKind,
+    ) -> OutputOperationResult<String> {
+        let factory = OperationRejectedFactory::new(request_identifier.clone(), operation);
+        let reference = Some(RejectedFragileReference::TranscriptBlock(
+            self.block.reference.clone(),
+        ));
+        match self.block.text_availability {
+            TranscriptBlockTextAvailability::ReadableText => {}
+            TranscriptBlockTextAvailability::UnavailableText => {
+                return Err(factory.unsupported_reference(reference));
+            }
+            TranscriptBlockTextAvailability::EncryptedText => {
+                return Err(factory.unauthorized(reference));
+            }
+        }
+        let line_limit = self
+            .maximum_line_bytes
+            .into_u64()
+            .max(self.block.size_byte_count().saturating_add(4096))
+            .max(4096);
+        let line = BoundedLineReader::new(
+            self.block.path.clone(),
+            self.block.source_line_number,
+            line_limit,
+        )
+        .read_line()
+        .map_err(|failure| {
+            failure.transcript_block_rejection(&factory, self.block.reference.clone())
+        })?;
+        let record = TranscriptLineParser::new(
+            self.block.provenance.source,
+            self.block.provenance.source_identifier.clone(),
+            self.block.path.clone(),
+            self.block.source_line_number,
+            line,
+        )
+        .parse()
+        .ok_or_else(|| factory.stale(reference.clone()))?;
+        let Some(block) = record
+            .transcript_blocks()
+            .into_iter()
+            .find(|candidate| candidate.block_index == self.block.block_index.into_u64())
+        else {
+            return Err(factory.stale(reference));
+        };
+        let Some(text) = block.readable_text().map(ToOwned::to_owned) else {
+            return Err(factory.stale(reference));
+        };
+        let hash = StableHash::new(&text).hex();
+        if hash != self.block.text_hash || block.kind != self.block.kind {
+            return Err(factory.stale(reference));
+        }
+        Ok(text)
     }
 }
 
@@ -1610,6 +2176,20 @@ impl BoundedLineReadFailure {
         reference: FragileOutputReference,
     ) -> OperationRejected {
         let reference = Some(RejectedFragileReference::Output(reference));
+        match self {
+            Self::Missing => factory.broken(reference),
+            Self::PermissionDenied => factory.unauthorized(reference),
+            Self::IoFailure | Self::Malformed => factory.stale(reference),
+            Self::Oversized => factory.oversized(reference),
+        }
+    }
+
+    pub fn transcript_block_rejection(
+        self,
+        factory: &OperationRejectedFactory,
+        reference: FragileTranscriptBlockReference,
+    ) -> OperationRejected {
+        let reference = Some(RejectedFragileReference::TranscriptBlock(reference));
         match self {
             Self::Missing => factory.broken(reference),
             Self::PermissionDenied => factory.unauthorized(reference),
@@ -1820,6 +2400,39 @@ impl SelectedOutputText {
             size: SizeMetadataFactory::from_text(&text, None).exact(),
             excerpt: OutputTextExcerpt {
                 text: OutputText::new(projected),
+                byte_count: ByteCount::new(projected_bytes),
+                truncation,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedTranscriptBlockText {
+    size: SizeMetadata,
+    excerpt: TranscriptTextExcerpt,
+}
+
+impl SelectedTranscriptBlockText {
+    pub fn new(text: String, source: SourceKind, path: PathBuf, maximum_bytes: ByteLimit) -> Self {
+        let original_bytes = text.len() as u64;
+        let projected = Utf8Prefix::new(&text, maximum_bytes.into_u64()).into_string();
+        let projected_bytes = projected.len() as u64;
+        let truncation = if projected_bytes < original_bytes {
+            Some(Truncation {
+                source,
+                path: Some(FilesystemPath::new(path.display().to_string())),
+                original_bytes: Some(ByteCount::new(original_bytes)),
+                projected_bytes: ByteCount::new(projected_bytes),
+                reason: TruncationReason::RequestLimit,
+            })
+        } else {
+            None
+        };
+        Self {
+            size: SizeMetadataFactory::from_text(&text, None).exact(),
+            excerpt: TranscriptTextExcerpt {
+                text: TranscriptText::new(projected),
                 byte_count: ByteCount::new(projected_bytes),
                 truncation,
             },
@@ -2072,6 +2685,64 @@ impl PreviewProjector {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptBlockPreviewProjector {
+    preview_text: String,
+    original_bytes: u64,
+    source: SourceKind,
+    path: PathBuf,
+    availability: TranscriptBlockTextAvailability,
+}
+
+impl TranscriptBlockPreviewProjector {
+    pub fn new(
+        preview_text: String,
+        original_bytes: u64,
+        source: SourceKind,
+        path: PathBuf,
+        availability: TranscriptBlockTextAvailability,
+    ) -> Self {
+        Self {
+            preview_text,
+            original_bytes,
+            source,
+            path,
+            availability,
+        }
+    }
+
+    pub fn project(&self, projection: &CardProjection) -> Option<TranscriptTextExcerpt> {
+        if self.availability != TranscriptBlockTextAvailability::ReadableText {
+            return None;
+        }
+        match projection {
+            CardProjection::MetadataOnly => None,
+            CardProjection::BoundedPreview(bound) => Some(self.bounded(bound.maximum_bytes)),
+        }
+    }
+
+    pub fn bounded(&self, maximum_bytes: ByteLimit) -> TranscriptTextExcerpt {
+        let text = Utf8Prefix::new(&self.preview_text, maximum_bytes.into_u64()).into_string();
+        let projected_bytes = text.len() as u64;
+        let truncation = if projected_bytes < self.original_bytes {
+            Some(Truncation {
+                source: self.source,
+                path: Some(FilesystemPath::new(self.path.display().to_string())),
+                original_bytes: Some(ByteCount::new(self.original_bytes)),
+                projected_bytes: ByteCount::new(projected_bytes),
+                reason: TruncationReason::ProjectionLimit,
+            })
+        } else {
+            None
+        };
+        TranscriptTextExcerpt {
+            text: TranscriptText::new(text),
+            byte_count: ByteCount::new(projected_bytes),
+            truncation,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Utf8Prefix<'a> {
     text: &'a str,
@@ -2170,22 +2841,26 @@ impl ProjectionRequestValidator {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadLimitValidator {
     request_identifier: RequestIdentifier,
+    operation: OperationKind,
     maximum_read_bytes: ByteLimit,
 }
 
 impl ReadLimitValidator {
-    pub fn new(request_identifier: RequestIdentifier, maximum_read_bytes: ByteLimit) -> Self {
+    pub fn new(
+        request_identifier: RequestIdentifier,
+        operation: OperationKind,
+        maximum_read_bytes: ByteLimit,
+    ) -> Self {
         Self {
             request_identifier,
+            operation,
             maximum_read_bytes,
         }
     }
 
     pub fn validate(&self, requested: ByteLimit) -> OutputOperationResult<()> {
-        let factory = OperationRejectedFactory::new(
-            self.request_identifier.clone(),
-            OperationKind::ReadOutput,
-        );
+        let factory =
+            OperationRejectedFactory::new(self.request_identifier.clone(), self.operation);
         if requested.into_u64() == 0 {
             return Err(factory.invalid_request());
         }
@@ -2193,6 +2868,173 @@ impl ReadLimitValidator {
             return Err(factory.oversized(None));
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptBlockRequestValidator {
+    maximum_page_items: PageLimit,
+    maximum_preview_bytes: ByteLimit,
+}
+
+impl TranscriptBlockRequestValidator {
+    pub fn new(maximum_page_items: PageLimit, maximum_preview_bytes: ByteLimit) -> Self {
+        Self {
+            maximum_page_items,
+            maximum_preview_bytes,
+        }
+    }
+
+    pub fn validate_listing(
+        &self,
+        request_identifier: &RequestIdentifier,
+        operation: OperationKind,
+        page: &PageRequest,
+        projection: &CardProjection,
+    ) -> OutputOperationResult<()> {
+        PageRequestValidator::new(
+            request_identifier.clone(),
+            operation,
+            self.maximum_page_items,
+        )
+        .validate(page)?;
+        ProjectionRequestValidator::new(
+            request_identifier.clone(),
+            operation,
+            self.maximum_preview_bytes,
+        )
+        .validate(projection)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptBlockQueryValidator<'a> {
+    query: &'a TranscriptBlockTextQuery,
+}
+
+impl<'a> TranscriptBlockQueryValidator<'a> {
+    pub fn new(query: &'a TranscriptBlockTextQuery) -> Self {
+        Self { query }
+    }
+
+    pub fn validate(
+        &self,
+        request_identifier: &RequestIdentifier,
+        operation: OperationKind,
+    ) -> OutputOperationResult<()> {
+        let factory = OperationRejectedFactory::new(request_identifier.clone(), operation);
+        if QueryComplexity::new(self.query.as_query()).is_pathological() {
+            Err(factory.invalid_query())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryComplexity<'a> {
+    query: &'a Query,
+}
+
+impl<'a> QueryComplexity<'a> {
+    pub fn new(query: &'a Query) -> Self {
+        Self { query }
+    }
+
+    pub fn is_pathological(&self) -> bool {
+        self.node_count() > 64 || self.depth() > 16 || self.has_empty_or_excessive_term()
+    }
+
+    pub fn node_count(&self) -> usize {
+        QueryShape::new(self.query).node_count()
+    }
+
+    pub fn depth(&self) -> usize {
+        QueryShape::new(self.query).depth()
+    }
+
+    pub fn has_empty_or_excessive_term(&self) -> bool {
+        QueryShape::new(self.query).has_empty_or_excessive_term()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryShape<'a> {
+    query: &'a Query,
+}
+
+impl<'a> QueryShape<'a> {
+    pub fn new(query: &'a Query) -> Self {
+        Self { query }
+    }
+
+    pub fn node_count(&self) -> usize {
+        match self.query {
+            Query::Contains(_) | Query::Near(_) => 1,
+            Query::Not(child) => 1 + QueryShape::new(child).node_count(),
+            Query::AllOf(children) | Query::AnyOf(children) => {
+                1 + children
+                    .iter()
+                    .map(|child| QueryShape::new(child).node_count())
+                    .sum::<usize>()
+            }
+        }
+    }
+
+    pub fn depth(&self) -> usize {
+        match self.query {
+            Query::Contains(_) | Query::Near(_) => 1,
+            Query::Not(child) => 1 + QueryShape::new(child).depth(),
+            Query::AllOf(children) | Query::AnyOf(children) => {
+                1 + children
+                    .iter()
+                    .map(|child| QueryShape::new(child).depth())
+                    .max()
+                    .unwrap_or(0)
+            }
+        }
+    }
+
+    pub fn has_empty_or_excessive_term(&self) -> bool {
+        match self.query {
+            Query::Contains(term) => QueryTermShape::new(term).is_invalid(),
+            Query::Near(query) => {
+                query.distance.0 > 10_000
+                    || QueryTermShape::new(&query.left).is_invalid()
+                    || QueryTermShape::new(&query.right).is_invalid()
+            }
+            Query::Not(child) => QueryShape::new(child).has_empty_or_excessive_term(),
+            Query::AllOf(children) | Query::AnyOf(children) => {
+                children.is_empty()
+                    || children
+                        .iter()
+                        .any(|child| QueryShape::new(child).has_empty_or_excessive_term())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryTermShape<'a> {
+    term: &'a QueryTerm,
+}
+
+impl<'a> QueryTermShape<'a> {
+    pub fn new(term: &'a QueryTerm) -> Self {
+        Self { term }
+    }
+
+    pub fn is_invalid(&self) -> bool {
+        match self.term {
+            QueryTerm::Word(word) => {
+                word.value.len() > 256 || word.normalized().as_str().is_empty()
+            }
+            QueryTerm::Phrase(phrase) => {
+                phrase.words.len() > 32
+                    || phrase.words.iter().map(String::len).sum::<usize>() > 2048
+                    || phrase.normalized_words().is_empty()
+            }
+        }
     }
 }
 
@@ -2276,6 +3118,39 @@ impl PaginationQueryShape {
         }
     }
 
+    pub fn transcript_blocks(
+        filter: &TranscriptBlockFilter,
+        lowered_time_window: Option<&TimeWindow>,
+    ) -> Self {
+        Self {
+            material: StableSignatureMaterial::new("transcript-blocks-query")
+                .field(
+                    "filter",
+                    TranscriptBlockFilterSignature::new(filter, lowered_time_window).material(),
+                )
+                .finish(),
+        }
+    }
+
+    pub fn transcript_block_search(
+        filter: &TranscriptBlockFilter,
+        lowered_time_window: Option<&TimeWindow>,
+        query: &TranscriptBlockTextQuery,
+    ) -> Self {
+        Self {
+            material: StableSignatureMaterial::new("transcript-block-search-query")
+                .field(
+                    "filter",
+                    TranscriptBlockFilterSignature::new(filter, lowered_time_window).material(),
+                )
+                .field(
+                    "text_query",
+                    TextQuerySignature::new(query.as_query()).material(),
+                )
+                .finish(),
+        }
+    }
+
     pub fn material(&self) -> &str {
         &self.material
     }
@@ -2336,6 +3211,171 @@ impl<'a> AuthoredStatusFilterSignature<'a> {
                     .field("kind", "only")
                     .field("status", AuthoredStatusName::new(*status).as_str())
                     .finish()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptBlockFilterSignature<'a> {
+    filter: &'a TranscriptBlockFilter,
+    lowered_time_window: Option<&'a TimeWindow>,
+}
+
+impl<'a> TranscriptBlockFilterSignature<'a> {
+    pub fn new(
+        filter: &'a TranscriptBlockFilter,
+        lowered_time_window: Option<&'a TimeWindow>,
+    ) -> Self {
+        Self {
+            filter,
+            lowered_time_window,
+        }
+    }
+
+    pub fn material(&self) -> String {
+        StableSignatureMaterial::new("transcript-block-filter")
+            .field(
+                "source_selection",
+                SourceSelectionSignature::new(&self.filter.source_selection).material(),
+            )
+            .field(
+                "session_reference",
+                OptionalSignatureText::new(
+                    self.filter
+                        .session_reference
+                        .as_ref()
+                        .map(|reference| reference.as_str()),
+                )
+                .material(),
+            )
+            .field(
+                "subagent_reference",
+                OptionalSignatureText::new(
+                    self.filter
+                        .subagent_reference
+                        .as_ref()
+                        .map(|reference| reference.as_str()),
+                )
+                .material(),
+            )
+            .field(
+                "kind_selection",
+                TranscriptBlockKindSelectionSignature::new(&self.filter.kind_selection).material(),
+            )
+            .field(
+                "authored_status",
+                AuthoredStatusFilterSignature::new(&self.filter.authored_status).material(),
+            )
+            .field(
+                "time_window",
+                OptionalTimeWindowSignature::new(self.lowered_time_window).material(),
+            )
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptBlockKindSelectionSignature<'a> {
+    selection: &'a TranscriptBlockKindSelection,
+}
+
+impl<'a> TranscriptBlockKindSelectionSignature<'a> {
+    pub fn new(selection: &'a TranscriptBlockKindSelection) -> Self {
+        Self { selection }
+    }
+
+    pub fn material(&self) -> String {
+        match self.selection {
+            TranscriptBlockKindSelection::AllTranscriptBlockKinds => {
+                StableSignatureMaterial::new("transcript-block-kind-selection")
+                    .field("kind", "all")
+                    .finish()
+            }
+            TranscriptBlockKindSelection::OnlyTranscriptBlockKinds(selected) => {
+                let kinds = selected
+                    .kinds
+                    .iter()
+                    .map(|kind| TranscriptBlockKindName::new(*kind).as_str().to_string())
+                    .collect::<BTreeSet<_>>();
+                let mut material = StableSignatureMaterial::new("transcript-block-kind-selection")
+                    .field("kind", "only")
+                    .field("kind_count", kinds.len().to_string());
+                for kind in kinds {
+                    material = material.field("selected_kind", kind);
+                }
+                material.finish()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextQuerySignature<'a> {
+    query: &'a Query,
+}
+
+impl<'a> TextQuerySignature<'a> {
+    pub fn new(query: &'a Query) -> Self {
+        Self { query }
+    }
+
+    pub fn material(&self) -> String {
+        match self.query {
+            Query::Contains(term) => StableSignatureMaterial::new("text-query")
+                .field("kind", "contains")
+                .field("term", QueryTermSignature::new(term).material())
+                .finish(),
+            Query::AllOf(children) => self.children_material("all-of", children),
+            Query::AnyOf(children) => self.children_material("any-of", children),
+            Query::Not(child) => StableSignatureMaterial::new("text-query")
+                .field("kind", "not")
+                .field("child", TextQuerySignature::new(child).material())
+                .finish(),
+            Query::Near(query) => StableSignatureMaterial::new("text-query")
+                .field("kind", "near")
+                .field("left", QueryTermSignature::new(&query.left).material())
+                .field("right", QueryTermSignature::new(&query.right).material())
+                .field("distance", query.distance.0.to_string())
+                .finish(),
+        }
+    }
+
+    pub fn children_material(&self, kind: &'static str, children: &[Query]) -> String {
+        let mut material = StableSignatureMaterial::new("text-query")
+            .field("kind", kind)
+            .field("child_count", children.len().to_string());
+        for child in children {
+            material = material.field("child", TextQuerySignature::new(child).material());
+        }
+        material.finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryTermSignature<'a> {
+    term: &'a QueryTerm,
+}
+
+impl<'a> QueryTermSignature<'a> {
+    pub fn new(term: &'a QueryTerm) -> Self {
+        Self { term }
+    }
+
+    pub fn material(&self) -> String {
+        match self.term {
+            QueryTerm::Word(word) => StableSignatureMaterial::new("text-query-term")
+                .field("kind", "word")
+                .field("value", &word.value)
+                .finish(),
+            QueryTerm::Phrase(phrase) => {
+                let mut material = StableSignatureMaterial::new("text-query-term")
+                    .field("kind", "phrase")
+                    .field("word_count", phrase.words.len().to_string());
+                for word in &phrase.words {
+                    material = material.field("word", word);
+                }
+                material.finish()
             }
         }
     }
@@ -2468,6 +3508,18 @@ impl PaginatedItemReference for IndexedOutput {
 impl PaginatedItemReference for IndexedOutputSegment {
     fn pagination_reference(&self) -> &str {
         self.reference.as_str()
+    }
+}
+
+impl PaginatedItemReference for IndexedTranscriptBlock {
+    fn pagination_reference(&self) -> &str {
+        self.reference.as_str()
+    }
+}
+
+impl PaginatedItemReference for IndexedTranscriptBlockSearchMatch {
+    fn pagination_reference(&self) -> &str {
+        self.block.reference.as_str()
     }
 }
 
@@ -2604,6 +3656,7 @@ pub enum PageCollectionKind {
     Subagents,
     Outputs,
     Segments,
+    TranscriptBlocks,
 }
 
 impl PageCollectionKind {
@@ -2613,6 +3666,7 @@ impl PageCollectionKind {
             Self::Subagents => "subagents",
             Self::Outputs => "outputs",
             Self::Segments => "segments",
+            Self::TranscriptBlocks => "transcript-blocks",
         }
     }
 
@@ -2622,6 +3676,7 @@ impl PageCollectionKind {
             "subagents" => Some(Self::Subagents),
             "outputs" => Some(Self::Outputs),
             "segments" => Some(Self::Segments),
+            "transcript-blocks" => Some(Self::TranscriptBlocks),
             _ => None,
         }
     }
@@ -2816,6 +3871,78 @@ impl IndexedSegmentSorter {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedTranscriptBlockSorter {
+    order: ListingOrder,
+}
+
+impl IndexedTranscriptBlockSorter {
+    pub fn new(order: ListingOrder) -> Self {
+        Self { order }
+    }
+
+    pub fn sort(&self, blocks: &mut [IndexedTranscriptBlock]) {
+        blocks.sort_by(|left, right| TranscriptBlockOrdering::new(self.order).compare(left, right));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptBlockOrdering {
+    order: ListingOrder,
+}
+
+impl TranscriptBlockOrdering {
+    pub fn new(order: ListingOrder) -> Self {
+        Self { order }
+    }
+
+    pub fn compare(
+        &self,
+        left: &IndexedTranscriptBlock,
+        right: &IndexedTranscriptBlock,
+    ) -> Ordering {
+        match self.order {
+            ListingOrder::ReferenceAscending => {
+                left.reference.as_str().cmp(right.reference.as_str())
+            }
+            ListingOrder::OldestFirst => self
+                .compare_oldest(left.chronology_timestamp(), right.chronology_timestamp())
+                .then_with(|| {
+                    left.source_sort_material()
+                        .cmp(&right.source_sort_material())
+                })
+                .then_with(|| left.source_line_number.cmp(&right.source_line_number))
+                .then_with(|| {
+                    left.block_index
+                        .into_u64()
+                        .cmp(&right.block_index.into_u64())
+                })
+                .then_with(|| left.reference.as_str().cmp(right.reference.as_str())),
+            ListingOrder::NewestFirst => self
+                .compare_newest(left.chronology_timestamp(), right.chronology_timestamp())
+                .then_with(|| {
+                    left.source_sort_material()
+                        .cmp(&right.source_sort_material())
+                })
+                .then_with(|| left.source_line_number.cmp(&right.source_line_number))
+                .then_with(|| {
+                    left.block_index
+                        .into_u64()
+                        .cmp(&right.block_index.into_u64())
+                })
+                .then_with(|| left.reference.as_str().cmp(right.reference.as_str())),
+        }
+    }
+
+    pub fn compare_oldest(&self, left: Option<&Timestamp>, right: Option<&Timestamp>) -> Ordering {
+        ChronologyOrdering::new(ListingOrder::OldestFirst).compare_oldest(left, right)
+    }
+
+    pub fn compare_newest(&self, left: Option<&Timestamp>, right: Option<&Timestamp>) -> Ordering {
+        ChronologyOrdering::new(ListingOrder::NewestFirst).compare_newest(left, right)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChronologyOrdering {
     order: ListingOrder,
@@ -2920,6 +4047,179 @@ impl<'a> AuthoredStatusFilterMatcher<'a> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptBlockKindSelectionMatcher<'a> {
+    selection: &'a TranscriptBlockKindSelection,
+}
+
+impl<'a> TranscriptBlockKindSelectionMatcher<'a> {
+    pub fn new(selection: &'a TranscriptBlockKindSelection) -> Self {
+        Self { selection }
+    }
+
+    pub fn accepts(&self, kind: TranscriptBlockKind) -> bool {
+        match self.selection {
+            TranscriptBlockKindSelection::AllTranscriptBlockKinds => true,
+            TranscriptBlockKindSelection::OnlyTranscriptBlockKinds(selected) => {
+                selected.kinds.contains(&kind)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptBlockFilterMatcher<'a> {
+    filter: &'a TranscriptBlockFilter,
+    lowered_time_window: Option<&'a TimeWindow>,
+}
+
+impl<'a> TranscriptBlockFilterMatcher<'a> {
+    pub fn new(
+        filter: &'a TranscriptBlockFilter,
+        lowered_time_window: Option<&'a TimeWindow>,
+    ) -> Self {
+        Self {
+            filter,
+            lowered_time_window,
+        }
+    }
+
+    pub fn matching_blocks(
+        &self,
+        blocks: Vec<IndexedTranscriptBlock>,
+    ) -> Vec<IndexedTranscriptBlock> {
+        blocks
+            .into_iter()
+            .filter(|block| {
+                SourceSelectionFilter::new(&self.filter.source_selection)
+                    .accepts(block.provenance.source)
+            })
+            .filter(|block| {
+                self.filter
+                    .session_reference
+                    .as_ref()
+                    .is_none_or(|reference| block.session_reference == *reference)
+            })
+            .filter(|block| {
+                self.filter
+                    .subagent_reference
+                    .as_ref()
+                    .is_none_or(|reference| block.subagent_reference.as_ref() == Some(reference))
+            })
+            .filter(|block| {
+                TranscriptBlockKindSelectionMatcher::new(&self.filter.kind_selection)
+                    .accepts(block.kind)
+            })
+            .filter(|block| {
+                AuthoredStatusFilterMatcher::new(&self.filter.authored_status)
+                    .accepts(block.provenance.authored_status)
+            })
+            .filter(|block| {
+                OptionalTimeWindowFilter::new(self.lowered_time_window)
+                    .accepts(block.provenance.observed_at.as_ref())
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptBlockReferenceFilterResolver<'a> {
+    index: &'a DurableFragileIndex,
+}
+
+impl<'a> TranscriptBlockReferenceFilterResolver<'a> {
+    pub fn new(index: &'a DurableFragileIndex) -> Self {
+        Self { index }
+    }
+
+    pub fn resolve_filter_references(
+        &self,
+        filter: &TranscriptBlockFilter,
+        request_identifier: &RequestIdentifier,
+        operation: OperationKind,
+    ) -> OutputOperationResult<()> {
+        if let Some(reference) = &filter.session_reference {
+            ReferenceResolver::new(self.index).resolve_session(
+                reference,
+                request_identifier,
+                operation,
+            )?;
+        }
+        if let Some(reference) = &filter.subagent_reference {
+            ReferenceResolver::new(self.index).resolve_subagent(
+                reference,
+                request_identifier,
+                operation,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedTranscriptBlockSearchMatch {
+    block: IndexedTranscriptBlock,
+    evidence: TranscriptBlockSearchEvidence,
+}
+
+impl IndexedTranscriptBlockSearchMatch {
+    pub fn new(block: IndexedTranscriptBlock, evidence: TranscriptBlockSearchEvidence) -> Self {
+        Self { block, evidence }
+    }
+
+    pub fn reply_match(&self, projection: &CardProjection) -> TranscriptBlockSearchMatch {
+        TranscriptBlockSearchMatch {
+            card: self.block.card(projection),
+            evidence: self.evidence.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptBlockSearcher {
+    query: TranscriptBlockTextQuery,
+    maximum_read_bytes: ByteLimit,
+}
+
+impl TranscriptBlockSearcher {
+    pub fn new(query: TranscriptBlockTextQuery, maximum_read_bytes: ByteLimit) -> Self {
+        Self {
+            query,
+            maximum_read_bytes,
+        }
+    }
+
+    pub fn search(
+        &self,
+        blocks: Vec<IndexedTranscriptBlock>,
+        request_identifier: &RequestIdentifier,
+        operation: OperationKind,
+    ) -> OutputOperationResult<Vec<IndexedTranscriptBlockSearchMatch>> {
+        let mut matches = Vec::new();
+        for block in blocks {
+            if block.text_availability != TranscriptBlockTextAvailability::ReadableText {
+                continue;
+            }
+            let text = TranscriptBlockBackingReader::new(block.clone(), self.maximum_read_bytes)
+                .read_text(request_identifier, operation)?;
+            let search_text = SearchText::new(text);
+            if let Some(evidence) = self
+                .query
+                .as_query()
+                .find_in(&search_text)
+                .evidence()
+                .cloned()
+            {
+                matches.push(IndexedTranscriptBlockSearchMatch::new(
+                    block,
+                    TranscriptBlockSearchEvidence::new(evidence),
+                ));
+            }
+        }
+        Ok(matches)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SizeAccumulator {
     byte_count: u64,
@@ -2986,6 +4286,15 @@ impl SizeMetadataFactory {
             line_count: Some(LineCount::new(self.line_count)),
             segment_count: self.segment_count.map(ItemCount::new),
             certainty: SizeCertainty::Exact,
+        }
+    }
+
+    pub fn unknown() -> SizeMetadata {
+        SizeMetadata {
+            byte_count: None,
+            line_count: None,
+            segment_count: None,
+            certainty: SizeCertainty::Unknown,
         }
     }
 }
@@ -3126,6 +4435,13 @@ impl OperationRejectedFactory {
         self.rejected(OperationRejectionReason::Unsupported, None)
     }
 
+    pub fn unsupported_reference(
+        &self,
+        reference: Option<RejectedFragileReference>,
+    ) -> OperationRejected {
+        self.rejected(OperationRejectionReason::Unsupported, reference)
+    }
+
     pub fn unauthorized(&self, reference: Option<RejectedFragileReference>) -> OperationRejected {
         self.rejected(OperationRejectionReason::Unauthorized, reference)
     }
@@ -3136,6 +4452,10 @@ impl OperationRejectedFactory {
 
     pub fn invalid_range(&self, reference: Option<RejectedFragileReference>) -> OperationRejected {
         self.rejected(OperationRejectionReason::InvalidRange, reference)
+    }
+
+    pub fn invalid_query(&self) -> OperationRejected {
+        self.rejected(OperationRejectionReason::InvalidQuery, None)
     }
 }
 
@@ -3164,6 +4484,74 @@ impl SourceKindName {
             "Codex" => Some(SourceKind::Codex),
             "Pi" => Some(SourceKind::Pi),
             "Repository" => Some(SourceKind::Repository),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptBlockKindName {
+    kind: TranscriptBlockKind,
+}
+
+impl TranscriptBlockKindName {
+    pub fn new(kind: TranscriptBlockKind) -> Self {
+        Self { kind }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self.kind {
+            TranscriptBlockKind::UserPrompt => "UserPrompt",
+            TranscriptBlockKind::AgentResponse => "AgentResponse",
+            TranscriptBlockKind::ToolCall => "ToolCall",
+            TranscriptBlockKind::ToolResult => "ToolResult",
+            TranscriptBlockKind::Inference => "Inference",
+            TranscriptBlockKind::SystemInstruction => "SystemInstruction",
+            TranscriptBlockKind::Attachment => "Attachment",
+            TranscriptBlockKind::SessionEvent => "SessionEvent",
+            TranscriptBlockKind::Unclassified => "Unclassified",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<TranscriptBlockKind> {
+        match value {
+            "UserPrompt" => Some(TranscriptBlockKind::UserPrompt),
+            "AgentResponse" => Some(TranscriptBlockKind::AgentResponse),
+            "ToolCall" => Some(TranscriptBlockKind::ToolCall),
+            "ToolResult" => Some(TranscriptBlockKind::ToolResult),
+            "Inference" => Some(TranscriptBlockKind::Inference),
+            "SystemInstruction" => Some(TranscriptBlockKind::SystemInstruction),
+            "Attachment" => Some(TranscriptBlockKind::Attachment),
+            "SessionEvent" => Some(TranscriptBlockKind::SessionEvent),
+            "Unclassified" => Some(TranscriptBlockKind::Unclassified),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptBlockTextAvailabilityName {
+    availability: TranscriptBlockTextAvailability,
+}
+
+impl TranscriptBlockTextAvailabilityName {
+    pub fn new(availability: TranscriptBlockTextAvailability) -> Self {
+        Self { availability }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self.availability {
+            TranscriptBlockTextAvailability::ReadableText => "ReadableText",
+            TranscriptBlockTextAvailability::UnavailableText => "UnavailableText",
+            TranscriptBlockTextAvailability::EncryptedText => "EncryptedText",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<TranscriptBlockTextAvailability> {
+        match value {
+            "ReadableText" => Some(TranscriptBlockTextAvailability::ReadableText),
+            "UnavailableText" => Some(TranscriptBlockTextAvailability::UnavailableText),
+            "EncryptedText" => Some(TranscriptBlockTextAvailability::EncryptedText),
             _ => None,
         }
     }
@@ -3393,3 +4781,8 @@ index_merger!(IndexedSessionMerger, IndexedSession, reference);
 index_merger!(IndexedSubagentMerger, IndexedSubagent, reference);
 index_merger!(IndexedOutputMerger, IndexedOutput, reference);
 index_merger!(IndexedSegmentMerger, IndexedOutputSegment, reference);
+index_merger!(
+    IndexedTranscriptBlockMerger,
+    IndexedTranscriptBlock,
+    reference
+);

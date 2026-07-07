@@ -23,7 +23,7 @@ use aggregator::{
         TranscriptScanLimitConfiguration, TranscriptScanLimits,
         claude::{ClaudeJsonlRootReader, ClaudeTranscriptAdapter},
         codex::{CodexSessionRootReader, CodexTranscriptAdapter},
-        pi::PiTranscriptAdapter,
+        pi::{PiRunHistoryRootReader, PiTranscriptAdapter},
         repository::{
             RepositoryAdapter, RepositoryChangeFixture, RepositoryCommandPolicy,
             RepositoryEvidenceFixture,
@@ -39,18 +39,22 @@ use meta_signal_aggregator::{
     OutputInterfaceConfiguration, RepositoryName, SocketMode, TranscriptRoot, TranscriptSource,
 };
 use nota::{NotaEncode, NotaSource};
+use nota_text_query::{QueryTerm, WordDistance};
 use signal_aggregator::{
     AggregatorReply, AggregatorRequest, AuthoredStatus, AuthoredStatusFilter,
     BoundedTextProjection, ByteCount, ByteLimit, ByteRange, CardProjection, ContractName,
     DurationAmount, DurationUnit, EvidenceRequest, FilesystemPath as SignalFilesystemPath,
-    FragileOutputReference, LimitPolicy, ListingOrder, OperationRejectionReason, OutputListFilter,
-    OutputListRequest, OutputReadRange, OutputReadRequest, OutputSegmentListFilter,
-    OutputSegmentListRequest, PageLimit, PageRequest, Projection, ReadFailureReason,
-    RejectionReason, RelativeDuration, RepositoryIdentifier, RepositoryPath,
-    RepositoryWorktreeState, RequestIdentifier, SegmentLimit, SegmentProjection, SelectedSources,
-    SessionListFilter, SessionListRequest, SourceIdentifier, SourceKind, SourceSelection,
-    SubagentListFilter, SubagentListRequest, TimeRange, TimeWindow, Timestamp, TruncationReason,
-    Version,
+    FragileOutputReference, FragileTranscriptBlockReference, LimitPolicy, ListingOrder,
+    OperationRejectionReason, OutputListFilter, OutputListRequest, OutputReadRange,
+    OutputReadRequest, OutputSegmentListFilter, OutputSegmentListRequest, PageLimit, PageRequest,
+    Projection, ReadFailureReason, RejectionReason, RelativeDuration, RepositoryIdentifier,
+    RepositoryPath, RepositoryWorktreeState, RequestIdentifier, SegmentLimit, SegmentProjection,
+    SelectedSources, SessionListFilter, SessionListRequest, SourceIdentifier, SourceKind,
+    SourceSelection, SubagentListFilter, SubagentListRequest, TextQuery, TimeRange, TimeWindow,
+    Timestamp, TranscriptBlockEstimateRequest, TranscriptBlockFilter, TranscriptBlockKind,
+    TranscriptBlockKindSelection, TranscriptBlockListRequest, TranscriptBlockReadRequest,
+    TranscriptBlockSearchRequest, TranscriptBlockTextAvailability, TranscriptBlockTextQuery,
+    TruncationReason, Version,
 };
 use tempfile::TempDir;
 
@@ -174,6 +178,27 @@ fn read_request_with_byte_limit(
             maximum_bytes: ByteLimit::new(maximum_bytes),
         },
     )
+}
+
+fn transcript_block_filter(kind_selection: TranscriptBlockKindSelection) -> TranscriptBlockFilter {
+    TranscriptBlockFilter {
+        source_selection: SourceSelection::AllConfigured,
+        session_reference: None,
+        subagent_reference: None,
+        kind_selection,
+        authored_status: AuthoredStatusFilter::AnyAuthoredStatus,
+        time_window: None,
+    }
+}
+
+fn all_transcript_block_filter() -> TranscriptBlockFilter {
+    transcript_block_filter(TranscriptBlockKindSelection::AllTranscriptBlockKinds)
+}
+
+fn only_transcript_block_filter(kind: TranscriptBlockKind) -> TranscriptBlockFilter {
+    transcript_block_filter(TranscriptBlockKindSelection::OnlyTranscriptBlockKinds(
+        signal_aggregator::SelectedTranscriptBlockKinds { kinds: vec![kind] },
+    ))
 }
 
 fn accepted_configuration(root: &TempDir) -> AggregatorConfiguration {
@@ -1875,6 +1900,454 @@ fn pi_adapter_reads_run_history_records() {
         outcome.transcript_segments[0].projection,
         SegmentProjection::IdentifiersOnly
     ));
+}
+
+#[test]
+fn transcript_adapters_extract_observed_logical_block_kinds() {
+    let root = TempDir::new().expect("temporary root");
+    let claude = root.path().join("claude");
+    let codex = root.path().join("codex");
+    let pi = root.path().join("pi");
+    fs::create_dir_all(&claude).expect("claude directory");
+    fs::create_dir_all(&codex).expect("codex directory");
+    fs::create_dir_all(&pi).expect("pi directory");
+    fs::write(
+        claude.join("session.jsonl"),
+        concat!(
+            r#"{"timestamp":"2026-04-01T00:00:00Z","message":{"role":"assistant","content":["#,
+            r#"{"type":"thinking","thinking":"claude reasoning"},"#,
+            r#"{"type":"text","text":"claude answer"},"#,
+            r#"{"type":"tool_use","name":"Bash","input":{"command":"echo claude"}},"#,
+            r#"{"type":"tool_result","content":"claude tool result"},"#,
+            r#"{"type":"image","source":{"type":"base64"}}]}}
+"#,
+        ),
+    )
+    .expect("write claude blocks");
+    fs::write(
+        codex.join("session.jsonl"),
+        concat!(
+            r#"{"timestamp":"2026-04-01T00:00:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"codex prompt"}]}}
+"#,
+            r#"{"timestamp":"2026-04-01T00:00:01Z","payload":{"type":"reasoning","summary":[{"text":"codex reasoning"}]}}
+"#,
+            r#"{"timestamp":"2026-04-01T00:00:02Z","payload":{"type":"function_call","name":"shell","arguments":"{}"}}
+"#,
+            r#"{"timestamp":"2026-04-01T00:00:03Z","payload":{"type":"function_call_output","output":"codex tool result"}}
+"#,
+        ),
+    )
+    .expect("write codex blocks");
+    fs::write(
+        pi.join("run-history.jsonl"),
+        concat!(
+            r#"{"timestamp":"2026-04-01T00:00:00Z","message":{"role":"assistant","content":["#,
+            r#"{"type":"thinking","text":"pi reasoning"},"#,
+            r#"{"type":"text","text":"pi answer"},"#,
+            r#"{"type":"toolCall","name":"shell","input":{"command":"echo pi"}},"#,
+            r#"{"type":"toolResult","text":"pi tool result"}]}}
+"#,
+        ),
+    )
+    .expect("write pi blocks");
+
+    let claude_records = ClaudeJsonlRootReader::new(claude).read_records().records;
+    let codex_records = CodexSessionRootReader::new(codex).read_records().records;
+    let pi_records = PiRunHistoryRootReader::new(pi).read_records().records;
+
+    let claude_kinds = claude_records[0]
+        .blocks
+        .iter()
+        .map(|block| block.kind)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        claude_kinds,
+        vec![
+            TranscriptBlockKind::Inference,
+            TranscriptBlockKind::AgentResponse,
+            TranscriptBlockKind::ToolCall,
+            TranscriptBlockKind::ToolResult,
+            TranscriptBlockKind::Attachment,
+        ]
+    );
+    assert_eq!(
+        claude_records[0].blocks[4].text_availability,
+        TranscriptBlockTextAvailability::UnavailableText
+    );
+    assert!(codex_records.iter().any(|record| {
+        record
+            .blocks
+            .iter()
+            .any(|block| block.kind == TranscriptBlockKind::UserPrompt)
+    }));
+    assert!(codex_records.iter().any(|record| {
+        record
+            .blocks
+            .iter()
+            .any(|block| block.kind == TranscriptBlockKind::Inference)
+    }));
+    assert!(codex_records.iter().any(|record| {
+        record
+            .blocks
+            .iter()
+            .any(|block| block.kind == TranscriptBlockKind::ToolCall)
+    }));
+    assert!(codex_records.iter().any(|record| {
+        record
+            .blocks
+            .iter()
+            .any(|block| block.kind == TranscriptBlockKind::ToolResult)
+    }));
+    assert_eq!(
+        pi_records[0]
+            .blocks
+            .iter()
+            .map(|block| block.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            TranscriptBlockKind::Inference,
+            TranscriptBlockKind::AgentResponse,
+            TranscriptBlockKind::ToolCall,
+            TranscriptBlockKind::ToolResult,
+        ]
+    );
+}
+
+#[test]
+fn transcript_block_interface_filters_searches_reads_and_rejects_stale_cursors() {
+    let root = TempDir::new().expect("temporary root");
+    let configuration = accepted_configuration(&root);
+    fs::write(
+        root.path().join("claude/session.jsonl"),
+        concat!(
+            r#"{"timestamp":"2026-04-02T00:00:00Z","message":{"role":"user","content":[{"type":"text","text":"please find exact phrase"}]}}
+"#,
+            r#"{"timestamp":"2026-04-02T00:00:01Z","message":{"role":"assistant","content":["#,
+            r#"{"type":"thinking","thinking":"alpha beta omega hidden reasoning"},"#,
+            r#"{"type":"text","text":"visible agent response"},"#,
+            r#"{"type":"tool_use","name":"Bash","input":{"command":"echo alpha tool"}}]}}
+"#,
+        ),
+    )
+    .expect("write transcript blocks");
+    let runtime = RuntimeConfiguration::validate_from_meta(&configuration)
+        .accepted_configuration()
+        .expect("accepted configuration")
+        .clone();
+    let clock = CollectionClock::fixed(
+        ReferenceTime::from_timestamp(Timestamp::new("2026-04-02T01:00:00Z"))
+            .expect("reference timestamp"),
+    );
+    let nexus = NexusPlane::with_runtime_configuration(runtime, clock);
+
+    let all_blocks = nexus
+        .list_transcript_blocks(TranscriptBlockListRequest {
+            request_identifier: RequestIdentifier::new("list-blocks"),
+            filter: all_transcript_block_filter(),
+            page: PageRequest {
+                limit: PageLimit::new(10),
+                cursor: None,
+                order: ListingOrder::OldestFirst,
+            },
+            projection: CardProjection::MetadataOnly,
+        })
+        .expect("list transcript blocks");
+    assert_eq!(
+        all_blocks
+            .blocks
+            .iter()
+            .map(|block| block.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            TranscriptBlockKind::UserPrompt,
+            TranscriptBlockKind::Inference,
+            TranscriptBlockKind::AgentResponse,
+            TranscriptBlockKind::ToolCall,
+        ]
+    );
+
+    let tool_calls = nexus
+        .list_transcript_blocks(TranscriptBlockListRequest {
+            request_identifier: RequestIdentifier::new("list-tool-calls"),
+            filter: only_transcript_block_filter(TranscriptBlockKind::ToolCall),
+            page: PageRequest {
+                limit: PageLimit::new(10),
+                cursor: None,
+                order: ListingOrder::OldestFirst,
+            },
+            projection: CardProjection::BoundedPreview(BoundedTextProjection {
+                maximum_bytes: ByteLimit::new(12),
+            }),
+        })
+        .expect("list tool call blocks");
+    assert_eq!(tool_calls.blocks.len(), 1);
+    assert!(
+        tool_calls.blocks[0]
+            .preview
+            .as_ref()
+            .is_some_and(|preview| preview.byte_count.into_u64() <= 12)
+    );
+
+    let word_search = nexus
+        .search_transcript_blocks(TranscriptBlockSearchRequest {
+            request_identifier: RequestIdentifier::new("search-word"),
+            filter: all_transcript_block_filter(),
+            query: TranscriptBlockTextQuery::new(TextQuery::contains(QueryTerm::word("alpha"))),
+            page: PageRequest {
+                limit: PageLimit::new(10),
+                cursor: None,
+                order: ListingOrder::OldestFirst,
+            },
+            projection: CardProjection::MetadataOnly,
+        })
+        .expect("word search");
+    assert_eq!(word_search.matches.len(), 2);
+
+    let phrase_search = nexus
+        .search_transcript_blocks(TranscriptBlockSearchRequest {
+            request_identifier: RequestIdentifier::new("search-phrase"),
+            filter: all_transcript_block_filter(),
+            query: TranscriptBlockTextQuery::new(TextQuery::contains(QueryTerm::phrase(vec![
+                "exact".to_string(),
+                "phrase".to_string(),
+            ]))),
+            page: PageRequest {
+                limit: PageLimit::new(10),
+                cursor: None,
+                order: ListingOrder::OldestFirst,
+            },
+            projection: CardProjection::MetadataOnly,
+        })
+        .expect("phrase search");
+    assert_eq!(phrase_search.matches.len(), 1);
+    assert_eq!(
+        phrase_search.matches[0].card.kind,
+        TranscriptBlockKind::UserPrompt
+    );
+
+    let near_search = nexus
+        .search_transcript_blocks(TranscriptBlockSearchRequest {
+            request_identifier: RequestIdentifier::new("search-near"),
+            filter: all_transcript_block_filter(),
+            query: TranscriptBlockTextQuery::new(TextQuery::near(
+                QueryTerm::word("alpha"),
+                QueryTerm::word("omega"),
+                WordDistance::new(1),
+            )),
+            page: PageRequest {
+                limit: PageLimit::new(10),
+                cursor: None,
+                order: ListingOrder::OldestFirst,
+            },
+            projection: CardProjection::MetadataOnly,
+        })
+        .expect("near search");
+    assert_eq!(near_search.matches.len(), 1);
+    assert_eq!(
+        near_search.matches[0].card.kind,
+        TranscriptBlockKind::Inference
+    );
+
+    let estimated = nexus
+        .estimate_transcript_block(TranscriptBlockEstimateRequest {
+            request_identifier: RequestIdentifier::new("estimate-block"),
+            block_reference: near_search.matches[0].card.reference.clone(),
+        })
+        .expect("estimate block");
+    assert!(
+        estimated
+            .size
+            .byte_count
+            .is_some_and(|count| count.into_u64() > 20)
+    );
+
+    let read = nexus
+        .read_transcript_block(TranscriptBlockReadRequest {
+            request_identifier: RequestIdentifier::new("read-block"),
+            block_reference: near_search.matches[0].card.reference.clone(),
+            maximum_bytes: ByteLimit::new(8),
+        })
+        .expect("read bounded block");
+    assert_eq!(read.excerpt.text.as_str(), "alpha be");
+    assert_eq!(read.excerpt.byte_count.into_u64(), 8);
+    assert!(read.excerpt.truncation.is_some());
+
+    let first_page = nexus
+        .list_transcript_blocks(TranscriptBlockListRequest {
+            request_identifier: RequestIdentifier::new("block-cursor-first"),
+            filter: all_transcript_block_filter(),
+            page: PageRequest {
+                limit: PageLimit::new(1),
+                cursor: None,
+                order: ListingOrder::OldestFirst,
+            },
+            projection: CardProjection::MetadataOnly,
+        })
+        .expect("first block page");
+    let stale_kind_cursor = nexus
+        .list_transcript_blocks(TranscriptBlockListRequest {
+            request_identifier: RequestIdentifier::new("block-cursor-stale-kind"),
+            filter: only_transcript_block_filter(TranscriptBlockKind::AgentResponse),
+            page: PageRequest {
+                limit: PageLimit::new(1),
+                cursor: first_page.page.next_cursor.clone(),
+                order: ListingOrder::OldestFirst,
+            },
+            projection: CardProjection::MetadataOnly,
+        })
+        .expect_err("kind change must stale the block cursor");
+    assert_eq!(
+        stale_kind_cursor.reason,
+        OperationRejectionReason::FragileReferenceStale
+    );
+
+    let first_search_page = nexus
+        .search_transcript_blocks(TranscriptBlockSearchRequest {
+            request_identifier: RequestIdentifier::new("search-cursor-first"),
+            filter: all_transcript_block_filter(),
+            query: TranscriptBlockTextQuery::new(TextQuery::contains(QueryTerm::word("alpha"))),
+            page: PageRequest {
+                limit: PageLimit::new(1),
+                cursor: None,
+                order: ListingOrder::OldestFirst,
+            },
+            projection: CardProjection::MetadataOnly,
+        })
+        .expect("first search page");
+    let stale_query_cursor = nexus
+        .search_transcript_blocks(TranscriptBlockSearchRequest {
+            request_identifier: RequestIdentifier::new("search-cursor-stale-query"),
+            filter: all_transcript_block_filter(),
+            query: TranscriptBlockTextQuery::new(TextQuery::contains(QueryTerm::word("phrase"))),
+            page: PageRequest {
+                limit: PageLimit::new(1),
+                cursor: first_search_page.page.next_cursor.clone(),
+                order: ListingOrder::OldestFirst,
+            },
+            projection: CardProjection::MetadataOnly,
+        })
+        .expect_err("query change must stale the search cursor");
+    assert_eq!(
+        stale_query_cursor.reason,
+        OperationRejectionReason::FragileReferenceStale
+    );
+}
+
+#[test]
+fn transcript_block_reads_reject_missing_broken_stale_unavailable_and_invalid_queries() {
+    let root = TempDir::new().expect("temporary root");
+    let configuration = accepted_configuration(&root);
+    let transcript = root.path().join("claude/session.jsonl");
+    fs::write(
+        &transcript,
+        concat!(
+            r#"{"timestamp":"2026-04-03T00:00:00Z","message":{"role":"assistant","content":["#,
+            r#"{"type":"text","text":"stable block text"},"#,
+            r#"{"type":"image","source":{"type":"base64"}}]}}
+"#,
+        ),
+    )
+    .expect("write transcript blocks");
+    let runtime = RuntimeConfiguration::validate_from_meta(&configuration)
+        .accepted_configuration()
+        .expect("accepted configuration")
+        .clone();
+    let clock = CollectionClock::fixed(
+        ReferenceTime::from_timestamp(Timestamp::new("2026-04-03T01:00:00Z"))
+            .expect("reference timestamp"),
+    );
+    let nexus = NexusPlane::with_runtime_configuration(runtime, clock);
+
+    let listed = nexus
+        .list_transcript_blocks(TranscriptBlockListRequest {
+            request_identifier: RequestIdentifier::new("list-for-rejections"),
+            filter: all_transcript_block_filter(),
+            page: PageRequest {
+                limit: PageLimit::new(10),
+                cursor: None,
+                order: ListingOrder::OldestFirst,
+            },
+            projection: CardProjection::MetadataOnly,
+        })
+        .expect("list blocks");
+    let readable_reference = listed.blocks[0].reference.clone();
+    let attachment_reference = listed.blocks[1].reference.clone();
+
+    let missing = nexus
+        .read_transcript_block(TranscriptBlockReadRequest {
+            request_identifier: RequestIdentifier::new("missing-block"),
+            block_reference: FragileTranscriptBlockReference::new("missing-block-reference"),
+            maximum_bytes: ByteLimit::new(16),
+        })
+        .expect_err("missing block reference rejected");
+    assert_eq!(missing.reason, OperationRejectionReason::Missing);
+
+    let unavailable = nexus
+        .read_transcript_block(TranscriptBlockReadRequest {
+            request_identifier: RequestIdentifier::new("unavailable-block"),
+            block_reference: attachment_reference,
+            maximum_bytes: ByteLimit::new(16),
+        })
+        .expect_err("unavailable attachment text rejected");
+    assert_eq!(unavailable.reason, OperationRejectionReason::Unsupported);
+
+    let invalid_query = nexus
+        .search_transcript_blocks(TranscriptBlockSearchRequest {
+            request_identifier: RequestIdentifier::new("invalid-query"),
+            filter: all_transcript_block_filter(),
+            query: TranscriptBlockTextQuery::new(TextQuery::contains(QueryTerm::word("!!!"))),
+            page: PageRequest {
+                limit: PageLimit::new(10),
+                cursor: None,
+                order: ListingOrder::OldestFirst,
+            },
+            projection: CardProjection::MetadataOnly,
+        })
+        .expect_err("empty normalized query rejected");
+    assert_eq!(invalid_query.reason, OperationRejectionReason::InvalidQuery);
+
+    fs::write(
+        &transcript,
+        r#"{"timestamp":"2026-04-03T00:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"changed block text"}]}}
+"#,
+    )
+    .expect("rewrite transcript for stale reference");
+    let stale = nexus
+        .read_transcript_block(TranscriptBlockReadRequest {
+            request_identifier: RequestIdentifier::new("stale-block"),
+            block_reference: readable_reference.clone(),
+            maximum_bytes: ByteLimit::new(16),
+        })
+        .expect_err("changed backing file stales the block reference");
+    assert_eq!(
+        stale.reason,
+        OperationRejectionReason::FragileReferenceStale
+    );
+
+    let refreshed = nexus
+        .list_transcript_blocks(TranscriptBlockListRequest {
+            request_identifier: RequestIdentifier::new("refresh-after-stale"),
+            filter: all_transcript_block_filter(),
+            page: PageRequest {
+                limit: PageLimit::new(10),
+                cursor: None,
+                order: ListingOrder::OldestFirst,
+            },
+            projection: CardProjection::MetadataOnly,
+        })
+        .expect("refresh changed block");
+    fs::remove_file(&transcript).expect("delete transcript for broken reference");
+    let broken = nexus
+        .read_transcript_block(TranscriptBlockReadRequest {
+            request_identifier: RequestIdentifier::new("broken-block"),
+            block_reference: refreshed.blocks[0].reference.clone(),
+            maximum_bytes: ByteLimit::new(16),
+        })
+        .expect_err("deleted backing file breaks the block reference");
+    assert_eq!(
+        broken.reason,
+        OperationRejectionReason::FragileReferenceBroken
+    );
 }
 
 #[test]

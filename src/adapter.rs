@@ -10,8 +10,9 @@ use signal_aggregator::{
     AuthoredStatus, ByteCount, ByteLimit, ByteRange, FilesystemPath, ItemCount, LimitPolicy,
     LineNumber, LineRange, OutputTitle, Projection, ReadFailure, ReadFailureReason,
     SegmentProjection, SourceIdentifier, SourceKind, SourceVolume, SubagentName, TimeWindow,
-    Timestamp, TranscriptSegment, TranscriptSegmentIdentifier, TranscriptText,
-    TranscriptTextExcerpt, Truncation, TruncationReason,
+    Timestamp, TranscriptBlockKind, TranscriptBlockTextAvailability, TranscriptSegment,
+    TranscriptSegmentIdentifier, TranscriptText, TranscriptTextExcerpt, Truncation,
+    TruncationReason,
 };
 
 use crate::time_model::CanonicalTimestamp;
@@ -243,6 +244,7 @@ pub struct TranscriptRecord {
     pub title: Option<OutputTitle>,
     pub subagent_name: Option<SubagentName>,
     pub authored_status: AuthoredStatus,
+    pub blocks: Vec<TranscriptBlockRecord>,
 }
 
 impl TranscriptRecord {
@@ -264,6 +266,7 @@ impl TranscriptRecord {
             title: None,
             subagent_name: None,
             authored_status: AuthoredStatus::AgentAuthored,
+            blocks: Vec::new(),
         }
     }
 
@@ -280,6 +283,30 @@ impl TranscriptRecord {
     pub fn with_authored_status(mut self, authored_status: AuthoredStatus) -> Self {
         self.authored_status = authored_status;
         self
+    }
+
+    pub fn with_blocks(mut self, blocks: Vec<TranscriptBlockRecord>) -> Self {
+        self.blocks = blocks;
+        self
+    }
+
+    pub fn transcript_blocks(&self) -> Vec<TranscriptBlockRecord> {
+        if !self.blocks.is_empty() {
+            return self.blocks.clone();
+        }
+        vec![
+            TranscriptBlockSourceContext::new(
+                self.source,
+                self.source_identifier.clone(),
+                self.path.clone(),
+                self.line_number,
+                self.timestamp.clone(),
+            )
+            .readable_block(0, TranscriptBlockKind::AgentResponse, self.text.clone())
+            .with_title(self.title.clone())
+            .with_subagent_name(self.subagent_name.clone())
+            .with_authored_status(self.authored_status),
+        ]
     }
 
     pub fn byte_count(&self) -> u64 {
@@ -309,6 +336,211 @@ impl TranscriptRecord {
         ByteRange {
             start: ByteCount::new(0),
             end: ByteCount::new(self.byte_count()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptBlockSourceContext {
+    source: SourceKind,
+    source_identifier: SourceIdentifier,
+    path: PathBuf,
+    line_number: u64,
+    timestamp: Option<Timestamp>,
+}
+
+impl TranscriptBlockSourceContext {
+    pub fn new(
+        source: SourceKind,
+        source_identifier: SourceIdentifier,
+        path: PathBuf,
+        line_number: u64,
+        timestamp: Option<Timestamp>,
+    ) -> Self {
+        Self {
+            source,
+            source_identifier,
+            path,
+            line_number,
+            timestamp,
+        }
+    }
+
+    pub fn readable_block(
+        &self,
+        block_index: u64,
+        kind: TranscriptBlockKind,
+        text: String,
+    ) -> TranscriptBlockRecord {
+        TranscriptBlockRecord {
+            source: self.source,
+            source_identifier: self.source_identifier.clone(),
+            path: self.path.clone(),
+            line_number: self.line_number,
+            block_index,
+            kind,
+            text_availability: TranscriptBlockTextAvailability::ReadableText,
+            text: Some(text),
+            timestamp: self.timestamp.clone(),
+            title: None,
+            subagent_name: None,
+            authored_status: AuthoredStatus::UnknownAuthorship,
+        }
+    }
+
+    pub fn unavailable_block(
+        &self,
+        block_index: u64,
+        kind: TranscriptBlockKind,
+    ) -> TranscriptBlockRecord {
+        TranscriptBlockRecord {
+            source: self.source,
+            source_identifier: self.source_identifier.clone(),
+            path: self.path.clone(),
+            line_number: self.line_number,
+            block_index,
+            kind,
+            text_availability: TranscriptBlockTextAvailability::UnavailableText,
+            text: None,
+            timestamp: self.timestamp.clone(),
+            title: None,
+            subagent_name: None,
+            authored_status: AuthoredStatus::UnknownAuthorship,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptBlockRecord {
+    pub source: SourceKind,
+    pub source_identifier: SourceIdentifier,
+    pub path: PathBuf,
+    pub line_number: u64,
+    pub block_index: u64,
+    pub kind: TranscriptBlockKind,
+    pub text_availability: TranscriptBlockTextAvailability,
+    pub text: Option<String>,
+    pub timestamp: Option<Timestamp>,
+    pub title: Option<OutputTitle>,
+    pub subagent_name: Option<SubagentName>,
+    pub authored_status: AuthoredStatus,
+}
+
+impl TranscriptBlockRecord {
+    pub fn with_title(mut self, title: Option<OutputTitle>) -> Self {
+        self.title = title;
+        self
+    }
+
+    pub fn with_subagent_name(mut self, subagent_name: Option<SubagentName>) -> Self {
+        self.subagent_name = subagent_name;
+        self
+    }
+
+    pub fn with_authored_status(mut self, authored_status: AuthoredStatus) -> Self {
+        self.authored_status = authored_status;
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: &TranscriptJsonMetadata<'_>) -> Self {
+        self.title = metadata.title();
+        self.subagent_name = metadata.subagent_name();
+        self.authored_status = metadata.authored_status();
+        self
+    }
+
+    pub fn readable_text(&self) -> Option<&str> {
+        if self.text_availability == TranscriptBlockTextAvailability::ReadableText {
+            self.text.as_deref()
+        } else {
+            None
+        }
+    }
+
+    pub fn byte_count(&self) -> Option<u64> {
+        self.readable_text().map(|text| text.len() as u64)
+    }
+
+    pub fn line_count(&self) -> Option<u64> {
+        self.readable_text()
+            .map(|text| OutputLineCounter::new(text).count())
+    }
+
+    pub fn filesystem_path(&self) -> FilesystemPath {
+        FilesystemPath::new(self.path.display().to_string())
+    }
+
+    pub fn line_range(&self) -> LineRange {
+        LineRange {
+            start: LineNumber::new(self.line_number),
+            end: LineNumber::new(self.line_number + 1),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct TranscriptBlockCollector<'collector, 'json> {
+    context: &'collector TranscriptBlockSourceContext,
+    metadata: TranscriptJsonMetadata<'json>,
+    blocks: &'collector mut Vec<TranscriptBlockRecord>,
+}
+
+impl<'collector, 'json> TranscriptBlockCollector<'collector, 'json> {
+    pub fn new(
+        context: &'collector TranscriptBlockSourceContext,
+        metadata: TranscriptJsonMetadata<'json>,
+        blocks: &'collector mut Vec<TranscriptBlockRecord>,
+    ) -> Self {
+        Self {
+            context,
+            metadata,
+            blocks,
+        }
+    }
+
+    pub fn push_readable(&mut self, kind: TranscriptBlockKind, text: impl Into<String>) {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return;
+        }
+        let block_index = self.blocks.len() as u64;
+        self.blocks.push(
+            self.context
+                .readable_block(block_index, kind, text)
+                .with_metadata(&self.metadata),
+        );
+    }
+
+    pub fn push_unavailable(&mut self, kind: TranscriptBlockKind) {
+        let block_index = self.blocks.len() as u64;
+        self.blocks.push(
+            self.context
+                .unavailable_block(block_index, kind)
+                .with_metadata(&self.metadata),
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TranscriptBlockTextJoiner<'a> {
+    blocks: &'a [TranscriptBlockRecord],
+}
+
+impl<'a> TranscriptBlockTextJoiner<'a> {
+    pub fn new(blocks: &'a [TranscriptBlockRecord]) -> Self {
+        Self { blocks }
+    }
+
+    pub fn text(&self) -> Option<String> {
+        let readable = self
+            .blocks
+            .iter()
+            .filter_map(|block| block.readable_text())
+            .collect::<Vec<_>>();
+        if readable.is_empty() {
+            None
+        } else {
+            Some(readable.join("\n"))
         }
     }
 }

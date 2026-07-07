@@ -3,7 +3,9 @@ use signal_aggregator::{
     OutputEstimateRequest, OutputEstimated, OutputListRequest, OutputRead, OutputReadRequest,
     OutputSegmentListRequest, OutputSegmentsListed, OutputsListed, PackageIdentifier,
     RequestIdentifier, SessionListRequest, SessionsListed, SourceKind, SubagentListRequest,
-    SubagentsListed, TimeWindow,
+    SubagentsListed, TimeWindow, TranscriptBlockEstimateRequest, TranscriptBlockEstimated,
+    TranscriptBlockListRequest, TranscriptBlockRead, TranscriptBlockReadRequest,
+    TranscriptBlockSearchRequest, TranscriptBlocksListed, TranscriptBlocksSearched,
 };
 
 use crate::{
@@ -141,6 +143,50 @@ impl NexusPlane {
     pub fn read_output(&self, request: OutputReadRequest) -> OutputOperationResult<OutputRead> {
         self.output_interface(&request.request_identifier, OperationKind::ReadOutput)?
             .read_output(request)
+    }
+
+    pub fn list_transcript_blocks(
+        &self,
+        request: TranscriptBlockListRequest,
+    ) -> OutputOperationResult<TranscriptBlocksListed> {
+        self.output_interface(
+            &request.request_identifier,
+            OperationKind::ListTranscriptBlocks,
+        )?
+        .list_transcript_blocks(request)
+    }
+
+    pub fn search_transcript_blocks(
+        &self,
+        request: TranscriptBlockSearchRequest,
+    ) -> OutputOperationResult<TranscriptBlocksSearched> {
+        self.output_interface(
+            &request.request_identifier,
+            OperationKind::SearchTranscriptBlocks,
+        )?
+        .search_transcript_blocks(request)
+    }
+
+    pub fn estimate_transcript_block(
+        &self,
+        request: TranscriptBlockEstimateRequest,
+    ) -> OutputOperationResult<TranscriptBlockEstimated> {
+        self.output_interface(
+            &request.request_identifier,
+            OperationKind::EstimateTranscriptBlock,
+        )?
+        .estimate_transcript_block(request)
+    }
+
+    pub fn read_transcript_block(
+        &self,
+        request: TranscriptBlockReadRequest,
+    ) -> OutputOperationResult<TranscriptBlockRead> {
+        self.output_interface(
+            &request.request_identifier,
+            OperationKind::ReadTranscriptBlock,
+        )?
+        .read_transcript_block(request)
     }
 
     pub fn output_interface(

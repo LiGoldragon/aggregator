@@ -3,11 +3,13 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use signal_aggregator::{
     FilesystemPath, ReadFailure, ReadFailureReason, SourceIdentifier, SourceKind, Timestamp,
+    TranscriptBlockKind,
 };
 
 use crate::{
     AdapterKind,
     adapter::{
+        TranscriptBlockCollector, TranscriptBlockSourceContext, TranscriptBlockTextJoiner,
         TranscriptBoundedFile, TranscriptBoundedFileRead, TranscriptFailureAccumulator,
         TranscriptFileDiscovery, TranscriptJsonMetadata, TranscriptLineLocator, TranscriptLineText,
         TranscriptLineTextOutcome, TranscriptRawReadOutcome, TranscriptReadOutcome,
@@ -207,9 +209,6 @@ impl<'a> ClaudeJsonlRecord<'a> {
             Ok(value) => value,
             Err(_) => return ClaudeJsonlRecordResult::Malformed,
         };
-        let Some(text) = ClaudeJsonValue::new(&value).text() else {
-            return ClaudeJsonlRecordResult::Malformed;
-        };
         let timestamp = match ClaudeJsonValue::new(&value).timestamp() {
             Some(value) => {
                 let timestamp = Timestamp::new(value.to_string());
@@ -221,6 +220,20 @@ impl<'a> ClaudeJsonlRecord<'a> {
             None => None,
         };
         let metadata = TranscriptJsonMetadata::new(&value);
+        let context = TranscriptBlockSourceContext::new(
+            SourceKind::Claude,
+            source_identifier.clone(),
+            path.clone(),
+            line_number,
+            timestamp.clone(),
+        );
+        let blocks = ClaudeJsonValue::new(&value).blocks(&context, metadata);
+        let Some(text) = ClaudeJsonValue::new(&value)
+            .text()
+            .or_else(|| TranscriptBlockTextJoiner::new(&blocks).text())
+        else {
+            return ClaudeJsonlRecordResult::Malformed;
+        };
         ClaudeJsonlRecordResult::Record(
             TranscriptRecord::new(
                 SourceKind::Claude,
@@ -232,7 +245,8 @@ impl<'a> ClaudeJsonlRecord<'a> {
             )
             .with_title(metadata.title())
             .with_subagent_name(metadata.subagent_name())
-            .with_authored_status(metadata.authored_status()),
+            .with_authored_status(metadata.authored_status())
+            .with_blocks(blocks),
         )
     }
 }
@@ -258,6 +272,43 @@ impl<'a> ClaudeJsonValue<'a> {
             .get("timestamp")
             .and_then(Value::as_str)
             .or_else(|| self.value.get("created_at").and_then(Value::as_str))
+    }
+
+    pub fn role(&self) -> Option<&'a str> {
+        self.value.get("role").and_then(Value::as_str).or_else(|| {
+            self.value
+                .get("message")
+                .and_then(|message| message.get("role"))
+                .and_then(Value::as_str)
+        })
+    }
+
+    pub fn blocks(
+        &self,
+        context: &TranscriptBlockSourceContext,
+        metadata: TranscriptJsonMetadata<'a>,
+    ) -> Vec<crate::adapter::TranscriptBlockRecord> {
+        let mut blocks = Vec::new();
+        {
+            let mut collector = TranscriptBlockCollector::new(context, metadata, &mut blocks);
+            if let Some(thinking) = self.value.get("thinking").and_then(Value::as_str) {
+                collector.push_readable(TranscriptBlockKind::Inference, thinking);
+            }
+            if let Some(text) = self.value.get("text").and_then(Value::as_str) {
+                collector.push_readable(ClaudeRole::new(self.role()).text_kind(), text);
+            }
+            if let Some(content) = self
+                .value
+                .get("message")
+                .and_then(|message| message.get("content"))
+            {
+                ClaudeJsonContent::new(content, self.role()).push_blocks(&mut collector);
+            }
+            if let Some(content) = self.value.get("content") {
+                ClaudeJsonContent::new(content, self.role()).push_blocks(&mut collector);
+            }
+        }
+        blocks
     }
 
     pub fn text(&self) -> Option<String> {
@@ -297,15 +348,168 @@ impl<'a> JsonContent<'a> {
         if let Some(text) = self.value.as_str() {
             return Some(text.to_string());
         }
-        let array = self.value.as_array()?;
-        let texts = array
-            .iter()
-            .filter_map(|item| item.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>();
-        if texts.is_empty() {
-            None
+        if let Some(array) = self.value.as_array() {
+            let texts = array
+                .iter()
+                .filter_map(|item| {
+                    item.get("text")
+                        .and_then(Value::as_str)
+                        .or_else(|| item.get("thinking").and_then(Value::as_str))
+                })
+                .collect::<Vec<_>>();
+            if texts.is_empty() {
+                None
+            } else {
+                Some(texts.join("\n"))
+            }
         } else {
-            Some(texts.join("\n"))
+            self.value
+                .get("text")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ClaudeRole<'a> {
+    role: Option<&'a str>,
+}
+
+impl<'a> ClaudeRole<'a> {
+    pub fn new(role: Option<&'a str>) -> Self {
+        Self { role }
+    }
+
+    pub fn text_kind(&self) -> TranscriptBlockKind {
+        match self.role.map(str::to_ascii_lowercase).as_deref() {
+            Some("user") => TranscriptBlockKind::UserPrompt,
+            Some("system") => TranscriptBlockKind::SystemInstruction,
+            Some("tool") | Some("tool_result") | Some("toolresult") => {
+                TranscriptBlockKind::ToolResult
+            }
+            Some("assistant") => TranscriptBlockKind::AgentResponse,
+            _ => TranscriptBlockKind::AgentResponse,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ClaudeJsonContent<'a> {
+    value: &'a Value,
+    role: Option<&'a str>,
+}
+
+impl<'a> ClaudeJsonContent<'a> {
+    pub fn new(value: &'a Value, role: Option<&'a str>) -> Self {
+        Self { value, role }
+    }
+
+    pub fn push_blocks(&self, collector: &mut TranscriptBlockCollector<'_, 'a>) {
+        if let Some(text) = self.value.as_str() {
+            collector.push_readable(ClaudeRole::new(self.role).text_kind(), text);
+            return;
+        }
+        if let Some(array) = self.value.as_array() {
+            for item in array {
+                ClaudeContentItem::new(item, self.role).push_block(collector);
+            }
+            return;
+        }
+        if self.value.is_object() {
+            ClaudeContentItem::new(self.value, self.role).push_block(collector);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ClaudeContentItem<'a> {
+    value: &'a Value,
+    role: Option<&'a str>,
+}
+
+impl<'a> ClaudeContentItem<'a> {
+    pub fn new(value: &'a Value, role: Option<&'a str>) -> Self {
+        Self { value, role }
+    }
+
+    pub fn push_block(&self, collector: &mut TranscriptBlockCollector<'_, 'a>) {
+        match self.item_type().to_ascii_lowercase().as_str() {
+            "text" => self.push_text(collector, ClaudeRole::new(self.role).text_kind()),
+            "thinking" => self.push_thinking(collector),
+            "tool_use" | "tooluse" => {
+                self.push_serialized(collector, TranscriptBlockKind::ToolCall)
+            }
+            "tool_result" | "toolresult" => self.push_tool_result(collector),
+            "image" | "document" | "attachment" => {
+                collector.push_unavailable(TranscriptBlockKind::Attachment)
+            }
+            _ => self.push_fallback(collector),
+        }
+    }
+
+    pub fn item_type(&self) -> &'a str {
+        self.value.get("type").and_then(Value::as_str).unwrap_or("")
+    }
+
+    pub fn push_text(
+        &self,
+        collector: &mut TranscriptBlockCollector<'_, 'a>,
+        kind: TranscriptBlockKind,
+    ) {
+        if let Some(text) = self.value.get("text").and_then(Value::as_str) {
+            collector.push_readable(kind, text);
+        }
+    }
+
+    pub fn push_thinking(&self, collector: &mut TranscriptBlockCollector<'_, 'a>) {
+        if let Some(text) = self
+            .value
+            .get("thinking")
+            .and_then(Value::as_str)
+            .or_else(|| self.value.get("text").and_then(Value::as_str))
+        {
+            collector.push_readable(TranscriptBlockKind::Inference, text);
+        }
+    }
+
+    pub fn push_tool_result(&self, collector: &mut TranscriptBlockCollector<'_, 'a>) {
+        if let Some(text) = self
+            .value
+            .get("content")
+            .and_then(|content| JsonContent::new(content).text())
+            .or_else(|| {
+                self.value
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+        {
+            collector.push_readable(TranscriptBlockKind::ToolResult, text);
+        } else {
+            self.push_serialized(collector, TranscriptBlockKind::ToolResult);
+        }
+    }
+
+    pub fn push_serialized(
+        &self,
+        collector: &mut TranscriptBlockCollector<'_, 'a>,
+        kind: TranscriptBlockKind,
+    ) {
+        if let Ok(text) = serde_json::to_string(self.value) {
+            collector.push_readable(kind, text);
+        }
+    }
+
+    pub fn push_fallback(&self, collector: &mut TranscriptBlockCollector<'_, 'a>) {
+        if let Some(text) = self.value.get("text").and_then(Value::as_str) {
+            collector.push_readable(ClaudeRole::new(self.role).text_kind(), text);
+        } else if let Some(text) = self
+            .value
+            .get("content")
+            .and_then(|content| JsonContent::new(content).text())
+        {
+            collector.push_readable(TranscriptBlockKind::Unclassified, text);
         }
     }
 }

@@ -3,11 +3,13 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::Value;
 use signal_aggregator::{
     FilesystemPath, ReadFailure, ReadFailureReason, SourceIdentifier, SourceKind, Timestamp,
+    TranscriptBlockKind,
 };
 
 use crate::{
     AdapterKind,
     adapter::{
+        TranscriptBlockCollector, TranscriptBlockSourceContext, TranscriptBlockTextJoiner,
         TranscriptBoundedFile, TranscriptBoundedFileRead, TranscriptFailureAccumulator,
         TranscriptFileDiscovery, TranscriptJsonMetadata, TranscriptLineLocator, TranscriptLineText,
         TranscriptLineTextOutcome, TranscriptRawReadOutcome, TranscriptReadOutcome,
@@ -425,9 +427,6 @@ impl<'a> CodexJsonlRecord<'a> {
             Ok(value) => value,
             Err(_) => return CodexJsonlRecordResult::Malformed,
         };
-        let Some(text) = CodexJsonValue::new(&value).text() else {
-            return CodexJsonlRecordResult::Malformed;
-        };
         let timestamp = match CodexJsonValue::new(&value).timestamp() {
             Some(value) => {
                 let timestamp = Timestamp::new(value.to_string());
@@ -439,6 +438,20 @@ impl<'a> CodexJsonlRecord<'a> {
             None => None,
         };
         let metadata = TranscriptJsonMetadata::new(&value);
+        let context = TranscriptBlockSourceContext::new(
+            SourceKind::Codex,
+            source_identifier.clone(),
+            path.clone(),
+            line_number,
+            timestamp.clone(),
+        );
+        let blocks = CodexJsonValue::new(&value).blocks(&context, metadata);
+        let Some(text) = CodexJsonValue::new(&value)
+            .text()
+            .or_else(|| TranscriptBlockTextJoiner::new(&blocks).text())
+        else {
+            return CodexJsonlRecordResult::Malformed;
+        };
         CodexJsonlRecordResult::Record(
             TranscriptRecord::new(
                 SourceKind::Codex,
@@ -450,7 +463,8 @@ impl<'a> CodexJsonlRecord<'a> {
             )
             .with_title(metadata.title())
             .with_subagent_name(metadata.subagent_name())
-            .with_authored_status(metadata.authored_status()),
+            .with_authored_status(metadata.authored_status())
+            .with_blocks(blocks),
         )
     }
 }
@@ -478,20 +492,270 @@ impl<'a> CodexJsonValue<'a> {
             .or_else(|| self.value.get("created_at").and_then(Value::as_str))
     }
 
+    pub fn role(&self) -> Option<&'a str> {
+        self.value
+            .get("role")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                self.value
+                    .get("payload")
+                    .and_then(|payload| payload.get("role"))
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| {
+                self.value
+                    .get("payload")
+                    .and_then(|payload| payload.get("message"))
+                    .and_then(|message| message.get("role"))
+                    .and_then(Value::as_str)
+            })
+    }
+
+    pub fn blocks(
+        &self,
+        context: &TranscriptBlockSourceContext,
+        metadata: TranscriptJsonMetadata<'a>,
+    ) -> Vec<crate::adapter::TranscriptBlockRecord> {
+        let mut blocks = Vec::new();
+        {
+            let mut collector = TranscriptBlockCollector::new(context, metadata, &mut blocks);
+            if let Some(payload) = self.value.get("payload") {
+                CodexPayload::new(payload, self.role()).push_blocks(&mut collector);
+            }
+            if let Some(item) = self.value.get("item") {
+                CodexPayload::new(item, self.role()).push_blocks(&mut collector);
+            }
+            if let Some(content) = self.value.get("content") {
+                CodexContent::new(content)
+                    .push_readable(&mut collector, CodexRole::new(self.role()).text_kind());
+            }
+            if let Some(message) = self.value.get("message") {
+                CodexContent::new(message)
+                    .push_readable(&mut collector, CodexRole::new(self.role()).text_kind());
+            }
+        }
+        blocks
+    }
+
     pub fn text(&self) -> Option<String> {
         self.value
             .get("content")
-            .and_then(Value::as_str)
-            .or_else(|| self.value.get("message").and_then(Value::as_str))
-            .map(ToOwned::to_owned)
+            .and_then(|content| CodexContent::new(content).text())
+            .or_else(|| {
+                self.value
+                    .get("message")
+                    .and_then(|message| CodexContent::new(message).text())
+            })
             .or_else(|| self.item_content())
+            .or_else(|| self.payload_text())
     }
 
     pub fn item_content(&self) -> Option<String> {
         self.value
             .get("item")
             .and_then(|item| item.get("content"))
+            .and_then(|content| CodexContent::new(content).text())
+    }
+
+    pub fn payload_text(&self) -> Option<String> {
+        self.value
+            .get("payload")
+            .and_then(|payload| CodexPayload::new(payload, self.role()).text())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CodexRole<'a> {
+    role: Option<&'a str>,
+}
+
+impl<'a> CodexRole<'a> {
+    pub fn new(role: Option<&'a str>) -> Self {
+        Self { role }
+    }
+
+    pub fn text_kind(&self) -> TranscriptBlockKind {
+        match self.role.map(str::to_ascii_lowercase).as_deref() {
+            Some("user") => TranscriptBlockKind::UserPrompt,
+            Some("system") => TranscriptBlockKind::SystemInstruction,
+            Some("tool") => TranscriptBlockKind::ToolResult,
+            Some("assistant") => TranscriptBlockKind::AgentResponse,
+            _ => TranscriptBlockKind::AgentResponse,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CodexPayload<'a> {
+    value: &'a Value,
+    role: Option<&'a str>,
+}
+
+impl<'a> CodexPayload<'a> {
+    pub fn new(value: &'a Value, role: Option<&'a str>) -> Self {
+        Self { value, role }
+    }
+
+    pub fn payload_type(&self) -> &'a str {
+        self.value.get("type").and_then(Value::as_str).unwrap_or("")
+    }
+
+    pub fn push_blocks(&self, collector: &mut TranscriptBlockCollector<'_, 'a>) {
+        match self.payload_type().to_ascii_lowercase().as_str() {
+            "message" => self.push_message(collector),
+            "function_call" | "functioncall" => {
+                self.push_serialized(collector, TranscriptBlockKind::ToolCall)
+            }
+            "function_call_output" | "functioncalloutput" => self.push_tool_result(collector),
+            "reasoning" => self.push_reasoning(collector),
+            _ => self.push_fallback(collector),
+        }
+    }
+
+    pub fn text(&self) -> Option<String> {
+        match self.payload_type().to_ascii_lowercase().as_str() {
+            "message" => self.message_text(),
+            "function_call_output" | "functioncalloutput" => self.tool_result_text(),
+            "reasoning" => self.reasoning_text(),
+            _ => self
+                .value
+                .get("content")
+                .and_then(|content| CodexContent::new(content).text()),
+        }
+    }
+
+    pub fn push_message(&self, collector: &mut TranscriptBlockCollector<'_, 'a>) {
+        let kind = CodexRole::new(self.message_role()).text_kind();
+        if let Some(content) = self.message_content() {
+            CodexContent::new(content).push_readable(collector, kind);
+        }
+    }
+
+    pub fn push_tool_result(&self, collector: &mut TranscriptBlockCollector<'_, 'a>) {
+        if let Some(text) = self.tool_result_text() {
+            collector.push_readable(TranscriptBlockKind::ToolResult, text);
+        } else {
+            self.push_serialized(collector, TranscriptBlockKind::ToolResult);
+        }
+    }
+
+    pub fn push_reasoning(&self, collector: &mut TranscriptBlockCollector<'_, 'a>) {
+        if let Some(text) = self.reasoning_text() {
+            collector.push_readable(TranscriptBlockKind::Inference, text);
+        }
+    }
+
+    pub fn push_fallback(&self, collector: &mut TranscriptBlockCollector<'_, 'a>) {
+        if let Some(text) = self.text() {
+            collector.push_readable(CodexRole::new(self.role).text_kind(), text);
+        }
+    }
+
+    pub fn push_serialized(
+        &self,
+        collector: &mut TranscriptBlockCollector<'_, 'a>,
+        kind: TranscriptBlockKind,
+    ) {
+        if let Ok(text) = serde_json::to_string(self.value) {
+            collector.push_readable(kind, text);
+        }
+    }
+
+    pub fn message_role(&self) -> Option<&'a str> {
+        self.value
+            .get("role")
             .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
+            .or(self.role)
+            .or_else(|| {
+                self.value
+                    .get("message")
+                    .and_then(|message| message.get("role"))
+                    .and_then(Value::as_str)
+            })
+    }
+
+    pub fn message_content(&self) -> Option<&'a Value> {
+        self.value.get("content").or_else(|| {
+            self.value
+                .get("message")
+                .and_then(|message| message.get("content"))
+        })
+    }
+
+    pub fn message_text(&self) -> Option<String> {
+        self.message_content()
+            .and_then(|content| CodexContent::new(content).text())
+    }
+
+    pub fn tool_result_text(&self) -> Option<String> {
+        self.value
+            .get("output")
+            .and_then(|value| CodexContent::new(value).text())
+            .or_else(|| {
+                self.value
+                    .get("content")
+                    .and_then(|value| CodexContent::new(value).text())
+            })
+    }
+
+    pub fn reasoning_text(&self) -> Option<String> {
+        self.value
+            .get("summary")
+            .and_then(|value| CodexContent::new(value).text())
+            .or_else(|| {
+                self.value
+                    .get("content")
+                    .and_then(|value| CodexContent::new(value).text())
+            })
+            .or_else(|| {
+                self.value
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CodexContent<'a> {
+    value: &'a Value,
+}
+
+impl<'a> CodexContent<'a> {
+    pub fn new(value: &'a Value) -> Self {
+        Self { value }
+    }
+
+    pub fn text(&self) -> Option<String> {
+        if let Some(text) = self.value.as_str() {
+            return Some(text.to_string());
+        }
+        if let Some(array) = self.value.as_array() {
+            let texts = array
+                .iter()
+                .filter_map(|item| CodexContent::new(item).text())
+                .collect::<Vec<_>>();
+            if texts.is_empty() {
+                None
+            } else {
+                Some(texts.join("\n"))
+            }
+        } else if let Some(text) = self.value.get("text").and_then(Value::as_str) {
+            Some(text.to_string())
+        } else {
+            self.value
+                .get("content")
+                .and_then(|content| CodexContent::new(content).text())
+        }
+    }
+
+    pub fn push_readable(
+        &self,
+        collector: &mut TranscriptBlockCollector<'_, 'a>,
+        kind: TranscriptBlockKind,
+    ) {
+        if let Some(text) = self.text() {
+            collector.push_readable(kind, text);
+        }
     }
 }
