@@ -43,9 +43,10 @@ Optional read-only legacy recovery roots are for one-time migration or recovery 
 
 ## Local transcript block search workflow
 
-Transcript block search is for scraping configured local harness, session, and subagent transcript roots. It is not a harness integration API and is not a reason to create or keep markdown report files alive. Configure local readable Claude JSONL, Codex session, or Pi run-history roots, then discover cards before reading text:
+Transcript block search is for scraping configured local harness, session, and subagent transcript roots. It is not a harness integration API and is not a reason to create or keep markdown report files alive. Configure local readable Claude JSONL, Claude subagent `.output` JSONL, Codex session, or Pi run-history roots, then call `ObserveHealth` and discover cards before reading text:
 
-1. `ListSessions` with source and time filters.
+1. `ObserveHealth` to see configured source/index status (`ReadableEmpty`, `ReadableIndexed`, `UnreadableRoot`, `DiscoveryTruncated`, `MalformedRecords`, or `IndexStoreUnreadable`).
+2. `ListSessions` with source and time filters.
 2. `ListSubagents` for the selected session when subagent drill-down matters.
 3. `ListTranscriptBlocks` with `MetadataOnly` or a small `BoundedPreview` and a grounded kind filter.
 4. `SearchTranscriptBlocks` with canonical `nota-text-query` forms such as `(Contains (Word (quota)))`, `(Contains (Phrase ([rate limit])))`, or `(Near ((Word (quota)) (Word (reset)) 6))`.

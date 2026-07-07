@@ -44,9 +44,10 @@ cannot mutate configuration.
 
 The source of truth is underlying runtime evidence: harness/session/subagent
 transcripts and event evidence, plus configured repository evidence for the
-collection surface. Current adapters read explicitly configured Claude JSONL,
-Codex session, Pi run-history, and repository roots. Transcript locations and
-formats are adapter records, not hard-coded private paths.
+collection surface. Current adapters read explicitly configured Claude JSONL, Claude subagent
+`.output` JSONL, Codex session, Pi run-history, and optional repository roots.
+Transcript-only configuration is supported for recovery; transcript locations
+and formats are adapter records, not hard-coded private paths.
 
 The output-interface index is derived from configured transcript evidence. It is
 not derived from agent-written reports as a normal workflow.
@@ -72,6 +73,7 @@ The ordinary contract exposes metadata-first output operations:
 - `ListOutputSegments` lists segment cards for a selected output.
 - `ListTranscriptBlocks` lists whole logical transcript-block cards with grounded kind selection and optional bounded previews.
 - `SearchTranscriptBlocks` applies `nota-text-query` over readable transcript blocks and returns query evidence with matching cards.
+- `ObserveHealth` reports metadata-first runtime capabilities, configured source health, and fragile-index counts without transcript text.
 - `EstimateTranscriptBlock` estimates a selected block before text projection.
 - `ReadTranscriptBlock` reads a selected whole block only with an explicit `maximum_bytes` bounded by the configured read cap.
 - `EstimateOutput` estimates an explicit output range.

@@ -13,21 +13,24 @@ use signal_aggregator::{
     AuthoredStatus, AuthoredStatusFilter, ByteCount, ByteLimit, ByteRange, CardProjection,
     DurationUnit, FilesystemPath, FragileOutputReference, FragileOutputSegmentReference,
     FragilePageCursor, FragileSessionReference, FragileSubagentReference,
-    FragileTranscriptBlockReference, ItemCount, LineCount, LineNumber, LineRange, ListingOrder,
-    OperationKind, OperationRejected, OperationRejectionReason, OutputCard, OutputEstimateRequest,
-    OutputEstimated, OutputListFilter, OutputListRequest, OutputProvenance, OutputRead,
-    OutputReadRange, OutputReadRequest, OutputSegmentCard, OutputSegmentListFilter,
+    FragileTranscriptBlockReference, IndexHealth, ItemCount, LineCount, LineNumber, LineRange,
+    ListingOrder, OperationKind, OperationRejected, OperationRejectionReason, OutputCard,
+    OutputEstimateRequest, OutputEstimated, OutputListFilter, OutputListRequest, OutputProvenance,
+    OutputRead, OutputReadRange, OutputReadRequest, OutputSegmentCard, OutputSegmentListFilter,
     OutputSegmentListRequest, OutputSegmentsListed, OutputText, OutputTextExcerpt, OutputsListed,
     PageLimit, PageMetadata, PageRequest, RejectedFragileReference, RequestIdentifier,
-    SegmentIndex, SessionCard, SessionListFilter, SessionListRequest, SessionsListed,
-    SizeCertainty, SizeMetadata, SourceKind, SourceSelection, SubagentCard, SubagentListFilter,
-    SubagentListRequest, SubagentsListed, TimeWindow, Timestamp, TranscriptBlockCard,
-    TranscriptBlockEstimateRequest, TranscriptBlockEstimated, TranscriptBlockFilter,
-    TranscriptBlockKind, TranscriptBlockKindSelection, TranscriptBlockListRequest,
-    TranscriptBlockProvenance, TranscriptBlockRead, TranscriptBlockReadRequest,
-    TranscriptBlockSearchEvidence, TranscriptBlockSearchMatch, TranscriptBlockSearchRequest,
-    TranscriptBlockTextAvailability, TranscriptBlockTextQuery, TranscriptBlocksListed,
-    TranscriptBlocksSearched, TranscriptText, TranscriptTextExcerpt, Truncation, TruncationReason,
+    RuntimeCapabilities, RuntimeCapabilityStatus, RuntimeHealthObserved, RuntimeHealthRequest,
+    SegmentIndex, SessionCard, SessionIdentifier, SessionListFilter, SessionListRequest,
+    SessionsListed, SizeCertainty, SizeMetadata, SourceHealthCard, SourceHealthStatus, SourceKind,
+    SourceLocator, SourceSelection, SubagentCard, SubagentListFilter, SubagentListRequest,
+    SubagentTaskMetadata, SubagentsListed, TaskIdentifier, TimeWindow, Timestamp,
+    TranscriptBlockCard, TranscriptBlockEstimateRequest, TranscriptBlockEstimated,
+    TranscriptBlockFilter, TranscriptBlockKind, TranscriptBlockKindSelection,
+    TranscriptBlockListRequest, TranscriptBlockProvenance, TranscriptBlockRead,
+    TranscriptBlockReadRequest, TranscriptBlockSearchEvidence, TranscriptBlockSearchMatch,
+    TranscriptBlockSearchRequest, TranscriptBlockTextAvailability, TranscriptBlockTextQuery,
+    TranscriptBlocksListed, TranscriptBlocksSearched, TranscriptText, TranscriptTextExcerpt,
+    Truncation, TruncationReason,
 };
 
 use crate::{
@@ -53,6 +56,32 @@ impl OutputInterfaceRuntime {
         Self {
             configuration,
             clock,
+        }
+    }
+
+    pub fn observe_health(&self, request: RuntimeHealthRequest) -> RuntimeHealthObserved {
+        let current = CurrentIndexBuilder::new(self.configuration.clone()).build();
+        let sources = self
+            .configuration
+            .transcript_sources()
+            .iter()
+            .map(|source| SourceHealthObserver::new(source.clone()).observe())
+            .collect::<Vec<_>>();
+        RuntimeHealthObserved {
+            request_identifier: request.request_identifier,
+            capabilities: RuntimeCapabilities {
+                health_observation: RuntimeCapabilityStatus::Supported,
+                transcript_only_configuration: RuntimeCapabilityStatus::Supported,
+                claude_subagent_output_sources: RuntimeCapabilityStatus::Supported,
+            },
+            sources,
+            index: IndexHealth {
+                status: SourceHealthStatus::ReadableIndexed,
+                session_count: ItemCount::new(current.sessions.len() as u64),
+                subagent_count: ItemCount::new(current.subagents.len() as u64),
+                output_count: ItemCount::new(current.outputs.len() as u64),
+                transcript_block_count: ItemCount::new(current.transcript_blocks.len() as u64),
+            },
         }
     }
 
@@ -130,6 +159,10 @@ impl OutputInterfaceRuntime {
             .filter(|subagent| {
                 AuthoredStatusFilterMatcher::new(&request.filter.authored_status)
                     .accepts(subagent.authored_status)
+            })
+            .filter(|subagent| {
+                TaskIdentifierFilter::new(request.filter.task_identifier.as_ref())
+                    .accepts(subagent.task.as_ref())
             })
             .collect::<Vec<_>>();
         IndexedSubagentSorter::new(request.page.order).sort(&mut subagents);
@@ -212,6 +245,10 @@ impl OutputInterfaceRuntime {
             .filter(|output| {
                 AuthoredStatusFilterMatcher::new(&request.filter.authored_status)
                     .accepts(output.provenance.authored_status)
+            })
+            .filter(|output| {
+                TaskIdentifierFilter::new(request.filter.task_identifier.as_ref())
+                    .accepts(output.task.as_ref())
             })
             .filter(|output| {
                 OptionalTimeWindowFilter::new(lowered_time_window.as_ref())
@@ -754,44 +791,69 @@ impl DurableFragileIndex {
     }
 
     pub fn session(&self, reference: &FragileSessionReference) -> Option<IndexedSession> {
-        self.sessions
-            .iter()
-            .find(|session| &session.reference == reference)
-            .cloned()
+        self.active_sessions
+            .contains(reference)
+            .then(|| {
+                self.sessions
+                    .iter()
+                    .find(|session| &session.reference == reference)
+                    .cloned()
+            })
+            .flatten()
     }
 
     pub fn subagent(&self, reference: &FragileSubagentReference) -> Option<IndexedSubagent> {
-        self.subagents
-            .iter()
-            .find(|subagent| &subagent.reference == reference)
-            .cloned()
+        self.active_subagents
+            .contains(reference)
+            .then(|| {
+                self.subagents
+                    .iter()
+                    .find(|subagent| &subagent.reference == reference)
+                    .cloned()
+            })
+            .flatten()
     }
 
     pub fn output(&self, reference: &FragileOutputReference) -> Option<IndexedOutput> {
-        self.outputs
-            .iter()
-            .find(|output| &output.reference == reference)
-            .cloned()
+        self.active_outputs
+            .contains(reference)
+            .then(|| {
+                self.outputs
+                    .iter()
+                    .find(|output| &output.reference == reference)
+                    .cloned()
+            })
+            .flatten()
     }
 
     pub fn segment(
         &self,
         reference: &FragileOutputSegmentReference,
     ) -> Option<IndexedOutputSegment> {
-        self.segments
-            .iter()
-            .find(|segment| &segment.reference == reference)
-            .cloned()
+        self.active_segments
+            .contains(reference)
+            .then(|| {
+                self.segments
+                    .iter()
+                    .find(|segment| &segment.reference == reference)
+                    .cloned()
+            })
+            .flatten()
     }
 
     pub fn transcript_block(
         &self,
         reference: &FragileTranscriptBlockReference,
     ) -> Option<IndexedTranscriptBlock> {
-        self.transcript_blocks
-            .iter()
-            .find(|block| &block.reference == reference)
-            .cloned()
+        self.active_transcript_blocks
+            .contains(reference)
+            .then(|| {
+                self.transcript_blocks
+                    .iter()
+                    .find(|block| &block.reference == reference)
+                    .cloned()
+            })
+            .flatten()
     }
 
     pub fn collection_signature(&self) -> String {
@@ -954,6 +1016,12 @@ impl CurrentIndexBuilder {
                 crate::adapter::claude::ClaudeJsonlRootReader::new(root.path().to_path_buf())
                     .read_records()
             }
+            TranscriptAdapterConfiguration::ClaudeSubagentOutput(root) => {
+                crate::adapter::claude::ClaudeJsonlRootReader::subagent_output(
+                    root.path().to_path_buf(),
+                )
+                .read_records()
+            }
             TranscriptAdapterConfiguration::Codex(root) => {
                 crate::adapter::codex::CodexSessionRootReader::new(root.path().to_path_buf())
                     .read_records()
@@ -962,6 +1030,70 @@ impl CurrentIndexBuilder {
                 crate::adapter::pi::PiRunHistoryRootReader::new(root.path().to_path_buf())
                     .read_records()
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceHealthObserver {
+    source: TranscriptAdapterConfiguration,
+}
+
+impl SourceHealthObserver {
+    pub fn new(source: TranscriptAdapterConfiguration) -> Self {
+        Self { source }
+    }
+
+    pub fn observe(&self) -> SourceHealthCard {
+        let outcome = match &self.source {
+            TranscriptAdapterConfiguration::Claude(root) => {
+                crate::adapter::claude::ClaudeJsonlRootReader::new(root.path().to_path_buf())
+                    .read_records()
+            }
+            TranscriptAdapterConfiguration::ClaudeSubagentOutput(root) => {
+                crate::adapter::claude::ClaudeJsonlRootReader::subagent_output(
+                    root.path().to_path_buf(),
+                )
+                .read_records()
+            }
+            TranscriptAdapterConfiguration::Codex(root) => {
+                crate::adapter::codex::CodexSessionRootReader::new(root.path().to_path_buf())
+                    .read_records()
+            }
+            TranscriptAdapterConfiguration::Pi(root) => {
+                crate::adapter::pi::PiRunHistoryRootReader::new(root.path().to_path_buf())
+                    .read_records()
+            }
+        };
+        let malformed = outcome
+            .read_failures
+            .iter()
+            .filter(|failure| failure.reason == signal_aggregator::ReadFailureReason::Malformed)
+            .count() as u64;
+        let unreadable = outcome.read_failures.len() as u64 - malformed;
+        let status = if unreadable > 0 {
+            SourceHealthStatus::UnreadableRoot
+        } else if !outcome.truncations.is_empty() {
+            SourceHealthStatus::DiscoveryTruncated
+        } else if malformed > 0 {
+            SourceHealthStatus::MalformedRecords
+        } else if outcome.records.is_empty() {
+            SourceHealthStatus::ReadableEmpty
+        } else {
+            SourceHealthStatus::ReadableIndexed
+        };
+        SourceHealthCard {
+            source: self.source.kind(),
+            source_identifier: outcome.source_identifier,
+            locator: SourceLocator {
+                root: FilesystemPath::new(self.source.root().path().display().to_string()),
+                relative_path: None,
+            },
+            status,
+            discovered_files: ItemCount::new(outcome.records.len() as u64),
+            indexed_records: ItemCount::new(outcome.records.len() as u64),
+            malformed_records: ItemCount::new(malformed),
+            unreadable_records: ItemCount::new(unreadable),
         }
     }
 }
@@ -987,7 +1119,7 @@ impl CurrentIndexAccumulator {
     }
 
     pub fn observe(&mut self, record: TranscriptRecord) {
-        let session_key = record.path.display().to_string();
+        let session_key = TranscriptRecordSessionKey::new(&record).key();
         self.sessions
             .entry(session_key)
             .or_insert_with(|| {
@@ -1026,6 +1158,36 @@ impl CurrentIndexAccumulator {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptRecordSessionKey<'a> {
+    record: &'a TranscriptRecord,
+}
+
+impl<'a> TranscriptRecordSessionKey<'a> {
+    pub fn new(record: &'a TranscriptRecord) -> Self {
+        Self { record }
+    }
+
+    pub fn key(&self) -> String {
+        match (&self.record.session_identifier, &self.record.task_metadata) {
+            (Some(session), Some(task)) => {
+                format!("{}|{}", session.as_str(), task.task_identifier.as_str())
+            }
+            (Some(session), None) => format!(
+                "{}|{}",
+                SourceKindName::new(self.record.source).as_str(),
+                session.as_str()
+            ),
+            (None, Some(task)) => format!(
+                "{}|{}",
+                SourceKindName::new(self.record.source).as_str(),
+                task.task_identifier.as_str()
+            ),
+            (None, None) => self.record.path.display().to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionAccumulator {
     source: SourceKind,
     source_identifier: signal_aggregator::SourceIdentifier,
@@ -1039,6 +1201,7 @@ pub struct SessionAccumulator {
     size: SizeAccumulator,
     started_at: Option<Timestamp>,
     last_observed_at: Option<Timestamp>,
+    session_identifier: Option<SessionIdentifier>,
 }
 
 impl SessionAccumulator {
@@ -1063,22 +1226,28 @@ impl SessionAccumulator {
             size: SizeAccumulator::new(),
             started_at: None,
             last_observed_at: None,
+            session_identifier: None,
         }
     }
 
     pub fn observe(&mut self, record: TranscriptRecord) {
         self.size.observe_text(&record.text);
+        if self.session_identifier.is_none() {
+            self.session_identifier = record.session_identifier.clone();
+        }
         self.observe_timestamp(record.timestamp.clone());
         let session_reference = self.session_reference();
         let subagent_reference = record
             .subagent_name
             .as_ref()
             .map(|name| self.subagent_reference(name));
+        let record_fingerprint = SourceFingerprint::from_path(&record.path)
+            .unwrap_or_else(|_| SourceFingerprint::missing());
         let output = IndexedOutput::from_record(
             record.clone(),
             session_reference.clone(),
             subagent_reference.clone(),
-            self.fingerprint.clone(),
+            record_fingerprint.clone(),
             self.preview_limit,
         );
         let segment = IndexedOutputSegment::from_output(&output);
@@ -1102,7 +1271,7 @@ impl SessionAccumulator {
                     block_record,
                     session_reference.clone(),
                     block_subagent_reference,
-                    self.fingerprint.clone(),
+                    record_fingerprint.clone(),
                     self.preview_limit,
                 ));
         }
@@ -1167,6 +1336,7 @@ impl SessionAccumulator {
                 fingerprint: self.fingerprint,
                 started_at: self.started_at,
                 last_observed_at: self.last_observed_at,
+                producer_session_identifier: self.session_identifier,
                 subagent_references: subagents
                     .iter()
                     .map(|subagent| subagent.reference.clone())
@@ -1202,6 +1372,7 @@ pub struct SubagentAccumulator {
     name: signal_aggregator::SubagentName,
     authored_status: AuthoredStatusAccumulator,
     output_references: Vec<FragileOutputReference>,
+    task: Option<SubagentTaskMetadata>,
     size: SizeAccumulator,
     first_observed_at: Option<Timestamp>,
     last_observed_at: Option<Timestamp>,
@@ -1219,6 +1390,7 @@ impl SubagentAccumulator {
             name,
             authored_status: AuthoredStatusAccumulator::new(),
             output_references: Vec::new(),
+            task: None,
             size: SizeAccumulator::new(),
             first_observed_at: None,
             last_observed_at: None,
@@ -1227,6 +1399,9 @@ impl SubagentAccumulator {
 
     pub fn observe(&mut self, output: &IndexedOutput) {
         self.output_references.push(output.reference.clone());
+        if self.task.is_none() {
+            self.task = output.task.clone();
+        }
         self.size.observe_size(&output.size);
         self.authored_status
             .observe(output.provenance.authored_status);
@@ -1248,6 +1423,7 @@ impl SubagentAccumulator {
             name: self.name,
             authored_status: self.authored_status.finish(),
             output_references: self.output_references,
+            task: self.task,
             size: self.size.finish(),
             first_observed_at: self.first_observed_at,
             last_observed_at: self.last_observed_at,
@@ -1266,6 +1442,7 @@ pub struct IndexedSession {
     last_observed_at: Option<Timestamp>,
     subagent_references: Vec<FragileSubagentReference>,
     output_references: Vec<FragileOutputReference>,
+    producer_session_identifier: Option<SessionIdentifier>,
     size: SizeMetadata,
 }
 
@@ -1275,6 +1452,11 @@ impl IndexedSession {
             reference: self.reference.clone(),
             source: self.source,
             source_identifier: self.source_identifier.clone(),
+            producer_session_identifier: self.producer_session_identifier.clone(),
+            transcript_locator: Some(SourceLocator {
+                root: FilesystemPath::new(self.path.display().to_string()),
+                relative_path: None,
+            }),
             started_at: self.started_at.clone(),
             last_observed_at: self.last_observed_at.clone(),
             subagent_count: Some(ItemCount::new(self.subagent_references.len() as u64)),
@@ -1296,6 +1478,7 @@ impl IndexedSession {
             "fingerprint": self.fingerprint.to_json(),
             "started_at": self.started_at.as_ref().map(|value| value.as_str()),
             "last_observed_at": self.last_observed_at.as_ref().map(|value| value.as_str()),
+            "producer_session_identifier": self.producer_session_identifier.as_ref().map(|value| value.as_str()),
             "subagent_references": self.subagent_references.iter().map(|reference| reference.as_str().to_string()).collect::<Vec<_>>(),
             "output_references": self.output_references.iter().map(|reference| reference.as_str().to_string()).collect::<Vec<_>>(),
             "size": SizeMetadataJson::new(&self.size).to_json(),
@@ -1316,6 +1499,9 @@ impl IndexedSession {
             last_observed_at: reader
                 .optional_string("last_observed_at")
                 .map(Timestamp::new),
+            producer_session_identifier: reader
+                .optional_string("producer_session_identifier")
+                .map(SessionIdentifier::new),
             subagent_references: reader
                 .strings("subagent_references")
                 .into_iter()
@@ -1338,6 +1524,7 @@ pub struct IndexedSubagent {
     name: signal_aggregator::SubagentName,
     authored_status: AuthoredStatus,
     output_references: Vec<FragileOutputReference>,
+    task: Option<SubagentTaskMetadata>,
     size: SizeMetadata,
     first_observed_at: Option<Timestamp>,
     last_observed_at: Option<Timestamp>,
@@ -1349,6 +1536,7 @@ impl IndexedSubagent {
             reference: self.reference.clone(),
             session_reference: self.session_reference.clone(),
             name: self.name.clone(),
+            task: self.task.clone(),
             authored_status: self.authored_status,
             output_count: Some(ItemCount::new(self.output_references.len() as u64)),
             size: self.size.clone(),
@@ -1369,6 +1557,7 @@ impl IndexedSubagent {
             "session_reference": self.session_reference.as_str(),
             "name": self.name.as_str(),
             "authored_status": AuthoredStatusName::new(self.authored_status).as_str(),
+            "task_identifier": self.task.as_ref().map(|task| task.task_identifier.as_str()),
             "output_references": self.output_references.iter().map(|reference| reference.as_str().to_string()).collect::<Vec<_>>(),
             "size": SizeMetadataJson::new(&self.size).to_json(),
             "first_observed_at": self.first_observed_at.as_ref().map(|value| value.as_str()),
@@ -1383,6 +1572,18 @@ impl IndexedSubagent {
             session_reference: FragileSessionReference::new(reader.string("session_reference")?),
             name: signal_aggregator::SubagentName::new(reader.string("name")?),
             authored_status: AuthoredStatusName::parse(&reader.string("authored_status")?)?,
+            task: reader
+                .optional_string("task_identifier")
+                .map(|task_identifier| SubagentTaskMetadata {
+                    task_identifier: TaskIdentifier::new(task_identifier),
+                    title: None,
+                    tool_use_identifier: None,
+                    output_locator: None,
+                    source_status: SourceHealthStatus::ReadableIndexed,
+                    result: None,
+                    usage: None,
+                    duration: None,
+                }),
             output_references: reader
                 .strings("output_references")
                 .into_iter()
@@ -1406,6 +1607,7 @@ pub struct IndexedOutput {
     subagent_reference: Option<FragileSubagentReference>,
     title: Option<signal_aggregator::OutputTitle>,
     provenance: OutputProvenance,
+    task: Option<SubagentTaskMetadata>,
     path: PathBuf,
     fingerprint: SourceFingerprint,
     source_line_number: u64,
@@ -1447,6 +1649,7 @@ impl IndexedOutput {
             session_reference,
             subagent_reference,
             title: record.title,
+            task: record.task_metadata.clone(),
             provenance: OutputProvenance {
                 source: record.source,
                 source_identifier: record.source_identifier,
@@ -1469,6 +1672,7 @@ impl IndexedOutput {
             session_reference: self.session_reference.clone(),
             subagent_reference: self.subagent_reference.clone(),
             title: self.title.clone(),
+            task: self.task.clone(),
             provenance: self.provenance.clone(),
             size: self.size.clone(),
             preview: PreviewProjector::new(
@@ -1491,6 +1695,7 @@ impl IndexedOutput {
             "session_reference": self.session_reference.as_str(),
             "subagent_reference": self.subagent_reference.as_ref().map(|value| value.as_str()),
             "title": self.title.as_ref().map(|value| value.as_str()),
+            "task_identifier": self.task.as_ref().map(|task| task.task_identifier.as_str()),
             "source": SourceKindName::new(self.provenance.source).as_str(),
             "source_identifier": self.provenance.source_identifier.as_str(),
             "authored_status": AuthoredStatusName::new(self.provenance.authored_status).as_str(),
@@ -1517,6 +1722,18 @@ impl IndexedOutput {
             title: reader
                 .optional_string("title")
                 .map(signal_aggregator::OutputTitle::new),
+            task: reader
+                .optional_string("task_identifier")
+                .map(|task_identifier| SubagentTaskMetadata {
+                    task_identifier: TaskIdentifier::new(task_identifier),
+                    title: None,
+                    tool_use_identifier: None,
+                    output_locator: None,
+                    source_status: SourceHealthStatus::ReadableIndexed,
+                    result: None,
+                    usage: None,
+                    duration: None,
+                }),
             provenance: OutputProvenance {
                 source,
                 source_identifier: signal_aggregator::SourceIdentifier::new(
@@ -1650,6 +1867,7 @@ pub struct IndexedTranscriptBlock {
     kind: TranscriptBlockKind,
     block_index: signal_aggregator::TranscriptBlockIndex,
     provenance: TranscriptBlockProvenance,
+    task: Option<SubagentTaskMetadata>,
     path: PathBuf,
     fingerprint: SourceFingerprint,
     source_line_number: u64,
@@ -1705,6 +1923,7 @@ impl IndexedTranscriptBlock {
             subagent_reference,
             kind: record.kind,
             block_index: signal_aggregator::TranscriptBlockIndex::new(record.block_index),
+            task: record.task_metadata.clone(),
             provenance: TranscriptBlockProvenance {
                 source: record.source,
                 source_identifier: record.source_identifier,
@@ -1727,6 +1946,7 @@ impl IndexedTranscriptBlock {
             reference: self.reference.clone(),
             session_reference: self.session_reference.clone(),
             subagent_reference: self.subagent_reference.clone(),
+            task: self.task.clone(),
             kind: self.kind,
             block_index: self.block_index,
             provenance: self.provenance.clone(),
@@ -1775,6 +1995,7 @@ impl IndexedTranscriptBlock {
             "reference": self.reference.as_str(),
             "session_reference": self.session_reference.as_str(),
             "subagent_reference": self.subagent_reference.as_ref().map(|value| value.as_str()),
+            "task_identifier": self.task.as_ref().map(|task| task.task_identifier.as_str()),
             "kind": TranscriptBlockKindName::new(self.kind).as_str(),
             "block_index": self.block_index.into_u64(),
             "source": SourceKindName::new(self.provenance.source).as_str(),
@@ -1803,6 +2024,18 @@ impl IndexedTranscriptBlock {
                 .map(FragileSubagentReference::new),
             kind: TranscriptBlockKindName::parse(&reader.string("kind")?)?,
             block_index: signal_aggregator::TranscriptBlockIndex::new(reader.u64("block_index")?),
+            task: reader
+                .optional_string("task_identifier")
+                .map(|task_identifier| SubagentTaskMetadata {
+                    task_identifier: TaskIdentifier::new(task_identifier),
+                    title: None,
+                    tool_use_identifier: None,
+                    output_locator: None,
+                    source_status: SourceHealthStatus::ReadableIndexed,
+                    result: None,
+                    usage: None,
+                    duration: None,
+                }),
             provenance: TranscriptBlockProvenance {
                 source,
                 source_identifier: signal_aggregator::SourceIdentifier::new(
@@ -2227,14 +2460,17 @@ impl TranscriptLineParser {
 
     pub fn parse(&self) -> Option<TranscriptRecord> {
         match self.source {
-            SourceKind::Claude => match ClaudeJsonlRecord::new(&self.line).into_transcript_record(
-                self.path.clone(),
-                self.line_number,
-                self.source_identifier.clone(),
-            ) {
-                crate::adapter::claude::ClaudeJsonlRecordResult::Record(record) => Some(record),
-                crate::adapter::claude::ClaudeJsonlRecordResult::Malformed => None,
-            },
+            SourceKind::Claude | SourceKind::ClaudeSubagentOutput => {
+                match ClaudeJsonlRecord::new(&self.line).into_transcript_record(
+                    self.source,
+                    self.path.clone(),
+                    self.line_number,
+                    self.source_identifier.clone(),
+                ) {
+                    crate::adapter::claude::ClaudeJsonlRecordResult::Record(record) => Some(record),
+                    crate::adapter::claude::ClaudeJsonlRecordResult::Malformed => None,
+                }
+            }
             SourceKind::Codex => match CodexJsonlRecord::new(&self.line).into_transcript_record(
                 self.path.clone(),
                 self.line_number,
@@ -4048,6 +4284,23 @@ impl<'a> AuthoredStatusFilterMatcher<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskIdentifierFilter<'a> {
+    task_identifier: Option<&'a TaskIdentifier>,
+}
+
+impl<'a> TaskIdentifierFilter<'a> {
+    pub fn new(task_identifier: Option<&'a TaskIdentifier>) -> Self {
+        Self { task_identifier }
+    }
+
+    pub fn accepts(&self, task: Option<&SubagentTaskMetadata>) -> bool {
+        self.task_identifier.is_none_or(|expected| {
+            task.is_some_and(|metadata| metadata.task_identifier == *expected)
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TranscriptBlockKindSelectionMatcher<'a> {
     selection: &'a TranscriptBlockKindSelection,
 }
@@ -4113,6 +4366,10 @@ impl<'a> TranscriptBlockFilterMatcher<'a> {
             .filter(|block| {
                 AuthoredStatusFilterMatcher::new(&self.filter.authored_status)
                     .accepts(block.provenance.authored_status)
+            })
+            .filter(|block| {
+                TaskIdentifierFilter::new(self.filter.task_identifier.as_ref())
+                    .accepts(block.task.as_ref())
             })
             .filter(|block| {
                 OptionalTimeWindowFilter::new(self.lowered_time_window)
@@ -4472,6 +4729,7 @@ impl SourceKindName {
     pub fn as_str(&self) -> &'static str {
         match self.source {
             SourceKind::Claude => "Claude",
+            SourceKind::ClaudeSubagentOutput => "ClaudeSubagentOutput",
             SourceKind::Codex => "Codex",
             SourceKind::Pi => "Pi",
             SourceKind::Repository => "Repository",
@@ -4481,6 +4739,7 @@ impl SourceKindName {
     pub fn parse(value: &str) -> Option<SourceKind> {
         match value {
             "Claude" => Some(SourceKind::Claude),
+            "ClaudeSubagentOutput" => Some(SourceKind::ClaudeSubagentOutput),
             "Codex" => Some(SourceKind::Codex),
             "Pi" => Some(SourceKind::Pi),
             "Repository" => Some(SourceKind::Repository),

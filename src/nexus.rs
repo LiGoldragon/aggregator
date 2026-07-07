@@ -2,10 +2,11 @@ use signal_aggregator::{
     EvidencePackage, EvidenceRequest, OperationKind, OperationRejectionReason,
     OutputEstimateRequest, OutputEstimated, OutputListRequest, OutputRead, OutputReadRequest,
     OutputSegmentListRequest, OutputSegmentsListed, OutputsListed, PackageIdentifier,
-    RequestIdentifier, SessionListRequest, SessionsListed, SourceKind, SubagentListRequest,
-    SubagentsListed, TimeWindow, TranscriptBlockEstimateRequest, TranscriptBlockEstimated,
-    TranscriptBlockListRequest, TranscriptBlockRead, TranscriptBlockReadRequest,
-    TranscriptBlockSearchRequest, TranscriptBlocksListed, TranscriptBlocksSearched,
+    RequestIdentifier, RuntimeHealthObserved, RuntimeHealthRequest, SessionListRequest,
+    SessionsListed, SourceKind, SubagentListRequest, SubagentsListed, TimeWindow,
+    TranscriptBlockEstimateRequest, TranscriptBlockEstimated, TranscriptBlockListRequest,
+    TranscriptBlockRead, TranscriptBlockReadRequest, TranscriptBlockSearchRequest,
+    TranscriptBlocksListed, TranscriptBlocksSearched,
 };
 
 use crate::{
@@ -98,6 +99,15 @@ impl NexusPlane {
                 .merge_repository(self.collect_repository_sources(selection.repositories));
         }
         Ok(package_builder.finish())
+    }
+
+    pub fn observe_health(
+        &self,
+        request: RuntimeHealthRequest,
+    ) -> OutputOperationResult<RuntimeHealthObserved> {
+        Ok(self
+            .output_interface(&request.request_identifier, OperationKind::ObserveHealth)?
+            .observe_health(request))
     }
 
     pub fn list_sessions(
@@ -238,6 +248,12 @@ impl NexusPlane {
             TranscriptAdapterConfiguration::Claude(root) => {
                 ClaudeTranscriptAdapter::new(root).collect(request)
             }
+            TranscriptAdapterConfiguration::ClaudeSubagentOutput(root) => {
+                crate::adapter::claude::ClaudeJsonlRootReader::subagent_output(
+                    root.path().to_path_buf(),
+                )
+                .collect(request)
+            }
             TranscriptAdapterConfiguration::Codex(root) => {
                 CodexTranscriptAdapter::new(root).collect(request)
             }
@@ -332,6 +348,7 @@ impl SourceKindContactPoint {
     pub fn adapter_kind(source: SourceKind) -> Option<AdapterKind> {
         match source {
             SourceKind::Claude => Some(AdapterKind::ClaudeTranscript),
+            SourceKind::ClaudeSubagentOutput => Some(AdapterKind::ClaudeSubagentOutput),
             SourceKind::Codex => Some(AdapterKind::CodexTranscript),
             SourceKind::Pi => Some(AdapterKind::PiTranscript),
             SourceKind::Repository => Some(AdapterKind::Repository),

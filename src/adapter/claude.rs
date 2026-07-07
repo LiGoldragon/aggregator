@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 use signal_aggregator::{
-    FilesystemPath, ReadFailure, ReadFailureReason, SourceIdentifier, SourceKind, Timestamp,
+    FilesystemPath, ReadFailure, ReadFailureReason, SessionIdentifier, SourceHealthStatus,
+    SourceIdentifier, SourceKind, SourceLocator, SubagentTaskMetadata, TaskIdentifier, Timestamp,
     TranscriptBlockKind,
 };
 
@@ -43,21 +44,46 @@ impl ClaudeTranscriptAdapter {
 pub struct ClaudeJsonlRootReader {
     root: PathBuf,
     limits: TranscriptScanLimits,
+    source: SourceKind,
 }
 
 impl ClaudeJsonlRootReader {
     pub fn new(root: PathBuf) -> Self {
-        Self::with_limits(root, TranscriptScanLimits::default_runtime())
+        Self::with_limits_and_source(
+            root,
+            TranscriptScanLimits::default_runtime(),
+            SourceKind::Claude,
+        )
     }
 
     pub fn with_limits(root: PathBuf, limits: TranscriptScanLimits) -> Self {
-        Self { root, limits }
+        Self::with_limits_and_source(root, limits, SourceKind::Claude)
+    }
+
+    pub fn subagent_output(root: PathBuf) -> Self {
+        Self::with_limits_and_source(
+            root,
+            TranscriptScanLimits::default_runtime(),
+            SourceKind::ClaudeSubagentOutput,
+        )
+    }
+
+    pub fn with_limits_and_source(
+        root: PathBuf,
+        limits: TranscriptScanLimits,
+        source: SourceKind,
+    ) -> Self {
+        Self {
+            root,
+            limits,
+            source,
+        }
     }
 
     pub fn collect(&self, request: &TranscriptReadRequest) -> TranscriptReadOutcome {
         let source_identifier = self.source_identifier();
-        if let Some(outcome) = request
-            .unsupported_relative_window_outcome(SourceKind::Claude, source_identifier.clone())
+        if let Some(outcome) =
+            request.unsupported_relative_window_outcome(self.source, source_identifier.clone())
         {
             return outcome;
         }
@@ -68,7 +94,7 @@ impl ClaudeJsonlRootReader {
         let source_identifier = self.source_identifier();
         if !self.root.exists() {
             return TranscriptRawReadOutcome::new(
-                SourceKind::Claude,
+                self.source,
                 source_identifier.clone(),
                 Vec::new(),
                 Vec::new(),
@@ -82,7 +108,7 @@ impl ClaudeJsonlRootReader {
                 Ok(discovery) => discovery,
                 Err(error) => {
                     return TranscriptRawReadOutcome::new(
-                        SourceKind::Claude,
+                        self.source,
                         source_identifier.clone(),
                         Vec::new(),
                         Vec::new(),
@@ -92,14 +118,14 @@ impl ClaudeJsonlRootReader {
             };
         let mut records = Vec::new();
         let mut failures = TranscriptFailureAccumulator::new(
-            SourceKind::Claude,
+            self.source,
             Some(self.root.clone()),
             self.limits.maximum_failures(),
         );
         let mut truncations = discovery
             .truncations
             .into_iter()
-            .map(|truncation| truncation.into_truncation(SourceKind::Claude))
+            .map(|truncation| truncation.into_truncation(self.source))
             .collect::<Vec<_>>();
         for file in discovery.files {
             match TranscriptBoundedFile::new(file.clone(), self.limits.clone()).read_to_string() {
@@ -111,7 +137,7 @@ impl ClaudeJsonlRootReader {
                     &mut truncations,
                 ),
                 Ok(TranscriptBoundedFileRead::Truncated(truncation)) => {
-                    truncations.push(truncation.into_truncation(SourceKind::Claude));
+                    truncations.push(truncation.into_truncation(self.source));
                 }
                 Err(error) => failures.push(self.failure_from_io(error, Some(file))),
             }
@@ -119,7 +145,7 @@ impl ClaudeJsonlRootReader {
         let failure_outcome = failures.finish();
         truncations.extend(failure_outcome.truncations);
         TranscriptRawReadOutcome::new(
-            SourceKind::Claude,
+            self.source,
             source_identifier,
             records,
             truncations,
@@ -141,7 +167,7 @@ impl ClaudeJsonlRootReader {
             let line = match line_text.bounded_text() {
                 TranscriptLineTextOutcome::Text(line) => line,
                 TranscriptLineTextOutcome::Truncated(truncation) => {
-                    truncations.push(truncation.into_truncation(SourceKind::Claude));
+                    truncations.push(truncation.into_truncation(self.source));
                     failures.push(self.failure(
                         ReadFailureReason::Malformed,
                         Some(TranscriptLineLocator::new(file.to_path_buf(), line_number).path()),
@@ -150,6 +176,7 @@ impl ClaudeJsonlRootReader {
                 }
             };
             let parsed = ClaudeJsonlRecord::new(line).into_transcript_record(
+                self.source,
                 file.to_path_buf(),
                 line_number,
                 self.source_identifier(),
@@ -167,12 +194,16 @@ impl ClaudeJsonlRootReader {
     }
 
     pub fn source_identifier(&self) -> SourceIdentifier {
-        SourceIdentifier::new(format!("claude:{}", self.root.display()))
+        SourceIdentifier::new(format!(
+            "{}:{}",
+            ClaudeSourceName::new(self.source).as_str(),
+            self.root.display()
+        ))
     }
 
     pub fn failure(&self, reason: ReadFailureReason, path: Option<PathBuf>) -> ReadFailure {
         ReadFailure {
-            source: SourceKind::Claude,
+            source: self.source,
             path: path.map(|value| FilesystemPath::new(value.display().to_string())),
             source_identifier: Some(self.source_identifier()),
             reason,
@@ -201,6 +232,7 @@ impl<'a> ClaudeJsonlRecord<'a> {
 
     pub fn into_transcript_record(
         self,
+        source: SourceKind,
         path: PathBuf,
         line_number: u64,
         source_identifier: SourceIdentifier,
@@ -221,7 +253,7 @@ impl<'a> ClaudeJsonlRecord<'a> {
         };
         let metadata = TranscriptJsonMetadata::new(&value);
         let context = TranscriptBlockSourceContext::new(
-            SourceKind::Claude,
+            source,
             source_identifier.clone(),
             path.clone(),
             line_number,
@@ -236,9 +268,9 @@ impl<'a> ClaudeJsonlRecord<'a> {
         };
         ClaudeJsonlRecordResult::Record(
             TranscriptRecord::new(
-                SourceKind::Claude,
+                source,
                 source_identifier,
-                path,
+                path.clone(),
                 line_number,
                 timestamp,
                 text,
@@ -246,11 +278,18 @@ impl<'a> ClaudeJsonlRecord<'a> {
             .with_title(metadata.title())
             .with_subagent_name(metadata.subagent_name())
             .with_authored_status(metadata.authored_status())
+            .with_session_identifier(ClaudeSessionIdentifier::new(&path).identifier())
+            .with_task_metadata(
+                metadata
+                    .task_metadata()
+                    .or_else(|| ClaudeOutputTaskIdentifier::new(&path).metadata()),
+            )
             .with_blocks(blocks),
         )
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaudeJsonlRecordResult {
     Record(TranscriptRecord),
@@ -534,5 +573,96 @@ impl<'a> ClaudeContentItem<'a> {
         {
             collector.push_readable(TranscriptBlockKind::Unclassified, text);
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaudeSourceName {
+    source: SourceKind,
+}
+
+impl ClaudeSourceName {
+    pub fn new(source: SourceKind) -> Self {
+        Self { source }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self.source {
+            SourceKind::Claude => "claude",
+            SourceKind::ClaudeSubagentOutput => "claude-subagent-output",
+            SourceKind::Codex => "codex",
+            SourceKind::Pi => "pi",
+            SourceKind::Repository => "repository",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeSessionIdentifier<'a> {
+    path: &'a Path,
+}
+
+impl<'a> ClaudeSessionIdentifier<'a> {
+    pub fn new(path: &'a Path) -> Self {
+        Self { path }
+    }
+
+    pub fn identifier(&self) -> Option<SessionIdentifier> {
+        let source = if self
+            .path
+            .extension()
+            .is_some_and(|extension| extension == "output")
+        {
+            self.path
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|value| value.to_str())
+        } else {
+            self.path.file_stem().and_then(|value| value.to_str())
+        }?;
+        Some(SessionIdentifier::new(
+            source.strip_prefix("claude-").unwrap_or(source),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeOutputTaskIdentifier<'a> {
+    path: &'a Path,
+}
+
+impl<'a> ClaudeOutputTaskIdentifier<'a> {
+    pub fn new(path: &'a Path) -> Self {
+        Self { path }
+    }
+
+    pub fn metadata(&self) -> Option<SubagentTaskMetadata> {
+        let task_identifier = self
+            .path
+            .file_stem()
+            .and_then(|value| value.to_str())?
+            .strip_suffix(".output")
+            .unwrap_or_else(|| {
+                self.path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("")
+            });
+        if task_identifier.is_empty() {
+            return None;
+        }
+        Some(SubagentTaskMetadata {
+            task_identifier: TaskIdentifier::new(task_identifier),
+            title: None,
+            tool_use_identifier: None,
+            output_locator: Some(SourceLocator {
+                root: FilesystemPath::new(self.path.display().to_string()),
+                relative_path: None,
+            }),
+            source_status: SourceHealthStatus::ReadableIndexed,
+            result: None,
+            usage: None,
+            duration: None,
+        })
     }
 }

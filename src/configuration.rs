@@ -264,6 +264,7 @@ pub enum LegacyRecoveryKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptAdapterConfiguration {
     Claude(TranscriptRootConfiguration),
+    ClaudeSubagentOutput(TranscriptRootConfiguration),
     Codex(TranscriptRootConfiguration),
     Pi(TranscriptRootConfiguration),
 }
@@ -272,6 +273,7 @@ impl TranscriptAdapterConfiguration {
     pub fn kind(&self) -> SourceKind {
         match self {
             Self::Claude(_) => SourceKind::Claude,
+            Self::ClaudeSubagentOutput(_) => SourceKind::ClaudeSubagentOutput,
             Self::Codex(_) => SourceKind::Codex,
             Self::Pi(_) => SourceKind::Pi,
         }
@@ -279,7 +281,10 @@ impl TranscriptAdapterConfiguration {
 
     pub fn root(&self) -> &TranscriptRootConfiguration {
         match self {
-            Self::Claude(root) | Self::Codex(root) | Self::Pi(root) => root,
+            Self::Claude(root)
+            | Self::ClaudeSubagentOutput(root)
+            | Self::Codex(root)
+            | Self::Pi(root) => root,
         }
     }
 }
@@ -401,9 +406,6 @@ impl<'a> RuntimeConfigurationValidator<'a> {
         if transcript_sources.is_empty() {
             self.issues
                 .push(ConfigurationIssue::missing_transcript_source());
-        }
-        if repositories.is_empty() {
-            self.issues.push(ConfigurationIssue::missing_repository());
         }
         if self.issues.is_empty() {
             RuntimeConfigurationValidation::Accepted(RuntimeConfiguration {
@@ -528,6 +530,9 @@ impl<'a> RuntimeConfigurationValidator<'a> {
             TranscriptSource::Claude(root) => self
                 .transcript_root(root)
                 .map(TranscriptAdapterConfiguration::Claude),
+            TranscriptSource::ClaudeSubagentOutput(root) => self
+                .transcript_root(root)
+                .map(TranscriptAdapterConfiguration::ClaudeSubagentOutput),
             TranscriptSource::Codex(root) => self
                 .transcript_root(root)
                 .map(TranscriptAdapterConfiguration::Codex),

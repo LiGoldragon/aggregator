@@ -48,13 +48,13 @@ use signal_aggregator::{
     OperationRejectionReason, OutputListFilter, OutputListRequest, OutputReadRange,
     OutputReadRequest, OutputSegmentListFilter, OutputSegmentListRequest, PageLimit, PageRequest,
     Projection, ReadFailureReason, RejectionReason, RelativeDuration, RepositoryIdentifier,
-    RepositoryPath, RepositoryWorktreeState, RequestIdentifier, SegmentLimit, SegmentProjection,
-    SelectedSources, SessionListFilter, SessionListRequest, SourceIdentifier, SourceKind,
-    SourceSelection, SubagentListFilter, SubagentListRequest, TextQuery, TimeRange, TimeWindow,
-    Timestamp, TranscriptBlockEstimateRequest, TranscriptBlockFilter, TranscriptBlockKind,
-    TranscriptBlockKindSelection, TranscriptBlockListRequest, TranscriptBlockReadRequest,
-    TranscriptBlockSearchRequest, TranscriptBlockTextAvailability, TranscriptBlockTextQuery,
-    TruncationReason, Version,
+    RepositoryPath, RepositoryWorktreeState, RequestIdentifier, RuntimeHealthRequest, SegmentLimit,
+    SegmentProjection, SelectedSources, SessionListFilter, SessionListRequest, SourceHealthStatus,
+    SourceIdentifier, SourceKind, SourceSelection, SubagentListFilter, SubagentListRequest,
+    TextQuery, TimeRange, TimeWindow, Timestamp, TranscriptBlockEstimateRequest,
+    TranscriptBlockFilter, TranscriptBlockKind, TranscriptBlockKindSelection,
+    TranscriptBlockListRequest, TranscriptBlockReadRequest, TranscriptBlockSearchRequest,
+    TranscriptBlockTextAvailability, TranscriptBlockTextQuery, TruncationReason, Version,
 };
 use tempfile::TempDir;
 
@@ -195,6 +195,7 @@ fn transcript_block_filter(kind_selection: TranscriptBlockKindSelection) -> Tran
         source_selection: SourceSelection::AllConfigured,
         session_reference: None,
         subagent_reference: None,
+        task_identifier: None,
         kind_selection,
         authored_status: AuthoredStatusFilter::AnyAuthoredStatus,
         time_window: None,
@@ -880,6 +881,7 @@ fn output_interface_lists_subagents_outputs_segments_and_bounded_reads() {
             filter: SubagentListFilter {
                 session_reference: sessions.sessions[0].reference.clone(),
                 authored_status: AuthoredStatusFilter::AnyAuthoredStatus,
+                task_identifier: None,
             },
             page: PageRequest {
                 limit: PageLimit::new(10),
@@ -904,6 +906,7 @@ fn output_interface_lists_subagents_outputs_segments_and_bounded_reads() {
                 }),
                 session_reference: Some(sessions.sessions[0].reference.clone()),
                 subagent_reference: Some(subagents.subagents[0].reference.clone()),
+                task_identifier: None,
                 authored_status: AuthoredStatusFilter::OnlyAuthoredStatus(
                     AuthoredStatus::AgentAuthored,
                 ),
@@ -1032,6 +1035,7 @@ fn output_interface_paginates_enforces_limits_and_rejects_stale_references() {
                 }),
                 session_reference: None,
                 subagent_reference: None,
+                task_identifier: None,
                 authored_status: AuthoredStatusFilter::AnyAuthoredStatus,
                 time_window: None,
             },
@@ -1054,6 +1058,7 @@ fn output_interface_paginates_enforces_limits_and_rejects_stale_references() {
                 }),
                 session_reference: None,
                 subagent_reference: None,
+                task_identifier: None,
                 authored_status: AuthoredStatusFilter::AnyAuthoredStatus,
                 time_window: None,
             },
@@ -1078,6 +1083,7 @@ fn output_interface_paginates_enforces_limits_and_rejects_stale_references() {
                 source_selection: SourceSelection::AllConfigured,
                 session_reference: None,
                 subagent_reference: None,
+                task_identifier: None,
                 authored_status: AuthoredStatusFilter::AnyAuthoredStatus,
                 time_window: None,
             },
@@ -1219,6 +1225,7 @@ fn output_interface_rejects_cursors_when_listing_shape_changes() {
             filter: SubagentListFilter {
                 session_reference: session_with_subagents.clone(),
                 authored_status: AuthoredStatusFilter::AnyAuthoredStatus,
+                task_identifier: None,
             },
             page: PageRequest {
                 limit: PageLimit::new(1),
@@ -1240,6 +1247,7 @@ fn output_interface_rejects_cursors_when_listing_shape_changes() {
                 authored_status: AuthoredStatusFilter::OnlyAuthoredStatus(
                     AuthoredStatus::HumanAuthored,
                 ),
+                task_identifier: None,
             },
             page: PageRequest {
                 limit: PageLimit::new(1),
@@ -1260,6 +1268,7 @@ fn output_interface_rejects_cursors_when_listing_shape_changes() {
                 source_selection: SourceSelection::AllConfigured,
                 session_reference: Some(session_with_subagents.clone()),
                 subagent_reference: None,
+                task_identifier: None,
                 authored_status: AuthoredStatusFilter::AnyAuthoredStatus,
                 time_window: None,
             },
@@ -1283,6 +1292,7 @@ fn output_interface_rejects_cursors_when_listing_shape_changes() {
                 source_selection: SourceSelection::AllConfigured,
                 session_reference: Some(session_with_subagents.clone()),
                 subagent_reference: None,
+                task_identifier: None,
                 authored_status: AuthoredStatusFilter::OnlyAuthoredStatus(
                     AuthoredStatus::HumanAuthored,
                 ),
@@ -1308,6 +1318,7 @@ fn output_interface_rejects_cursors_when_listing_shape_changes() {
                 source_selection: SourceSelection::AllConfigured,
                 session_reference: Some(session_with_subagents),
                 subagent_reference: None,
+                task_identifier: None,
                 authored_status: AuthoredStatusFilter::AnyAuthoredStatus,
                 time_window: None,
             },
@@ -1494,6 +1505,7 @@ fn daemon_cli_boundary_handles_collect_version_and_meta_configuration() {
                 }),
                 session_reference: None,
                 subagent_reference: None,
+                task_identifier: None,
                 authored_status: AuthoredStatusFilter::AnyAuthoredStatus,
                 time_window: Some(TimeWindow::Since(Timestamp::new("2026-01-02T00:00:00Z"))),
             },
@@ -2492,4 +2504,214 @@ fn repository_adapter_uses_fixture_or_reports_policy_unavailable() {
         RepositoryAdapter::command_policy(vec![repository], RepositoryCommandPolicy::unavailable())
             .collect();
     assert_eq!(unavailable_outcome.read_failures.len(), 1);
+}
+
+fn materialize_recovery_fixtures(root: &std::path::Path) -> (String, String, String, String) {
+    let parent = root.join("claude-parent");
+    let subagents = root.join("claude-subagents/claude-session-uuid");
+    let empty = root.join("empty-root");
+    let malformed = root.join("malformed-root");
+    fs::create_dir_all(&parent).expect("parent fixture directory");
+    fs::create_dir_all(&subagents).expect("subagent fixture directory");
+    fs::create_dir_all(&empty).expect("empty fixture directory");
+    fs::create_dir_all(&malformed).expect("malformed fixture directory");
+    fs::write(
+        parent.join("session-uuid.jsonl"),
+        include_str!("fixtures/claude-parent/session-uuid.jsonl"),
+    )
+    .expect("parent fixture");
+    fs::write(
+        subagents.join("task-1.output"),
+        include_str!("fixtures/claude-subagents/claude-session-uuid/task-1.output"),
+    )
+    .expect("subagent output fixture");
+    fs::write(
+        malformed.join("malformed.jsonl"),
+        include_str!("fixtures/malformed-root/malformed.jsonl"),
+    )
+    .expect("malformed fixture");
+    (
+        parent.display().to_string(),
+        root.join("claude-subagents").display().to_string(),
+        empty.display().to_string(),
+        malformed.display().to_string(),
+    )
+}
+
+fn transcript_only_configuration(
+    store_path: &std::path::Path,
+    parent: String,
+    subagents: String,
+) -> AggregatorConfiguration {
+    let mut configuration = ConfigurationFixture::minimal();
+    configuration.store_path = FilesystemPath::new(store_path.display().to_string());
+    configuration.active_repositories = Vec::new();
+    configuration.transcript_sources = vec![
+        TranscriptSource::Claude(TranscriptRoot {
+            path: FilesystemPath::new(parent),
+        }),
+        TranscriptSource::ClaudeSubagentOutput(TranscriptRoot {
+            path: FilesystemPath::new(subagents),
+        }),
+    ];
+    configuration
+}
+
+#[test]
+fn runtime_configuration_accepts_transcript_only_configuration() {
+    let temp = TempDir::new().expect("tempdir");
+    let (parent, subagents, _, _) = materialize_recovery_fixtures(temp.path());
+    let configuration =
+        transcript_only_configuration(&temp.path().join("store"), parent, subagents);
+    let validation = RuntimeConfiguration::validate_from_meta(&configuration);
+    assert!(
+        matches!(validation, RuntimeConfigurationValidation::Accepted(_)),
+        "transcript-only configuration should be accepted: {validation:?}"
+    );
+}
+
+#[test]
+fn health_and_subagent_output_recovery_use_configured_fixture_roots() {
+    let temp = TempDir::new().expect("tempdir");
+    let (parent, subagents, _, _) = materialize_recovery_fixtures(temp.path());
+    let configuration =
+        transcript_only_configuration(&temp.path().join("store"), parent, subagents);
+    let runtime_configuration = match RuntimeConfiguration::validate_from_meta(&configuration) {
+        RuntimeConfigurationValidation::Accepted(configuration) => configuration,
+        other => panic!("expected accepted configuration, got {other:?}"),
+    };
+    let nexus = NexusPlane::with_runtime_configuration(
+        runtime_configuration,
+        CollectionClock::fixed(
+            ReferenceTime::from_timestamp(Timestamp::new("2026-07-05T13:00:00Z"))
+                .expect("reference time"),
+        ),
+    );
+
+    let health = nexus
+        .observe_health(RuntimeHealthRequest {
+            request_identifier: RequestIdentifier::new("health-fixture"),
+        })
+        .expect("health observed");
+    assert!(
+        health
+            .sources
+            .iter()
+            .any(|source| source.source == SourceKind::ClaudeSubagentOutput
+                && source.status == SourceHealthStatus::ReadableIndexed),
+        "configured Claude subagent .output fixture should be indexed: {health:?}"
+    );
+
+    let sessions = nexus
+        .list_sessions(SessionListRequest {
+            request_identifier: RequestIdentifier::new("sessions-fixture"),
+            filter: SessionListFilter {
+                source_selection: SourceSelection::AllConfigured,
+                time_window: None,
+            },
+            page: PageRequest {
+                limit: PageLimit::new(10),
+                cursor: None,
+                order: ListingOrder::NewestFirst,
+            },
+        })
+        .expect("sessions");
+    assert_eq!(
+        sessions.sessions.len(),
+        1,
+        "parent task and .output should merge"
+    );
+
+    let subagents = nexus
+        .list_subagents(SubagentListRequest {
+            request_identifier: RequestIdentifier::new("subagents-fixture"),
+            filter: SubagentListFilter {
+                session_reference: sessions.sessions[0].reference.clone(),
+                authored_status: AuthoredStatusFilter::AnyAuthoredStatus,
+                task_identifier: None,
+            },
+            page: PageRequest {
+                limit: PageLimit::new(10),
+                cursor: None,
+                order: ListingOrder::NewestFirst,
+            },
+        })
+        .expect("subagents");
+    assert_eq!(subagents.subagents[0].name.as_str(), "writer");
+    assert_eq!(
+        subagents.subagents[0]
+            .task
+            .as_ref()
+            .expect("task metadata")
+            .task_identifier
+            .as_str(),
+        "task-1"
+    );
+
+    let search = nexus
+        .search_transcript_blocks(TranscriptBlockSearchRequest {
+            request_identifier: RequestIdentifier::new("search-fixture"),
+            filter: transcript_block_filter(TranscriptBlockKindSelection::AllTranscriptBlockKinds),
+            query: TranscriptBlockTextQuery::new(TextQuery::Contains(QueryTerm::word("quota"))),
+            page: PageRequest {
+                limit: PageLimit::new(10),
+                cursor: None,
+                order: ListingOrder::NewestFirst,
+            },
+            projection: CardProjection::MetadataOnly,
+        })
+        .expect("search");
+    assert_eq!(search.matches.len(), 1);
+    let read = nexus
+        .read_transcript_block(TranscriptBlockReadRequest {
+            request_identifier: RequestIdentifier::new("read-fixture"),
+            block_reference: search.matches[0].card.reference.clone(),
+            maximum_bytes: ByteLimit::new(256),
+        })
+        .expect("read block");
+    assert!(read.excerpt.text.as_str().contains("quota"));
+}
+
+#[test]
+fn health_distinguishes_empty_and_malformed_fixture_roots() {
+    let temp = TempDir::new().expect("tempdir");
+    let (_, _, empty, malformed) = materialize_recovery_fixtures(temp.path());
+    let mut configuration = ConfigurationFixture::minimal();
+    configuration.store_path = FilesystemPath::new(temp.path().join("store").display().to_string());
+    configuration.active_repositories = Vec::new();
+    configuration.transcript_sources = vec![
+        TranscriptSource::Claude(TranscriptRoot {
+            path: FilesystemPath::new(empty),
+        }),
+        TranscriptSource::Claude(TranscriptRoot {
+            path: FilesystemPath::new(malformed),
+        }),
+    ];
+    let runtime_configuration = match RuntimeConfiguration::validate_from_meta(&configuration) {
+        RuntimeConfigurationValidation::Accepted(configuration) => configuration,
+        other => panic!("expected accepted configuration, got {other:?}"),
+    };
+    let health = NexusPlane::with_runtime_configuration(
+        runtime_configuration,
+        CollectionClock::fixed(
+            ReferenceTime::from_timestamp(Timestamp::new("2026-07-05T13:00:00Z"))
+                .expect("reference time"),
+        ),
+    )
+    .observe_health(RuntimeHealthRequest {
+        request_identifier: RequestIdentifier::new("health-empty-malformed"),
+    })
+    .expect("health");
+    assert!(
+        health
+            .sources
+            .iter()
+            .any(|source| source.status == SourceHealthStatus::ReadableEmpty)
+    );
+    assert!(
+        health
+            .sources
+            .iter()
+            .any(|source| source.status == SourceHealthStatus::MalformedRecords)
+    );
 }

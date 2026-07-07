@@ -419,6 +419,17 @@ impl OrdinaryRequestHandler {
     pub fn handle(&self, request: AggregatorRequest) -> AggregatorReply {
         match request {
             AggregatorRequest::Version(_) => self.signal.version_report(),
+            AggregatorRequest::ObserveHealth(request) => {
+                match self
+                    .nexus_for_operation(&request.request_identifier, OperationKind::ObserveHealth)
+                {
+                    Ok(nexus) => match nexus.observe_health(request) {
+                        Ok(reply) => AggregatorReply::RuntimeHealthObserved(reply),
+                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    },
+                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                }
+            }
             AggregatorRequest::Collect(request) => self.handle_collect(request),
             AggregatorRequest::ListSessions(request) => {
                 match self

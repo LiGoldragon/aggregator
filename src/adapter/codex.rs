@@ -469,6 +469,7 @@ impl<'a> CodexJsonlRecord<'a> {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodexJsonlRecordResult {
     Record(TranscriptRecord),

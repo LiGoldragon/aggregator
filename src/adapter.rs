@@ -9,10 +9,11 @@ use serde_json::Value;
 use signal_aggregator::{
     AuthoredStatus, ByteCount, ByteLimit, ByteRange, FilesystemPath, ItemCount, LimitPolicy,
     LineNumber, LineRange, OutputTitle, Projection, ReadFailure, ReadFailureReason,
-    SegmentProjection, SourceIdentifier, SourceKind, SourceVolume, SubagentName, TimeWindow,
-    Timestamp, TranscriptBlockKind, TranscriptBlockTextAvailability, TranscriptSegment,
-    TranscriptSegmentIdentifier, TranscriptText, TranscriptTextExcerpt, Truncation,
-    TruncationReason,
+    SegmentProjection, SessionIdentifier, SourceHealthStatus, SourceIdentifier, SourceKind,
+    SourceLocator, SourceVolume, SubagentName, SubagentTaskMetadata, TaskIdentifier, TaskResult,
+    TaskTitle, TimeWindow, Timestamp, ToolUseIdentifier, TranscriptBlockKind,
+    TranscriptBlockTextAvailability, TranscriptSegment, TranscriptSegmentIdentifier,
+    TranscriptText, TranscriptTextExcerpt, Truncation, TruncationReason, UsageSummary,
 };
 
 use crate::time_model::CanonicalTimestamp;
@@ -22,6 +23,7 @@ pub enum AdapterKind {
     ClaudeTranscript,
     CodexTranscript,
     PiTranscript,
+    ClaudeSubagentOutput,
     Repository,
 }
 
@@ -31,6 +33,7 @@ impl AdapterKind {
             Self::ClaudeTranscript => "claude-transcript",
             Self::CodexTranscript => "codex-transcript",
             Self::PiTranscript => "pi-transcript",
+            Self::ClaudeSubagentOutput => "claude-subagent-output",
             Self::Repository => "repository",
         }
     }
@@ -244,6 +247,8 @@ pub struct TranscriptRecord {
     pub title: Option<OutputTitle>,
     pub subagent_name: Option<SubagentName>,
     pub authored_status: AuthoredStatus,
+    pub session_identifier: Option<SessionIdentifier>,
+    pub task_metadata: Option<SubagentTaskMetadata>,
     pub blocks: Vec<TranscriptBlockRecord>,
 }
 
@@ -266,6 +271,8 @@ impl TranscriptRecord {
             title: None,
             subagent_name: None,
             authored_status: AuthoredStatus::AgentAuthored,
+            session_identifier: None,
+            task_metadata: None,
             blocks: Vec::new(),
         }
     }
@@ -282,6 +289,19 @@ impl TranscriptRecord {
 
     pub fn with_authored_status(mut self, authored_status: AuthoredStatus) -> Self {
         self.authored_status = authored_status;
+        self
+    }
+
+    pub fn with_task_metadata(mut self, task_metadata: Option<SubagentTaskMetadata>) -> Self {
+        self.task_metadata = task_metadata;
+        self
+    }
+
+    pub fn with_session_identifier(
+        mut self,
+        session_identifier: Option<SessionIdentifier>,
+    ) -> Self {
+        self.session_identifier = session_identifier;
         self
     }
 
@@ -305,6 +325,7 @@ impl TranscriptRecord {
             .readable_block(0, TranscriptBlockKind::AgentResponse, self.text.clone())
             .with_title(self.title.clone())
             .with_subagent_name(self.subagent_name.clone())
+            .with_task_metadata(self.task_metadata.clone())
             .with_authored_status(self.authored_status),
         ]
     }
@@ -385,6 +406,7 @@ impl TranscriptBlockSourceContext {
             title: None,
             subagent_name: None,
             authored_status: AuthoredStatus::UnknownAuthorship,
+            task_metadata: None,
         }
     }
 
@@ -406,6 +428,7 @@ impl TranscriptBlockSourceContext {
             title: None,
             subagent_name: None,
             authored_status: AuthoredStatus::UnknownAuthorship,
+            task_metadata: None,
         }
     }
 }
@@ -424,6 +447,7 @@ pub struct TranscriptBlockRecord {
     pub title: Option<OutputTitle>,
     pub subagent_name: Option<SubagentName>,
     pub authored_status: AuthoredStatus,
+    pub task_metadata: Option<SubagentTaskMetadata>,
 }
 
 impl TranscriptBlockRecord {
@@ -442,10 +466,16 @@ impl TranscriptBlockRecord {
         self
     }
 
+    pub fn with_task_metadata(mut self, task_metadata: Option<SubagentTaskMetadata>) -> Self {
+        self.task_metadata = task_metadata;
+        self
+    }
+
     pub fn with_metadata(mut self, metadata: &TranscriptJsonMetadata<'_>) -> Self {
         self.title = metadata.title();
         self.subagent_name = metadata.subagent_name();
         self.authored_status = metadata.authored_status();
+        self.task_metadata = metadata.task_metadata();
         self
     }
 
@@ -591,7 +621,86 @@ impl<'a> TranscriptJsonMetadata<'a> {
 
     pub fn subagent_name(&self) -> Option<SubagentName> {
         self.string_field(&["subagent", "subagent_name", "agent_name"])
+            .or_else(|| self.task_input_string_field(&["subagent_type", "agent_type"]))
             .map(SubagentName::new)
+    }
+
+    pub fn task_metadata(&self) -> Option<SubagentTaskMetadata> {
+        let task_identifier = self
+            .string_field(&["task_identifier", "task_id", "id"])
+            .or_else(|| self.tool_use_identifier_value())?;
+        Some(SubagentTaskMetadata {
+            task_identifier: TaskIdentifier::new(task_identifier),
+            title: self
+                .string_field(&["task_title", "title", "description"])
+                .or_else(|| self.task_input_string_field(&["description", "title"]))
+                .map(TaskTitle::new),
+            tool_use_identifier: self.tool_use_identifier_value().map(ToolUseIdentifier::new),
+            output_locator: self.output_locator(),
+            source_status: SourceHealthStatus::ReadableIndexed,
+            result: self
+                .string_field(&["result", "status"])
+                .map(TaskResult::new),
+            usage: self.usage_summary(),
+            duration: None,
+        })
+    }
+
+    pub fn output_locator(&self) -> Option<SourceLocator> {
+        self.string_field(&["output_path", "output_file", "file_path"])
+            .or_else(|| self.task_input_string_field(&["output_path", "output_file", "file_path"]))
+            .map(|path| SourceLocator {
+                root: FilesystemPath::new(path),
+                relative_path: None,
+            })
+    }
+
+    pub fn usage_summary(&self) -> Option<UsageSummary> {
+        self.string_field(&["usage", "usage_summary"])
+            .map(UsageSummary::new)
+            .or_else(|| {
+                self.value
+                    .get("usage")
+                    .filter(|value| value.is_object())
+                    .map(|value| UsageSummary::new(value.to_string()))
+            })
+    }
+
+    pub fn tool_use_identifier_value(&self) -> Option<&'a str> {
+        self.string_field(&["tool_use_id", "tool_use_identifier"])
+            .or_else(|| {
+                self.value
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .find(|item| {
+                        item.get("type")
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| value == "tool_use")
+                            && item
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .is_some_and(|value| value == "Task")
+                    })
+                    .and_then(|item| item.get("id").and_then(Value::as_str))
+            })
+    }
+
+    pub fn task_input_string_field(&self, names: &[&str]) -> Option<&'a str> {
+        self.value
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|item| item.get("name").and_then(Value::as_str) == Some("Task"))
+            .filter_map(|item| item.get("input"))
+            .find_map(|input| {
+                names
+                    .iter()
+                    .find_map(|name| input.get(*name).and_then(Value::as_str))
+            })
+            .filter(|value| !value.trim().is_empty())
     }
 
     pub fn authored_status(&self) -> AuthoredStatus {
@@ -1172,7 +1281,7 @@ impl TranscriptFileDiscovery {
                 self.collect_jsonl_files(&path, state)?;
             } else if path
                 .extension()
-                .is_some_and(|extension| extension == "jsonl")
+                .is_some_and(|extension| extension == "jsonl" || extension == "output")
             {
                 state.observe_jsonl_file(path);
             }

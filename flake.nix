@@ -27,8 +27,9 @@
         examplesFilter = path: _type: builtins.match ".*/examples(/.*)?$" path != null;
         schemaFilter = path: _type: builtins.match ".*/schema(/.*)?$" path != null;
         generatedFilter = path: _type: builtins.match ".*/generated(/.*)?$" path != null;
+        testFixtureFilter = path: _type: pkgs.lib.hasInfix "/tests/fixtures" path;
         sourceFilter = path: type:
-          (craneLib.filterCargoSources path type) || (examplesFilter path type) || (schemaFilter path type) || (generatedFilter path type);
+          (craneLib.filterCargoSources path type) || (examplesFilter path type) || (schemaFilter path type) || (generatedFilter path type) || (testFixtureFilter path type);
         src = pkgs.lib.cleanSourceWith { src = ./.; filter = sourceFilter; name = "source"; };
         commonArgs = { inherit src; strictDeps = true; };
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
