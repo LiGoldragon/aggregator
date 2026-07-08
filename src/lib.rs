@@ -8,7 +8,9 @@ pub mod client;
 pub mod clock;
 pub mod configuration;
 pub mod daemon;
+pub mod derived_paths;
 pub mod error;
+pub mod local_default_configuration;
 pub mod nexus;
 pub mod output_index;
 pub mod sema;
@@ -27,7 +29,13 @@ pub use configuration::{
     TranscriptAdapterConfiguration, TranscriptRootConfiguration,
 };
 pub use daemon::AggregatorDaemonCommand;
+pub use derived_paths::{
+    ClaudeNativeSubagentOutputRoot, ClaudeProjectPathComponent, ClaudeProjectTranscriptRoot,
+    HomeDirectory, PiTintinwebCwdComponent, PiTintinwebSubagentOutputRoot, TemporaryDirectory,
+    UserIdentifier, WorkspacePath,
+};
 pub use error::{Error, Result};
+pub use local_default_configuration::LocalDefaultConfigurationRequest;
 pub use nexus::NexusPlane;
 pub use output_index::{FragileIndexStore, OutputInterfaceRuntime};
 pub use sema::SemaPlane;
