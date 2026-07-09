@@ -204,6 +204,13 @@ impl RuntimeConfiguration {
         &self.output_interfaces
     }
 
+    pub fn archive_root_path(&self) -> PathBuf {
+        self.store_path
+            .parent()
+            .map(|parent| parent.join("session-archive"))
+            .unwrap_or_else(|| PathBuf::from("session-archive"))
+    }
+
     pub fn select_sources(&self, selection: &SourceSelection) -> RuntimeSourceSelection {
         RuntimeSourceSelector::new(self).select(selection)
     }

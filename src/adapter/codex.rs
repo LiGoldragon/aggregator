@@ -66,23 +66,25 @@ impl CodexSessionRootReader {
     pub fn read_records(&self) -> TranscriptRawReadOutcome {
         let source_identifier = self.source_identifier();
         if !self.root.exists() {
-            return TranscriptRawReadOutcome::new(
+            return TranscriptRawReadOutcome::with_discovered_file_count(
                 SourceKind::Codex,
                 source_identifier.clone(),
                 Vec::new(),
                 Vec::new(),
                 vec![self.failure(ReadFailureReason::Missing, Some(self.root.clone()))],
+                0,
             );
         }
         let session_files = match self.session_files() {
             Ok(session_files) => session_files,
             Err(error) => {
-                return TranscriptRawReadOutcome::new(
+                return TranscriptRawReadOutcome::with_discovered_file_count(
                     SourceKind::Codex,
                     source_identifier.clone(),
                     Vec::new(),
                     Vec::new(),
                     vec![self.failure_from_io(error, Some(self.root.clone()))],
+                    0,
                 );
             }
         };
@@ -96,6 +98,7 @@ impl CodexSessionRootReader {
             failures.push(failure);
         }
         let mut truncations = session_files.truncations;
+        let discovered_files = session_files.files.len() as u64;
         for file in session_files.files {
             match TranscriptBoundedFile::new(file.clone(), self.limits.clone()).read_to_string() {
                 Ok(TranscriptBoundedFileRead::Text(text)) => self.read_file_lines(
@@ -113,12 +116,13 @@ impl CodexSessionRootReader {
         }
         let failure_outcome = failures.finish();
         truncations.extend(failure_outcome.truncations);
-        TranscriptRawReadOutcome::new(
+        TranscriptRawReadOutcome::with_discovered_file_count(
             SourceKind::Codex,
             source_identifier,
             records,
             truncations,
             failure_outcome.failures,
+            discovered_files,
         )
     }
 

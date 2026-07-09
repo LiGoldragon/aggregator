@@ -445,7 +445,7 @@ dependencies = [
 [[package]]
 name = "signal-aggregator"
 version = "0.5.0"
-source = "git+https://github.com/LiGoldragon/signal-aggregator?branch=main#ae923f9a61ff8d49deea86d9c5d4d79f39d8c7a9"
+source = "git+https://github.com/LiGoldragon/signal-aggregator?branch=main#2eccc8fc4bb54f1105d158656aa863fec686684e"
 dependencies = [
  "nota 0.5.1 (git+https://github.com/LiGoldragon/nota-next.git?branch=main)",
  "nota-text-query",

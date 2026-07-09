@@ -66,12 +66,13 @@ impl PiRunHistoryRootReader {
     pub fn read_records(&self) -> TranscriptRawReadOutcome {
         let source_identifier = self.source_identifier();
         if !self.root.exists() {
-            return TranscriptRawReadOutcome::new(
+            return TranscriptRawReadOutcome::with_discovered_file_count(
                 SourceKind::Pi,
                 source_identifier.clone(),
                 Vec::new(),
                 Vec::new(),
                 vec![self.failure(ReadFailureReason::Missing, Some(self.root.clone()))],
+                0,
             );
         }
         let discovery =
@@ -80,12 +81,13 @@ impl PiRunHistoryRootReader {
             {
                 Ok(discovery) => discovery,
                 Err(error) => {
-                    return TranscriptRawReadOutcome::new(
+                    return TranscriptRawReadOutcome::with_discovered_file_count(
                         SourceKind::Pi,
                         source_identifier.clone(),
                         Vec::new(),
                         Vec::new(),
                         vec![self.failure_from_io(error, Some(self.root.clone()))],
+                        0,
                     );
                 }
             };
@@ -103,6 +105,7 @@ impl PiRunHistoryRootReader {
             .into_iter()
             .map(|truncation| truncation.into_truncation(SourceKind::Pi))
             .collect::<Vec<_>>();
+        let discovered_files = discovery.files.len() as u64;
         for file in discovery.files {
             match TranscriptBoundedFile::new(file.clone(), self.limits.clone()).read_to_string() {
                 Ok(TranscriptBoundedFileRead::Text(text)) => self.read_file_lines(
@@ -120,12 +123,13 @@ impl PiRunHistoryRootReader {
         }
         let failure_outcome = failures.finish();
         truncations.extend(failure_outcome.truncations);
-        TranscriptRawReadOutcome::new(
+        TranscriptRawReadOutcome::with_discovered_file_count(
             SourceKind::Pi,
             source_identifier,
             records,
             truncations,
             failure_outcome.failures,
+            discovered_files,
         )
     }
 

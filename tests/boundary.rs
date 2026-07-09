@@ -944,7 +944,7 @@ fn session_inventory_lookup_and_archive_round_trip_through_rkyv_store() {
             .expect("reference timestamp"),
     );
     let nexus = NexusPlane::with_runtime_configuration(runtime, clock);
-    let archive_path = ArchivePath::new(root.path().join("archive.rkyv").display().to_string());
+    let archive_path = ArchivePath::new("archive.rkyv");
 
     let inventory = nexus
         .inventory_sessions(SessionInventoryRequest {
@@ -992,6 +992,23 @@ fn session_inventory_lookup_and_archive_round_trip_through_rkyv_store() {
         })
         .expect("write archive");
 
+    let duplicate_written = nexus
+        .write_session_archive(SessionArchiveWriteRequest {
+            request_identifier: RequestIdentifier::new("write-archive-duplicate"),
+            archive_path: archive_path.clone(),
+            record: SessionArchiveRecordDraft {
+                session: inventory.sessions[0].clone(),
+                summary: ArchiveSummaryText::new("summary may include a direct quote"),
+                provenance: ArchiveProvenanceText::new("bounded transcript read references"),
+                created_at: Timestamp::new("2026-01-02T01:10:00Z"),
+            },
+        })
+        .expect("write duplicate archive record");
+    assert_ne!(
+        written.card.record_identifier,
+        duplicate_written.card.record_identifier
+    );
+
     let queried = nexus
         .query_session_archive(SessionArchiveQueryRequest {
             request_identifier: RequestIdentifier::new("query-archive"),
@@ -999,7 +1016,10 @@ fn session_inventory_lookup_and_archive_round_trip_through_rkyv_store() {
             session_reference: Some(inventory.sessions[0].reference.clone()),
         })
         .expect("query archive");
-    assert_eq!(queried.records, vec![written.card.clone()]);
+    assert_eq!(
+        queried.records,
+        vec![written.card.clone(), duplicate_written.card.clone()]
+    );
 
     let read = nexus
         .read_session_archive(SessionArchiveReadRequest {
@@ -1022,6 +1042,65 @@ fn session_inventory_lookup_and_archive_round_trip_through_rkyv_store() {
     assert_eq!(
         read.record.provenance.text.as_str(),
         "bounded transcript read references"
+    );
+}
+
+#[test]
+fn session_archive_rejects_paths_outside_daemon_local_archive_root() {
+    let root = TempDir::new().expect("temporary root");
+    let configuration = accepted_configuration(&root);
+    fs::write(
+        root.path().join("claude/session.jsonl"),
+        "{\"timestamp\":\"2026-01-02T00:10:00Z\",\"title\":\"first\",\"sessionId\":\"session-uuid-1\",\"role\":\"assistant\",\"text\":\"alpha one\"}\n",
+    )
+    .expect("write transcript");
+    let runtime = RuntimeConfiguration::validate_from_meta(&configuration)
+        .accepted_configuration()
+        .expect("accepted configuration")
+        .clone();
+    let clock = CollectionClock::fixed(
+        ReferenceTime::from_timestamp(Timestamp::new("2026-01-02T01:00:00Z"))
+            .expect("reference timestamp"),
+    );
+    let nexus = NexusPlane::with_runtime_configuration(runtime, clock);
+    let inventory = nexus
+        .inventory_sessions(SessionInventoryRequest {
+            request_identifier: RequestIdentifier::new("inventory-for-archive-rejection"),
+            source_selection: SourceSelection::Only(SelectedSources {
+                sources: vec![SourceKind::Claude],
+            }),
+            archive_path: None,
+        })
+        .expect("inventory sessions");
+    let rejected = nexus
+        .write_session_archive(SessionArchiveWriteRequest {
+            request_identifier: RequestIdentifier::new("write-outside-archive-root"),
+            archive_path: ArchivePath::new(root.path().join("outside.rkyv").display().to_string()),
+            record: SessionArchiveRecordDraft {
+                session: inventory.sessions[0].clone(),
+                summary: ArchiveSummaryText::new("summary"),
+                provenance: ArchiveProvenanceText::new("provenance"),
+                created_at: Timestamp::new("2026-01-02T01:10:00Z"),
+            },
+        })
+        .expect_err("outside archive path must be rejected");
+    assert_eq!(rejected.reason, OperationRejectionReason::Unauthorized);
+
+    let archive_root = root.path().join("session-archive");
+    fs::create_dir_all(&archive_root).expect("archive root");
+    let outside = root.path().join("outside-symlink-target.rkyv");
+    fs::write(&outside, "not an archive").expect("outside target");
+    symlink(&outside, archive_root.join("linked.rkyv")).expect("archive symlink");
+    let symlink_rejected = nexus
+        .query_session_archive(SessionArchiveQueryRequest {
+            request_identifier: RequestIdentifier::new("query-symlink-archive"),
+            archive_path: ArchivePath::new("linked.rkyv"),
+            session_reference: None,
+        })
+        .expect_err("archive symlink must be rejected");
+    assert_eq!(
+        symlink_rejected.reason,
+        OperationRejectionReason::Unauthorized
     );
 }
 
@@ -2933,27 +3012,42 @@ fn health_distinguishes_empty_and_malformed_fixture_roots() {
         RuntimeConfigurationValidation::Accepted(configuration) => configuration,
         other => panic!("expected accepted configuration, got {other:?}"),
     };
-    let health = NexusPlane::with_runtime_configuration(
+    let nexus = NexusPlane::with_runtime_configuration(
         runtime_configuration,
         CollectionClock::fixed(
             ReferenceTime::from_timestamp(Timestamp::new("2026-07-05T13:00:00Z"))
                 .expect("reference time"),
         ),
-    )
-    .observe_health(RuntimeHealthRequest {
-        request_identifier: RequestIdentifier::new("health-empty-malformed"),
-    })
-    .expect("health");
+    );
+    let health = nexus
+        .observe_health(RuntimeHealthRequest {
+            request_identifier: RequestIdentifier::new("health-empty-malformed"),
+        })
+        .expect("health");
     assert!(
         health
             .sources
             .iter()
             .any(|source| source.status == SourceHealthStatus::ReadableEmpty)
     );
-    assert!(
-        health
-            .sources
-            .iter()
-            .any(|source| source.status == SourceHealthStatus::MalformedRecords)
+    assert!(health.sources.iter().any(|source| source.status
+        == SourceHealthStatus::MalformedRecords
+        && source.discovered_files.into_u64() == 1
+        && source.malformed_records.into_u64() > 0));
+
+    let inventory = nexus
+        .inventory_sessions(SessionInventoryRequest {
+            request_identifier: RequestIdentifier::new("inventory-empty-malformed"),
+            source_selection: SourceSelection::AllConfigured,
+            archive_path: None,
+        })
+        .expect("inventory");
+    assert_eq!(
+        inventory.scan_report.completeness,
+        SessionInventoryCompleteness::Resumable
     );
+    assert!(inventory.scan_report.sources.iter().any(|source| {
+        source.completeness == SessionInventoryCompleteness::Resumable
+            && source.discovered_files.into_u64() == 1
+    }));
 }

@@ -136,21 +136,34 @@ impl NexusPlane {
         &self,
         request: SessionArchiveWriteRequest,
     ) -> OutputOperationResult<SessionArchiveWritten> {
-        crate::SessionArchiveStore::new(request.archive_path.clone()).write_record(request)
+        let archive_root = self.archive_root_path(
+            &request.request_identifier,
+            OperationKind::WriteSessionArchive,
+        )?;
+        crate::SessionArchiveStore::new(archive_root, request.archive_path.clone())
+            .write_record(request)
     }
 
     pub fn query_session_archive(
         &self,
         request: SessionArchiveQueryRequest,
     ) -> OutputOperationResult<SessionArchiveQueried> {
-        crate::SessionArchiveStore::new(request.archive_path.clone()).query(request)
+        let archive_root = self.archive_root_path(
+            &request.request_identifier,
+            OperationKind::QuerySessionArchive,
+        )?;
+        crate::SessionArchiveStore::new(archive_root, request.archive_path.clone()).query(request)
     }
 
     pub fn read_session_archive(
         &self,
         request: SessionArchiveReadRequest,
     ) -> OutputOperationResult<SessionArchiveRead> {
-        crate::SessionArchiveStore::new(request.archive_path.clone()).read(request)
+        let archive_root = self.archive_root_path(
+            &request.request_identifier,
+            OperationKind::ReadSessionArchive,
+        )?;
+        crate::SessionArchiveStore::new(archive_root, request.archive_path.clone()).read(request)
     }
 
     pub fn list_sessions(
@@ -257,6 +270,20 @@ impl NexusPlane {
             configuration.clone(),
             self.clock.clone(),
         ))
+    }
+
+    pub fn archive_root_path(
+        &self,
+        request_identifier: &RequestIdentifier,
+        operation: OperationKind,
+    ) -> OutputOperationResult<std::path::PathBuf> {
+        let Some(configuration) = &self.runtime_configuration else {
+            return Err(
+                OperationRejectedFactory::new(request_identifier.clone(), operation)
+                    .rejected(OperationRejectionReason::Unsupported, None),
+            );
+        };
+        Ok(configuration.archive_root_path())
     }
 
     pub fn repository_command_policy(&self) -> RepositoryCommandPolicy {

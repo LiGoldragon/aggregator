@@ -151,7 +151,12 @@ impl OutputInterfaceRuntime {
             archive_path: archive_path.clone(),
             session_reference: None,
         };
-        match crate::SessionArchiveStore::new(archive_path.clone()).query(request) {
+        match crate::SessionArchiveStore::new(
+            self.configuration.archive_root_path(),
+            archive_path.clone(),
+        )
+        .query(request)
+        {
             Ok(reply) => reply
                 .records
                 .into_iter()
@@ -1166,7 +1171,7 @@ impl SourceHealthObserver {
                 relative_path: None,
             },
             status,
-            discovered_files: ItemCount::new(outcome.records.len() as u64),
+            discovered_files: ItemCount::new(outcome.discovered_files),
             indexed_records: ItemCount::new(outcome.records.len() as u64),
             malformed_records: ItemCount::new(malformed),
             unreadable_records: ItemCount::new(unreadable),
@@ -1374,9 +1379,10 @@ impl SourceHealthCompleteness {
             SourceHealthStatus::UnreadableRoot | SourceHealthStatus::IndexStoreUnreadable => {
                 SessionInventoryCompleteness::Failed
             }
-            SourceHealthStatus::ReadableEmpty
-            | SourceHealthStatus::ReadableIndexed
-            | SourceHealthStatus::MalformedRecords => SessionInventoryCompleteness::Complete,
+            SourceHealthStatus::MalformedRecords => SessionInventoryCompleteness::Resumable,
+            SourceHealthStatus::ReadableEmpty | SourceHealthStatus::ReadableIndexed => {
+                SessionInventoryCompleteness::Complete
+            }
         }
     }
 }
@@ -1394,9 +1400,8 @@ impl SourceCompletenessStatus {
     pub fn status(self) -> SourceHealthStatus {
         match self.completeness {
             SessionInventoryCompleteness::Complete => SourceHealthStatus::ReadableIndexed,
-            SessionInventoryCompleteness::Resumable | SessionInventoryCompleteness::Truncated => {
-                SourceHealthStatus::DiscoveryTruncated
-            }
+            SessionInventoryCompleteness::Resumable => SourceHealthStatus::MalformedRecords,
+            SessionInventoryCompleteness::Truncated => SourceHealthStatus::DiscoveryTruncated,
             SessionInventoryCompleteness::Failed => SourceHealthStatus::UnreadableRoot,
         }
     }

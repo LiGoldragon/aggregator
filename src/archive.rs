@@ -1,4 +1,7 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Component, Path, PathBuf},
+};
 
 use signal_aggregator::{
     ArchivePath, ArchiveRecordIdentifier, ArchiveSummaryText, ArchiveTextCompleteness, ByteCount,
@@ -10,6 +13,8 @@ use signal_aggregator::{
 };
 
 use crate::output_index::{OperationRejectedFactory, OutputOperationResult};
+
+pub const MAXIMUM_ARCHIVE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct SessionArchiveFile {
@@ -31,6 +36,23 @@ impl SessionArchiveFile {
 
     pub fn push(&mut self, record: SessionArchiveStoredRecord) {
         self.records.push(record);
+    }
+
+    pub fn next_record_identifier(&self) -> ArchiveRecordIdentifier {
+        let mut sequence = self.records.len() as u64 + 1;
+        loop {
+            let candidate = ArchiveRecordIdentifier::new(format!("archive-record-{sequence:016}"));
+            if !self.contains_record_identifier(&candidate) {
+                return candidate;
+            }
+            sequence += 1;
+        }
+    }
+
+    pub fn contains_record_identifier(&self, candidate: &ArchiveRecordIdentifier) -> bool {
+        self.records
+            .iter()
+            .any(|record| record.matches_record_identifier(candidate))
     }
 }
 
@@ -80,32 +102,20 @@ impl SessionArchiveStoredRecord {
         summary_limit: ByteLimit,
         provenance_limit: ByteLimit,
     ) -> SessionArchiveRecordProjection {
+        let summary = BoundedArchiveText::new(self.draft.summary.as_str(), summary_limit);
+        let provenance = BoundedArchiveText::new(self.draft.provenance.as_str(), provenance_limit);
         SessionArchiveRecordProjection {
             card: self.card(),
             session: self.draft.session.clone(),
             summary: SessionArchiveTextProjection {
-                text: ArchiveSummaryText::new(
-                    BoundedArchiveText::new(self.draft.summary.as_str(), summary_limit).text,
-                ),
-                byte_count: ByteCount::new(
-                    BoundedArchiveText::new(self.draft.summary.as_str(), summary_limit).byte_count,
-                ),
-                completeness: BoundedArchiveText::new(self.draft.summary.as_str(), summary_limit)
-                    .completeness,
+                text: ArchiveSummaryText::new(summary.text),
+                byte_count: ByteCount::new(summary.byte_count),
+                completeness: summary.completeness,
             },
             provenance: SessionArchiveProvenanceProjection {
-                text: signal_aggregator::ArchiveProvenanceText::new(
-                    BoundedArchiveText::new(self.draft.provenance.as_str(), provenance_limit).text,
-                ),
-                byte_count: ByteCount::new(
-                    BoundedArchiveText::new(self.draft.provenance.as_str(), provenance_limit)
-                        .byte_count,
-                ),
-                completeness: BoundedArchiveText::new(
-                    self.draft.provenance.as_str(),
-                    provenance_limit,
-                )
-                .completeness,
+                text: signal_aggregator::ArchiveProvenanceText::new(provenance.text),
+                byte_count: ByteCount::new(provenance.byte_count),
+                completeness: provenance.completeness,
             },
         }
     }
@@ -142,13 +152,15 @@ impl BoundedArchiveText {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionArchiveStore {
-    path: PathBuf,
+    archive_root: PathBuf,
+    archive_path: ArchivePath,
 }
 
 impl SessionArchiveStore {
-    pub fn new(path: ArchivePath) -> Self {
+    pub fn new(archive_root: impl Into<PathBuf>, path: ArchivePath) -> Self {
         Self {
-            path: PathBuf::from(path.as_str()),
+            archive_root: archive_root.into(),
+            archive_path: path,
         }
     }
 
@@ -156,19 +168,20 @@ impl SessionArchiveStore {
         &self,
         request: SessionArchiveWriteRequest,
     ) -> OutputOperationResult<SessionArchiveWritten> {
-        let mut file = self.read_or_empty(
+        let path = self.validated_path(
+            &request.request_identifier,
+            OperationKind::WriteSessionArchive,
+            ArchivePathAccess::CreateRoot,
+        )?;
+        let mut file = path.read_or_empty(
             &request.request_identifier,
             OperationKind::WriteSessionArchive,
         )?;
-        let record_identifier = ArchiveRecordIdentifier::new(format!(
-            "archive-record-{}-{}",
-            request.record.session.reference.as_str(),
-            request.record.created_at.as_str()
-        ));
+        let record_identifier = file.next_record_identifier();
         let stored = SessionArchiveStoredRecord::new(record_identifier, request.record);
         let card = stored.card();
         file.push(stored);
-        self.write_file(
+        path.write_file(
             &file,
             &request.request_identifier,
             OperationKind::WriteSessionArchive,
@@ -184,7 +197,12 @@ impl SessionArchiveStore {
         &self,
         request: SessionArchiveQueryRequest,
     ) -> OutputOperationResult<SessionArchiveQueried> {
-        let file = self.read_existing(
+        let path = self.validated_path(
+            &request.request_identifier,
+            OperationKind::QuerySessionArchive,
+            ArchivePathAccess::ExistingRoot,
+        )?;
+        let file = path.read_existing(
             &request.request_identifier,
             OperationKind::QuerySessionArchive,
         )?;
@@ -210,7 +228,12 @@ impl SessionArchiveStore {
         &self,
         request: SessionArchiveReadRequest,
     ) -> OutputOperationResult<SessionArchiveRead> {
-        let file = self.read_existing(
+        let path = self.validated_path(
+            &request.request_identifier,
+            OperationKind::ReadSessionArchive,
+            ArchivePathAccess::ExistingRoot,
+        )?;
+        let file = path.read_existing(
             &request.request_identifier,
             OperationKind::ReadSessionArchive,
         )?;
@@ -235,7 +258,198 @@ impl SessionArchiveStore {
         })
     }
 
-    fn read_or_empty(
+    pub fn validated_path(
+        &self,
+        request_identifier: &RequestIdentifier,
+        operation: OperationKind,
+        access: ArchivePathAccess,
+    ) -> OutputOperationResult<ArchiveFilePath> {
+        ArchivePathBoundary::new(self.archive_root.clone(), self.archive_path.clone())
+            .validated_file_path(request_identifier, operation, access)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchivePathAccess {
+    ExistingRoot,
+    CreateRoot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchivePathBoundary {
+    root: PathBuf,
+    requested: ArchivePath,
+}
+
+impl ArchivePathBoundary {
+    pub fn new(root: PathBuf, requested: ArchivePath) -> Self {
+        Self { root, requested }
+    }
+
+    pub fn validated_file_path(
+        &self,
+        request_identifier: &RequestIdentifier,
+        operation: OperationKind,
+        access: ArchivePathAccess,
+    ) -> OutputOperationResult<ArchiveFilePath> {
+        let root = self.canonical_root(request_identifier, operation, access)?;
+        let requested = PathBuf::from(self.requested.as_str());
+        if requested.as_os_str().is_empty() || self.has_forbidden_component(&requested) {
+            return Err(self.rejection(
+                request_identifier,
+                operation,
+                OperationRejectionReason::InvalidRequest,
+            ));
+        }
+        let candidate = if requested.is_absolute() {
+            requested
+        } else {
+            root.join(requested)
+        };
+        if self.has_symbolic_link(&candidate) {
+            return Err(self.rejection(
+                request_identifier,
+                operation,
+                OperationRejectionReason::Unauthorized,
+            ));
+        }
+        let Some(parent) = candidate.parent() else {
+            return Err(self.rejection(
+                request_identifier,
+                operation,
+                OperationRejectionReason::InvalidRequest,
+            ));
+        };
+        if matches!(access, ArchivePathAccess::CreateRoot) {
+            fs::create_dir_all(parent).map_err(|_| {
+                self.rejection(
+                    request_identifier,
+                    operation,
+                    OperationRejectionReason::Unsupported,
+                )
+            })?;
+        }
+        let parent = parent.canonicalize().map_err(|error| {
+            self.filesystem_rejection(request_identifier, operation, error.kind())
+        })?;
+        if !parent.starts_with(&root) {
+            return Err(self.rejection(
+                request_identifier,
+                operation,
+                OperationRejectionReason::Unauthorized,
+            ));
+        }
+        let Some(file_name) = candidate.file_name() else {
+            return Err(self.rejection(
+                request_identifier,
+                operation,
+                OperationRejectionReason::InvalidRequest,
+            ));
+        };
+        let path = parent.join(file_name);
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
+            if metadata.file_type().is_symlink() {
+                return Err(self.rejection(
+                    request_identifier,
+                    operation,
+                    OperationRejectionReason::Unauthorized,
+                ));
+            }
+            if metadata.is_dir() {
+                return Err(self.rejection(
+                    request_identifier,
+                    operation,
+                    OperationRejectionReason::InvalidRequest,
+                ));
+            }
+            let canonical = path.canonicalize().map_err(|error| {
+                self.filesystem_rejection(request_identifier, operation, error.kind())
+            })?;
+            if !canonical.starts_with(&root) {
+                return Err(self.rejection(
+                    request_identifier,
+                    operation,
+                    OperationRejectionReason::Unauthorized,
+                ));
+            }
+            return Ok(ArchiveFilePath::new(canonical));
+        }
+        Ok(ArchiveFilePath::new(path))
+    }
+
+    pub fn canonical_root(
+        &self,
+        request_identifier: &RequestIdentifier,
+        operation: OperationKind,
+        access: ArchivePathAccess,
+    ) -> OutputOperationResult<PathBuf> {
+        if matches!(access, ArchivePathAccess::CreateRoot) {
+            fs::create_dir_all(&self.root).map_err(|_| {
+                self.rejection(
+                    request_identifier,
+                    operation,
+                    OperationRejectionReason::Unsupported,
+                )
+            })?;
+        }
+        self.root
+            .canonicalize()
+            .map_err(|error| self.filesystem_rejection(request_identifier, operation, error.kind()))
+    }
+
+    pub fn has_forbidden_component(&self, path: &Path) -> bool {
+        path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::Prefix(_) | Component::RootDir
+            ) && !path.is_absolute()
+                || matches!(component, Component::ParentDir | Component::Prefix(_))
+        })
+    }
+
+    pub fn has_symbolic_link(&self, path: &Path) -> bool {
+        path.ancestors().any(|ancestor| {
+            fs::symlink_metadata(ancestor)
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(false)
+        })
+    }
+
+    pub fn filesystem_rejection(
+        &self,
+        request_identifier: &RequestIdentifier,
+        operation: OperationKind,
+        kind: std::io::ErrorKind,
+    ) -> OperationRejected {
+        let reason = match kind {
+            std::io::ErrorKind::NotFound => OperationRejectionReason::Missing,
+            std::io::ErrorKind::PermissionDenied => OperationRejectionReason::Unauthorized,
+            _ => OperationRejectionReason::Unsupported,
+        };
+        self.rejection(request_identifier, operation, reason)
+    }
+
+    pub fn rejection(
+        &self,
+        request_identifier: &RequestIdentifier,
+        operation: OperationKind,
+        reason: OperationRejectionReason,
+    ) -> OperationRejected {
+        OperationRejectedFactory::new(request_identifier.clone(), operation).rejected(reason, None)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveFilePath {
+    path: PathBuf,
+}
+
+impl ArchiveFilePath {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub fn read_or_empty(
         &self,
         request_identifier: &RequestIdentifier,
         operation: OperationKind,
@@ -246,43 +460,113 @@ impl SessionArchiveStore {
         self.read_existing(request_identifier, operation)
     }
 
-    fn read_existing(
+    pub fn read_existing(
         &self,
         request_identifier: &RequestIdentifier,
         operation: OperationKind,
     ) -> OutputOperationResult<SessionArchiveFile> {
-        let bytes = fs::read(&self.path)
-            .map_err(|_| self.archive_rejection(request_identifier, operation))?;
-        rkyv::from_bytes::<SessionArchiveFile, rkyv::rancor::Error>(&bytes)
-            .map_err(|_| self.archive_rejection(request_identifier, operation))
+        self.reject_oversized(request_identifier, operation)?;
+        let bytes = fs::read(&self.path).map_err(|error| {
+            self.filesystem_rejection(request_identifier, operation, error.kind())
+        })?;
+        rkyv::from_bytes::<SessionArchiveFile, rkyv::rancor::Error>(&bytes).map_err(|_| {
+            self.rejection(
+                request_identifier,
+                operation,
+                OperationRejectionReason::InvalidRequest,
+            )
+        })
     }
 
-    fn write_file(
+    pub fn write_file(
         &self,
         file: &SessionArchiveFile,
         request_identifier: &RequestIdentifier,
         operation: OperationKind,
     ) -> OutputOperationResult<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|_| self.archive_rejection(request_identifier, operation))?;
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(file).map_err(|_| {
+            self.rejection(
+                request_identifier,
+                operation,
+                OperationRejectionReason::Unsupported,
+            )
+        })?;
+        if bytes.len() as u64 > MAXIMUM_ARCHIVE_FILE_BYTES {
+            return Err(self.rejection(
+                request_identifier,
+                operation,
+                OperationRejectionReason::Oversized,
+            ));
         }
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(file)
-            .map_err(|_| self.archive_rejection(request_identifier, operation))?;
-        let temporary_path = self.path.with_extension("tmp");
-        fs::write(&temporary_path, bytes)
-            .map_err(|_| self.archive_rejection(request_identifier, operation))?;
-        fs::rename(&temporary_path, &self.path)
-            .map_err(|_| self.archive_rejection(request_identifier, operation))?;
+        let temporary_path = ArchiveTemporaryPath::new(self.path.clone()).path();
+        fs::write(&temporary_path, bytes).map_err(|error| {
+            self.filesystem_rejection(request_identifier, operation, error.kind())
+        })?;
+        fs::rename(&temporary_path, &self.path).map_err(|error| {
+            self.filesystem_rejection(request_identifier, operation, error.kind())
+        })?;
         Ok(())
     }
 
-    fn archive_rejection(
+    pub fn reject_oversized(
         &self,
         request_identifier: &RequestIdentifier,
         operation: OperationKind,
+    ) -> OutputOperationResult<()> {
+        let metadata = fs::metadata(&self.path).map_err(|error| {
+            self.filesystem_rejection(request_identifier, operation, error.kind())
+        })?;
+        if metadata.len() > MAXIMUM_ARCHIVE_FILE_BYTES {
+            return Err(self.rejection(
+                request_identifier,
+                operation,
+                OperationRejectionReason::Oversized,
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn filesystem_rejection(
+        &self,
+        request_identifier: &RequestIdentifier,
+        operation: OperationKind,
+        kind: std::io::ErrorKind,
     ) -> OperationRejected {
-        OperationRejectedFactory::new(request_identifier.clone(), operation)
-            .rejected(OperationRejectionReason::Unsupported, None)
+        let reason = match kind {
+            std::io::ErrorKind::NotFound => OperationRejectionReason::Missing,
+            std::io::ErrorKind::PermissionDenied => OperationRejectionReason::Unauthorized,
+            _ => OperationRejectionReason::Unsupported,
+        };
+        self.rejection(request_identifier, operation, reason)
+    }
+
+    pub fn rejection(
+        &self,
+        request_identifier: &RequestIdentifier,
+        operation: OperationKind,
+        reason: OperationRejectionReason,
+    ) -> OperationRejected {
+        OperationRejectedFactory::new(request_identifier.clone(), operation).rejected(reason, None)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveTemporaryPath {
+    path: PathBuf,
+}
+
+impl ArchiveTemporaryPath {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub fn path(&self) -> PathBuf {
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("archive.rkyv");
+        self.path
+            .with_file_name(format!(".{file_name}.{}.tmp", std::process::id()))
     }
 }

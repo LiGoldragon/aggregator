@@ -118,12 +118,13 @@ impl ClaudeJsonlRootReader {
     pub fn read_records(&self) -> TranscriptRawReadOutcome {
         let source_identifier = self.source_identifier();
         if !self.root.exists() {
-            return TranscriptRawReadOutcome::new(
+            return TranscriptRawReadOutcome::with_discovered_file_count(
                 self.source,
                 source_identifier.clone(),
                 Vec::new(),
                 Vec::new(),
                 vec![self.failure(ReadFailureReason::Missing, Some(self.root.clone()))],
+                0,
             );
         }
         let discovery = match TranscriptFileDiscovery::with_limits_and_file_shape(
@@ -135,12 +136,13 @@ impl ClaudeJsonlRootReader {
         {
             Ok(discovery) => discovery,
             Err(error) => {
-                return TranscriptRawReadOutcome::new(
+                return TranscriptRawReadOutcome::with_discovered_file_count(
                     self.source,
                     source_identifier.clone(),
                     Vec::new(),
                     Vec::new(),
                     vec![self.failure_from_io(error, Some(self.root.clone()))],
+                    0,
                 );
             }
         };
@@ -158,6 +160,7 @@ impl ClaudeJsonlRootReader {
             .into_iter()
             .map(|truncation| truncation.into_truncation(self.source))
             .collect::<Vec<_>>();
+        let discovered_files = discovery.files.len() as u64;
         for file in discovery.files {
             match TranscriptBoundedFile::new(file.clone(), self.limits.clone()).read_to_string() {
                 Ok(TranscriptBoundedFileRead::Text(text)) => self.read_file_lines(
@@ -175,12 +178,13 @@ impl ClaudeJsonlRootReader {
         }
         let failure_outcome = failures.finish();
         truncations.extend(failure_outcome.truncations);
-        TranscriptRawReadOutcome::new(
+        TranscriptRawReadOutcome::with_discovered_file_count(
             self.source,
             source_identifier,
             records,
             truncations,
             failure_outcome.failures,
+            discovered_files,
         )
     }
 

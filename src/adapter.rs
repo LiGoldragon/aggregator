@@ -4,6 +4,7 @@ pub mod pi;
 pub mod repository;
 
 use std::{
+    collections::BTreeSet,
     ffi::OsStr,
     path::{Path, PathBuf},
 };
@@ -152,6 +153,7 @@ pub struct TranscriptRawReadOutcome {
     pub records: Vec<TranscriptRecord>,
     pub truncations: Vec<Truncation>,
     pub read_failures: Vec<signal_aggregator::ReadFailure>,
+    pub discovered_files: u64,
 }
 
 impl TranscriptRawReadOutcome {
@@ -162,12 +164,33 @@ impl TranscriptRawReadOutcome {
         truncations: Vec<Truncation>,
         read_failures: Vec<signal_aggregator::ReadFailure>,
     ) -> Self {
+        let discovered_files =
+            TranscriptDiscoveredFiles::new(&records, &truncations, &read_failures).count();
+        Self::with_discovered_file_count(
+            source,
+            source_identifier,
+            records,
+            truncations,
+            read_failures,
+            discovered_files,
+        )
+    }
+
+    pub fn with_discovered_file_count(
+        source: SourceKind,
+        source_identifier: SourceIdentifier,
+        records: Vec<TranscriptRecord>,
+        truncations: Vec<Truncation>,
+        read_failures: Vec<signal_aggregator::ReadFailure>,
+        discovered_files: u64,
+    ) -> Self {
         Self {
             source,
             source_identifier,
             records,
             truncations,
             read_failures,
+            discovered_files,
         }
     }
 
@@ -190,6 +213,45 @@ impl TranscriptRawReadOutcome {
             self.truncations,
             request,
         )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptDiscoveredFiles<'a> {
+    records: &'a [TranscriptRecord],
+    truncations: &'a [Truncation],
+    read_failures: &'a [signal_aggregator::ReadFailure],
+}
+
+impl<'a> TranscriptDiscoveredFiles<'a> {
+    pub fn new(
+        records: &'a [TranscriptRecord],
+        truncations: &'a [Truncation],
+        read_failures: &'a [signal_aggregator::ReadFailure],
+    ) -> Self {
+        Self {
+            records,
+            truncations,
+            read_failures,
+        }
+    }
+
+    pub fn count(&self) -> u64 {
+        let mut paths = BTreeSet::new();
+        for record in self.records {
+            paths.insert(record.path.display().to_string());
+        }
+        for truncation in self.truncations {
+            if let Some(path) = &truncation.path {
+                paths.insert(path.as_str().to_string());
+            }
+        }
+        for failure in self.read_failures {
+            if let Some(path) = &failure.path {
+                paths.insert(path.as_str().to_string());
+            }
+        }
+        paths.len() as u64
     }
 }
 
