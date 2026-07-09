@@ -2132,6 +2132,43 @@ fn codex_adapter_honors_configured_discovery_limit() {
 }
 
 #[test]
+fn codex_adapter_honors_configured_index_discovery_limit() {
+    let root = TempDir::new().expect("temporary root");
+    let sessions = root.path().join("sessions");
+    fs::create_dir_all(&sessions).expect("sessions directory");
+    let mut index_text = String::new();
+    for index in 0..2 {
+        let session_name = format!("{index}.jsonl");
+        fs::write(
+            sessions.join(&session_name),
+            format!(
+                "{{\"timestamp\":\"2026-02-01T00:00:0{index}Z\",\"content\":\"codex {index}\"}}\n"
+            ),
+        )
+        .expect("write indexed codex fixture");
+        index_text.push_str(&format!("{{\"path\":\"sessions/{session_name}\"}}\n"));
+    }
+    fs::write(root.path().join("index.jsonl"), index_text).expect("write index");
+    let adapter = CodexTranscriptAdapter::new(
+        TranscriptRootConfiguration::new(root.path().to_path_buf())
+            .with_scan_limits(small_discovery_limits(1)),
+    );
+    let outcome = adapter.collect(&read_request(
+        TimeWindow::Since(Timestamp::new("2026-01-01T00:00:00Z")),
+        Projection::MetadataOnly,
+        8,
+    ));
+
+    assert_eq!(outcome.transcript_segments.len(), 1);
+    assert!(outcome.truncations.iter().any(|truncation| {
+        truncation
+            .path
+            .as_ref()
+            .is_some_and(|path| path.as_str().contains("sessions/1.jsonl"))
+    }));
+}
+
+#[test]
 fn codex_health_observation_reports_configured_discovery_limit() {
     let root = TempDir::new().expect("temporary root");
     for index in 0..2 {
@@ -2143,6 +2180,37 @@ fn codex_health_observation_reports_configured_discovery_limit() {
         )
         .expect("write codex fixture");
     }
+    let source = TranscriptAdapterConfiguration::Codex(
+        TranscriptRootConfiguration::new(root.path().to_path_buf())
+            .with_scan_limits(small_discovery_limits(1)),
+    );
+    let health = SourceHealthObserver::new(source).observe();
+
+    assert_eq!(health.status, SourceHealthStatus::DiscoveryTruncated);
+    assert_eq!(health.discovered_files.into_u64(), 1);
+    assert!(health.scan_limits.iter().any(|limit| {
+        limit.kind == ScanLimitKind::DiscoveredFiles && limit.limit.into_u64() == 1
+    }));
+}
+
+#[test]
+fn codex_health_observation_reports_configured_index_discovery_limit() {
+    let root = TempDir::new().expect("temporary root");
+    let sessions = root.path().join("sessions");
+    fs::create_dir_all(&sessions).expect("sessions directory");
+    let mut index_text = String::new();
+    for index in 0..2 {
+        let session_name = format!("{index}.jsonl");
+        fs::write(
+            sessions.join(&session_name),
+            format!(
+                "{{\"timestamp\":\"2026-02-01T00:00:0{index}Z\",\"content\":\"codex {index}\"}}\n"
+            ),
+        )
+        .expect("write indexed codex fixture");
+        index_text.push_str(&format!("{{\"path\":\"sessions/{session_name}\"}}\n"));
+    }
+    fs::write(root.path().join("index.jsonl"), index_text).expect("write index");
     let source = TranscriptAdapterConfiguration::Codex(
         TranscriptRootConfiguration::new(root.path().to_path_buf())
             .with_scan_limits(small_discovery_limits(1)),
@@ -2407,22 +2475,26 @@ fn pi_health_observation_reports_configured_discovery_limit() {
 }
 
 #[test]
-fn session_inventory_reports_configured_codex_and_pi_discovery_limits() {
+fn session_inventory_reports_configured_indexed_codex_and_pi_discovery_limits() {
     let root = TempDir::new().expect("temporary root");
     let repository = root.path().join("repository");
     let codex = root.path().join("codex");
     let pi = root.path().join("pi");
     fs::create_dir_all(&repository).expect("repository directory");
-    fs::create_dir_all(&codex).expect("codex directory");
+    let codex_sessions = codex.join("sessions");
+    fs::create_dir_all(&codex_sessions).expect("codex sessions directory");
     fs::create_dir_all(&pi).expect("pi directory");
+    let mut codex_index_text = String::new();
     for index in 0..2 {
+        let session_name = format!("{index}.jsonl");
         fs::write(
-            codex.join(format!("{index}.jsonl")),
+            codex_sessions.join(&session_name),
             format!(
                 "{{\"timestamp\":\"2026-02-01T00:00:0{index}Z\",\"content\":\"codex {index}\"}}\n"
             ),
         )
-        .expect("write codex fixture");
+        .expect("write indexed codex fixture");
+        codex_index_text.push_str(&format!("{{\"path\":\"sessions/{session_name}\"}}\n"));
         fs::write(
             pi.join(format!("run-history-{index}.jsonl")),
             format!(
@@ -2431,6 +2503,7 @@ fn session_inventory_reports_configured_codex_and_pi_discovery_limits() {
         )
         .expect("write pi fixture");
     }
+    fs::write(codex.join("index.jsonl"), codex_index_text).expect("write codex index");
     let output_interfaces = OutputInterfaceConfiguration {
         limits: OutputInterfaceLimitPolicy {
             maximum_transcript_discovered_files: ItemCount::new(1),
@@ -2481,6 +2554,10 @@ fn session_inventory_reports_configured_codex_and_pi_discovery_limits() {
         })
         .expect("inventory sessions");
 
+    assert_eq!(
+        inventory.scan_report.completeness,
+        SessionInventoryCompleteness::Truncated
+    );
     for source in [SourceKind::Codex, SourceKind::Pi] {
         let report = inventory
             .scan_report
@@ -2488,6 +2565,7 @@ fn session_inventory_reports_configured_codex_and_pi_discovery_limits() {
             .iter()
             .find(|report| report.source == source)
             .expect("source report");
+        assert_eq!(report.completeness, SessionInventoryCompleteness::Truncated);
         assert_eq!(report.discovered_files.into_u64(), 1);
         assert!(report.scan_limits.iter().any(|limit| {
             limit.kind == ScanLimitKind::DiscoveredFiles && limit.limit.into_u64() == 1

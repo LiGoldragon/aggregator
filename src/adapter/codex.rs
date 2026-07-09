@@ -10,10 +10,11 @@ use crate::{
     AdapterKind,
     adapter::{
         TranscriptBlockCollector, TranscriptBlockSourceContext, TranscriptBlockTextJoiner,
-        TranscriptBoundedFile, TranscriptBoundedFileRead, TranscriptFailureAccumulator,
-        TranscriptFileDiscovery, TranscriptJsonMetadata, TranscriptLineLocator, TranscriptLineText,
-        TranscriptLineTextOutcome, TranscriptRawReadOutcome, TranscriptReadOutcome,
-        TranscriptReadRequest, TranscriptRecord, TranscriptScanLimits,
+        TranscriptBoundedFile, TranscriptBoundedFileRead, TranscriptDiscoveryState,
+        TranscriptFailureAccumulator, TranscriptFileDiscovery, TranscriptJsonMetadata,
+        TranscriptLineLocator, TranscriptLineText, TranscriptLineTextOutcome,
+        TranscriptRawReadOutcome, TranscriptReadOutcome, TranscriptReadRequest, TranscriptRecord,
+        TranscriptScanLimits,
     },
     configuration::TranscriptRootConfiguration,
     time_model::CanonicalTimestamp,
@@ -246,7 +247,7 @@ impl CodexIndex {
     }
 
     pub fn session_files(&self) -> std::io::Result<CodexSessionFiles> {
-        let mut files = Vec::new();
+        let mut discovery_state = TranscriptDiscoveryState::new(self.limits.clone());
         let mut read_failures = TranscriptFailureAccumulator::new(
             SourceKind::Codex,
             Some(self.path.clone()),
@@ -279,7 +280,12 @@ impl CodexIndex {
                             match CodexIndexPath::new(self.root.clone(), path.clone())
                                 .session_path()
                             {
-                                Ok(path) => files.push(path),
+                                Ok(path) => {
+                                    discovery_state.observe_transcript_file(path);
+                                    if discovery_state.is_complete() {
+                                        break;
+                                    }
+                                }
                                 Err(error) => read_failures.push(self.read_failure(
                                     match error.kind() {
                                         std::io::ErrorKind::PermissionDenied => {
@@ -306,12 +312,19 @@ impl CodexIndex {
                 truncations.push(truncation.into_truncation(SourceKind::Codex));
             }
         }
-        files.sort();
+        let discovery_outcome = discovery_state.finish()?;
+        truncations.extend(
+            discovery_outcome
+                .truncations
+                .into_iter()
+                .map(|truncation| truncation.into_truncation(SourceKind::Codex)),
+        );
+        scan_limits.extend(discovery_outcome.scan_limits);
         let failure_outcome = read_failures.finish();
         truncations.extend(failure_outcome.truncations);
         scan_limits.extend(failure_outcome.scan_limits);
         Ok(CodexSessionFiles {
-            files,
+            files: discovery_outcome.files,
             read_failures: failure_outcome.failures,
             truncations,
             scan_limits,
