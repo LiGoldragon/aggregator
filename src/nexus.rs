@@ -319,8 +319,18 @@ impl NexusPlane {
                 ClaudeTranscriptAdapter::new(root).collect(request)
             }
             TranscriptAdapterConfiguration::ClaudeSubagentOutput(root) => {
-                crate::adapter::claude::ClaudeJsonlRootReader::subagent_output(
+                crate::adapter::claude::ClaudeJsonlRootReader::with_limits_and_source(
                     root.path().to_path_buf(),
+                    root.scan_limits().clone(),
+                    SourceKind::ClaudeSubagentOutput,
+                )
+                .collect(request)
+            }
+            TranscriptAdapterConfiguration::PiSubagentOutput(root) => {
+                crate::adapter::claude::ClaudeJsonlRootReader::with_limits_and_source(
+                    root.path().to_path_buf(),
+                    root.scan_limits().clone(),
+                    SourceKind::PiSubagentOutput,
                 )
                 .collect(request)
             }
@@ -421,6 +431,7 @@ impl SourceKindContactPoint {
             SourceKind::ClaudeSubagentOutput => Some(AdapterKind::ClaudeSubagentOutput),
             SourceKind::Codex => Some(AdapterKind::CodexTranscript),
             SourceKind::Pi => Some(AdapterKind::PiTranscript),
+            SourceKind::PiSubagentOutput => Some(AdapterKind::PiSubagentOutput),
             SourceKind::Repository => Some(AdapterKind::Repository),
         }
     }

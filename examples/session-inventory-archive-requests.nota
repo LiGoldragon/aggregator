@@ -1,5 +1,5 @@
 (InventorySessions (req-inventory AllConfigured (Some /tmp/aggregator-session-archive.rkyv)))
 (LookupSession (req-lookup (ByReference fragile-session-from-inventory) None))
-(WriteSessionArchive (req-archive-write /tmp/aggregator-session-archive.rkyv ((fragile-session-from-inventory Claude claude-source (Some producer-session-uuid) (/tmp/claude (Some session.jsonl)) 1 512 (Some 2026-01-02T00:00:00Z) (Some 2026-01-02T00:10:00Z) (Some 2026-01-02T00:00:00Z) (Some 2026-01-02T00:10:00Z) (Some 1) (Some 2) Current ReadableIndexed NotArchived) agent-authored-summary bounded-read-provenance 2026-01-02T00:20:00Z)))
+(WriteSessionArchive (req-archive-write /tmp/aggregator-session-archive.rkyv ((fragile-session-from-inventory MainSession Claude claude-source (Some producer-session-uuid) (/tmp/claude (Some session.jsonl)) 1 512 (Some 2026-01-02T00:00:00Z) (Some 2026-01-02T00:10:00Z) (Some 2026-01-02T00:00:00Z) (Some 2026-01-02T00:10:00Z) (Some 1) (Some 2) Current ReadableIndexed NotArchived) agent-authored-summary bounded-read-provenance 2026-01-02T00:20:00Z)))
 (QuerySessionArchive (req-archive-query /tmp/aggregator-session-archive.rkyv (Some fragile-session-from-inventory)))
 (ReadSessionArchive (req-archive-read /tmp/aggregator-session-archive.rkyv archive-record-from-query 1024 1024))

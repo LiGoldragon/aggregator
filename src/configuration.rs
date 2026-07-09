@@ -13,7 +13,7 @@ use signal_aggregator::{
     SourceKind, SourceSelection,
 };
 
-use crate::{Error, Result};
+use crate::{Error, Result, adapter::TranscriptScanLimits};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigurationStore {
@@ -274,6 +274,7 @@ pub enum TranscriptAdapterConfiguration {
     ClaudeSubagentOutput(TranscriptRootConfiguration),
     Codex(TranscriptRootConfiguration),
     Pi(TranscriptRootConfiguration),
+    PiSubagentOutput(TranscriptRootConfiguration),
 }
 
 impl TranscriptAdapterConfiguration {
@@ -283,6 +284,7 @@ impl TranscriptAdapterConfiguration {
             Self::ClaudeSubagentOutput(_) => SourceKind::ClaudeSubagentOutput,
             Self::Codex(_) => SourceKind::Codex,
             Self::Pi(_) => SourceKind::Pi,
+            Self::PiSubagentOutput(_) => SourceKind::PiSubagentOutput,
         }
     }
 
@@ -291,7 +293,8 @@ impl TranscriptAdapterConfiguration {
             Self::Claude(root)
             | Self::ClaudeSubagentOutput(root)
             | Self::Codex(root)
-            | Self::Pi(root) => root,
+            | Self::Pi(root)
+            | Self::PiSubagentOutput(root) => root,
         }
     }
 }
@@ -299,15 +302,28 @@ impl TranscriptAdapterConfiguration {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptRootConfiguration {
     path: PathBuf,
+    scan_limits: TranscriptScanLimits,
 }
 
 impl TranscriptRootConfiguration {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            scan_limits: TranscriptScanLimits::default_runtime(),
+        }
+    }
+
+    pub fn with_scan_limits(mut self, scan_limits: TranscriptScanLimits) -> Self {
+        self.scan_limits = scan_limits;
+        self
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn scan_limits(&self) -> &TranscriptScanLimits {
+        &self.scan_limits
     }
 }
 
@@ -469,6 +485,26 @@ impl<'a> RuntimeConfigurationValidator<'a> {
                 "maximum_recovery_files_per_root",
                 limits.maximum_recovery_files_per_root.into_u64() > 0,
             ),
+            (
+                "maximum_transcript_scan_entries",
+                limits.maximum_transcript_scan_entries.into_u64() > 0,
+            ),
+            (
+                "maximum_transcript_discovered_files",
+                limits.maximum_transcript_discovered_files.into_u64() > 0,
+            ),
+            (
+                "maximum_transcript_file_bytes",
+                limits.maximum_transcript_file_bytes.into_u64() > 0,
+            ),
+            (
+                "maximum_transcript_line_bytes",
+                limits.maximum_transcript_line_bytes.into_u64() > 0,
+            ),
+            (
+                "maximum_transcript_read_failures",
+                limits.maximum_transcript_read_failures.into_u64() > 0,
+            ),
         ] {
             if !accepted {
                 self.issues
@@ -546,6 +582,9 @@ impl<'a> RuntimeConfigurationValidator<'a> {
             TranscriptSource::Pi(root) => self
                 .transcript_root(root)
                 .map(TranscriptAdapterConfiguration::Pi),
+            TranscriptSource::PiSubagentOutput(root) => self
+                .transcript_root(root)
+                .map(TranscriptAdapterConfiguration::PiSubagentOutput),
         }
     }
 
@@ -555,7 +594,11 @@ impl<'a> RuntimeConfigurationValidator<'a> {
     ) -> Option<TranscriptRootConfiguration> {
         let path = PathBuf::from(root.path.as_str());
         if path.is_dir() {
-            Some(TranscriptRootConfiguration::new(path))
+            Some(TranscriptRootConfiguration::new(path).with_scan_limits(
+                TranscriptScanLimits::from_output_interface_limits(
+                    &self.configuration.output_interfaces.limits,
+                ),
+            ))
         } else {
             self.issues.push(ConfigurationIssue::unreadable_path(
                 root.path.clone(),

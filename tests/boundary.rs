@@ -49,7 +49,7 @@ use signal_aggregator::{
     OutputListFilter, OutputListRequest, OutputReadRange, OutputReadRequest,
     OutputSegmentListFilter, OutputSegmentListRequest, PageLimit, PageRequest, Projection,
     ReadFailureReason, RejectionReason, RelativeDuration, RepositoryIdentifier, RepositoryPath,
-    RepositoryWorktreeState, RequestIdentifier, RuntimeHealthRequest, SegmentLimit,
+    RepositoryWorktreeState, RequestIdentifier, RuntimeHealthRequest, ScanLimitKind, SegmentLimit,
     SegmentProjection, SelectedSources, SessionArchiveQueryRequest, SessionArchiveReadRequest,
     SessionArchiveRecordDraft, SessionArchiveStatus, SessionArchiveWriteRequest,
     SessionInventoryCompleteness, SessionInventoryRequest, SessionLifecycleStatus,
@@ -665,6 +665,49 @@ fn transcript_reader_caps_file_discovery_line_size_and_failure_reports() {
 }
 
 #[test]
+fn transcript_discovery_file_limit_is_configurable_and_reported() {
+    let root = TempDir::new().expect("temporary root");
+    for index in 0..3 {
+        fs::write(
+            root.path().join(format!("{index}.jsonl")),
+            format!(
+                "{{\"timestamp\":\"2026-01-02T00:00:0{index}Z\",\"text\":\"record {index}\"}}\n"
+            ),
+        )
+        .expect("write transcript fixture");
+    }
+    let limited = ClaudeJsonlRootReader::with_limits(
+        root.path().to_path_buf(),
+        TranscriptScanLimits::new(TranscriptScanLimitConfiguration::new(
+            MaximumScanEntries::new(16),
+            MaximumDiscoveredFiles::new(2),
+            MaximumFileBytes::new(4096),
+            MaximumLineBytes::new(1024),
+            MaximumReadFailures::new(8),
+        )),
+    )
+    .read_records();
+    assert_eq!(limited.discovered_files, 2);
+    assert!(limited.scan_limits.iter().any(|limit| {
+        limit.kind == ScanLimitKind::DiscoveredFiles && limit.limit.into_u64() == 2
+    }));
+
+    let raised = ClaudeJsonlRootReader::with_limits(
+        root.path().to_path_buf(),
+        TranscriptScanLimits::new(TranscriptScanLimitConfiguration::new(
+            MaximumScanEntries::new(16),
+            MaximumDiscoveredFiles::new(4),
+            MaximumFileBytes::new(4096),
+            MaximumLineBytes::new(1024),
+            MaximumReadFailures::new(8),
+        )),
+    )
+    .read_records();
+    assert_eq!(raised.discovered_files, 3);
+    assert!(raised.scan_limits.is_empty());
+}
+
+#[test]
 fn claude_reader_reports_symlinked_discovery_paths_that_escape_root_as_read_failure() {
     let root = TempDir::new().expect("temporary root");
     let outside_root = TempDir::new().expect("outside temporary root");
@@ -702,7 +745,7 @@ fn claude_reader_reports_symlinked_discovery_paths_that_escape_root_as_read_fail
 }
 
 #[test]
-fn claude_subagent_output_reader_reports_symlinked_output_paths_that_escape_root_as_read_failure() {
+fn claude_subagent_output_reader_follows_symlinked_output_files() {
     let root = TempDir::new().expect("temporary root");
     let outside_root = TempDir::new().expect("outside temporary root");
     let outside_file = outside_root.path().join("task.output");
@@ -720,12 +763,42 @@ fn claude_subagent_output_reader_reports_symlinked_output_paths_that_escape_root
             8,
         ));
 
-    assert_eq!(outcome.read_failures.len(), 1);
-    assert_eq!(
-        outcome.read_failures[0].reason,
-        ReadFailureReason::PermissionDenied
+    assert!(outcome.read_failures.is_empty());
+    assert_eq!(outcome.transcript_segments.len(), 1);
+    assert!(
+        outcome.transcript_segments[0]
+            .path
+            .as_str()
+            .contains("escape.output")
     );
-    assert!(outcome.transcript_segments.is_empty());
+}
+
+#[test]
+fn pi_subagent_output_reader_uses_output_files() {
+    let root = TempDir::new().expect("temporary root");
+    fs::write(
+        root.path().join("task.output"),
+        "{\"timestamp\":\"2026-02-01T00:00:00Z\",\"text\":\"pi tintinweb output\"}\n",
+    )
+    .expect("write output fixture");
+
+    let outcome = ClaudeJsonlRootReader::with_limits_and_source(
+        root.path().to_path_buf(),
+        TranscriptScanLimits::default_runtime(),
+        SourceKind::PiSubagentOutput,
+    )
+    .collect(&read_request(
+        TimeWindow::Since(Timestamp::new("2026-01-01T00:00:00Z")),
+        Projection::MetadataOnly,
+        8,
+    ));
+
+    assert!(outcome.read_failures.is_empty());
+    assert_eq!(outcome.transcript_segments.len(), 1);
+    assert_eq!(
+        outcome.transcript_segments[0].source,
+        SourceKind::PiSubagentOutput
+    );
 }
 
 #[test]

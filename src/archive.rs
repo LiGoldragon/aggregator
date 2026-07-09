@@ -697,7 +697,8 @@ mod tests {
     use signal_aggregator::{
         ArchiveProvenanceText, FilesystemPath, FragileSessionReference, ItemCount,
         RootRelativePath, SessionArchiveStatus, SessionIdentifier, SessionInventoryCard,
-        SessionLifecycleStatus, SourceHealthStatus, SourceIdentifier, SourceKind, SourceLocator,
+        SessionLifecycleStatus, SessionRole, SourceHealthStatus, SourceIdentifier, SourceKind,
+        SourceLocator,
     };
     use tempfile::TempDir;
 
@@ -705,6 +706,7 @@ mod tests {
         SessionArchiveRecordDraft {
             session: SessionInventoryCard {
                 reference: FragileSessionReference::new(session_reference),
+                role: SessionRole::MainSession,
                 source: SourceKind::Claude,
                 source_identifier: SourceIdentifier::new("claude-fixture"),
                 producer_session_identifier: Some(SessionIdentifier::new("producer-session")),

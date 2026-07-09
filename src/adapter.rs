@@ -12,10 +12,10 @@ use std::{
 use serde_json::Value;
 use signal_aggregator::{
     AuthoredStatus, ByteCount, ByteLimit, ByteRange, FilesystemPath, ItemCount, LimitPolicy,
-    LineNumber, LineRange, OutputTitle, Projection, ReadFailure, ReadFailureReason,
-    SegmentProjection, SessionIdentifier, SourceHealthStatus, SourceIdentifier, SourceKind,
-    SourceLocator, SourceVolume, SubagentName, SubagentTaskMetadata, TaskIdentifier, TaskResult,
-    TaskTitle, TimeWindow, Timestamp, ToolUseIdentifier, TranscriptBlockKind,
+    LineNumber, LineRange, OutputTitle, Projection, ReadFailure, ReadFailureReason, ScanLimitKind,
+    ScanLimitReport, SegmentProjection, SessionIdentifier, SourceHealthStatus, SourceIdentifier,
+    SourceKind, SourceLocator, SourceVolume, SubagentName, SubagentTaskMetadata, TaskIdentifier,
+    TaskResult, TaskTitle, TimeWindow, Timestamp, ToolUseIdentifier, TranscriptBlockKind,
     TranscriptBlockTextAvailability, TranscriptSegment, TranscriptSegmentIdentifier,
     TranscriptText, TranscriptTextExcerpt, Truncation, TruncationReason, UsageSummary,
 };
@@ -28,6 +28,7 @@ pub enum AdapterKind {
     CodexTranscript,
     PiTranscript,
     ClaudeSubagentOutput,
+    PiSubagentOutput,
     Repository,
 }
 
@@ -38,6 +39,7 @@ impl AdapterKind {
             Self::CodexTranscript => "codex-transcript",
             Self::PiTranscript => "pi-transcript",
             Self::ClaudeSubagentOutput => "claude-subagent-output",
+            Self::PiSubagentOutput => "pi-subagent-output",
             Self::Repository => "repository",
         }
     }
@@ -154,6 +156,7 @@ pub struct TranscriptRawReadOutcome {
     pub truncations: Vec<Truncation>,
     pub read_failures: Vec<signal_aggregator::ReadFailure>,
     pub discovered_files: u64,
+    pub scan_limits: Vec<ScanLimitReport>,
 }
 
 impl TranscriptRawReadOutcome {
@@ -191,7 +194,13 @@ impl TranscriptRawReadOutcome {
             truncations,
             read_failures,
             discovered_files,
+            scan_limits: Vec::new(),
         }
+    }
+
+    pub fn with_scan_limits(mut self, scan_limits: Vec<ScanLimitReport>) -> Self {
+        self.scan_limits = scan_limits;
+        self
     }
 
     pub fn empty(source: SourceKind, source_identifier: SourceIdentifier) -> Self {
@@ -1213,11 +1222,23 @@ pub struct TranscriptScanLimits {
 impl TranscriptScanLimits {
     pub fn default_runtime() -> Self {
         Self::new(TranscriptScanLimitConfiguration::new(
-            MaximumScanEntries::new(4096),
-            MaximumDiscoveredFiles::new(1024),
+            MaximumScanEntries::new(131_072),
+            MaximumDiscoveredFiles::new(32_768),
             MaximumFileBytes::new(8 * 1024 * 1024),
             MaximumLineBytes::new(256 * 1024),
-            MaximumReadFailures::new(128),
+            MaximumReadFailures::new(1024),
+        ))
+    }
+
+    pub fn from_output_interface_limits(
+        limits: &meta_signal_aggregator::OutputInterfaceLimitPolicy,
+    ) -> Self {
+        Self::new(TranscriptScanLimitConfiguration::new(
+            MaximumScanEntries::new(limits.maximum_transcript_scan_entries.into_u64()),
+            MaximumDiscoveredFiles::new(limits.maximum_transcript_discovered_files.into_u64()),
+            MaximumFileBytes::new(limits.maximum_transcript_file_bytes.into_u64()),
+            MaximumLineBytes::new(limits.maximum_transcript_line_bytes.into_u64()),
+            MaximumReadFailures::new(limits.maximum_transcript_read_failures.into_u64()),
         ))
     }
 
@@ -1263,14 +1284,45 @@ pub struct TranscriptLimitTruncation {
     pub path: Option<PathBuf>,
     pub original_bytes: Option<u64>,
     pub projected_bytes: u64,
+    pub kind: ScanLimitKind,
+    pub limit: u64,
 }
 
 impl TranscriptLimitTruncation {
     pub fn new(path: Option<PathBuf>, original_bytes: Option<u64>, projected_bytes: u64) -> Self {
+        Self::with_kind(
+            path,
+            original_bytes,
+            projected_bytes,
+            ScanLimitKind::FileBytes,
+            projected_bytes,
+        )
+    }
+
+    pub fn with_kind(
+        path: Option<PathBuf>,
+        original_bytes: Option<u64>,
+        projected_bytes: u64,
+        kind: ScanLimitKind,
+        limit: u64,
+    ) -> Self {
         Self {
             path,
             original_bytes,
             projected_bytes,
+            kind,
+            limit,
+        }
+    }
+
+    pub fn scan_limit_report(&self) -> ScanLimitReport {
+        ScanLimitReport {
+            kind: self.kind.clone(),
+            limit: ItemCount::new(self.limit),
+            path: self
+                .path
+                .as_ref()
+                .map(|path| FilesystemPath::new(path.display().to_string())),
         }
     }
 
@@ -1292,6 +1344,7 @@ pub struct TranscriptDiscoveryOutcome {
     pub files: Vec<PathBuf>,
     pub truncations: Vec<TranscriptLimitTruncation>,
     pub failures: Vec<TranscriptDiscoveryFailure>,
+    pub scan_limits: Vec<ScanLimitReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1312,6 +1365,12 @@ pub enum TranscriptFileShape {
     ClaudeSubagentOutput,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptSymbolicLinkPolicy {
+    ConfinedToRoot,
+    FollowOutputFileLinks,
+}
+
 impl TranscriptFileShape {
     pub fn accepts_extension(self, extension: &OsStr) -> bool {
         match self {
@@ -1326,6 +1385,7 @@ pub struct TranscriptFileDiscovery {
     root: PathBuf,
     limits: TranscriptScanLimits,
     file_shape: TranscriptFileShape,
+    symbolic_link_policy: TranscriptSymbolicLinkPolicy,
 }
 
 impl TranscriptFileDiscovery {
@@ -1346,7 +1406,13 @@ impl TranscriptFileDiscovery {
             root,
             limits,
             file_shape,
+            symbolic_link_policy: TranscriptSymbolicLinkPolicy::ConfinedToRoot,
         }
+    }
+
+    pub fn with_symbolic_link_policy(mut self, policy: TranscriptSymbolicLinkPolicy) -> Self {
+        self.symbolic_link_policy = policy;
+        self
     }
 
     pub fn jsonl_files(&self) -> std::io::Result<Vec<PathBuf>> {
@@ -1358,7 +1424,8 @@ impl TranscriptFileDiscovery {
             self.root.clone(),
             self.limits.clone(),
             TranscriptFileShape::Jsonl,
-        );
+        )
+        .with_symbolic_link_policy(self.symbolic_link_policy);
         discovery.discover_files()
     }
 
@@ -1392,7 +1459,7 @@ impl TranscriptFileDiscovery {
         directory: &Path,
         state: &mut TranscriptDiscoveryState,
     ) -> std::io::Result<()> {
-        if state.is_complete() {
+        if state.is_complete() || !state.observe_directory(directory.to_path_buf()) {
             return Ok(());
         }
         let mut entries = Vec::new();
@@ -1411,6 +1478,7 @@ impl TranscriptFileDiscovery {
                 break;
             }
             let path = entry.path();
+            let file_type = entry.file_type()?;
             let canonical_path = match path.canonicalize() {
                 Ok(path) => path,
                 Err(error) => {
@@ -1427,6 +1495,21 @@ impl TranscriptFileDiscovery {
                     continue;
                 }
             };
+            if file_type.is_dir() || file_type.is_symlink() && canonical_path.is_dir() {
+                if canonical_path.starts_with(canonical_root) {
+                    self.collect_files(canonical_root, &canonical_path, state)?;
+                } else {
+                    state.observe_discovery_failure(TranscriptDiscoveryFailure::new(
+                        path,
+                        ReadFailureReason::PermissionDenied,
+                    ));
+                }
+                continue;
+            }
+            if file_type.is_symlink() && self.accepts_output_file_symlink(&path) {
+                state.observe_transcript_file(path);
+                continue;
+            }
             if !canonical_path.starts_with(canonical_root) {
                 state.observe_discovery_failure(TranscriptDiscoveryFailure::new(
                     path,
@@ -1434,10 +1517,7 @@ impl TranscriptFileDiscovery {
                 ));
                 continue;
             }
-            let file_type = entry.file_type()?;
-            if file_type.is_dir() || file_type.is_symlink() && canonical_path.is_dir() {
-                self.collect_files(canonical_root, &canonical_path, state)?;
-            } else if canonical_path
+            if canonical_path
                 .extension()
                 .is_some_and(|extension| self.file_shape.accepts_extension(extension))
             {
@@ -1445,6 +1525,14 @@ impl TranscriptFileDiscovery {
             }
         }
         Ok(())
+    }
+
+    pub fn accepts_output_file_symlink(&self, path: &Path) -> bool {
+        self.symbolic_link_policy == TranscriptSymbolicLinkPolicy::FollowOutputFileLinks
+            && self.file_shape == TranscriptFileShape::ClaudeSubagentOutput
+            && path
+                .extension()
+                .is_some_and(|extension| self.file_shape.accepts_extension(extension))
     }
 }
 
@@ -1455,6 +1543,7 @@ pub struct TranscriptDiscoveryState {
     files: Vec<PathBuf>,
     truncations: Vec<TranscriptLimitTruncation>,
     failures: Vec<TranscriptDiscoveryFailure>,
+    visited_directories: BTreeSet<PathBuf>,
     scan_limit_reported: bool,
     file_limit_reported: bool,
 }
@@ -1467,16 +1556,26 @@ impl TranscriptDiscoveryState {
             files: Vec::new(),
             truncations: Vec::new(),
             failures: Vec::new(),
+            visited_directories: BTreeSet::new(),
             scan_limit_reported: false,
             file_limit_reported: false,
         }
     }
 
+    pub fn observe_directory(&mut self, directory: PathBuf) -> bool {
+        self.visited_directories.insert(directory)
+    }
+
     pub fn observe_scan_entry(&mut self, directory: PathBuf) -> bool {
         if self.scanned_entries >= self.limits.maximum_scan_entries() {
             if !self.scan_limit_reported {
-                self.truncations
-                    .push(TranscriptLimitTruncation::new(Some(directory), None, 0));
+                self.truncations.push(TranscriptLimitTruncation::with_kind(
+                    Some(directory),
+                    None,
+                    0,
+                    ScanLimitKind::ScanEntries,
+                    self.limits.maximum_scan_entries(),
+                ));
                 self.scan_limit_reported = true;
             }
             return false;
@@ -1488,8 +1587,13 @@ impl TranscriptDiscoveryState {
     pub fn observe_transcript_file(&mut self, path: PathBuf) {
         if self.files.len() as u64 >= self.limits.maximum_discovered_files() {
             if !self.file_limit_reported {
-                self.truncations
-                    .push(TranscriptLimitTruncation::new(Some(path), None, 0));
+                self.truncations.push(TranscriptLimitTruncation::with_kind(
+                    Some(path),
+                    None,
+                    0,
+                    ScanLimitKind::DiscoveredFiles,
+                    self.limits.maximum_discovered_files(),
+                ));
                 self.file_limit_reported = true;
             }
             return;
@@ -1507,10 +1611,23 @@ impl TranscriptDiscoveryState {
 
     pub fn finish(mut self) -> std::io::Result<TranscriptDiscoveryOutcome> {
         self.files.sort();
+        let scan_limits = self
+            .truncations
+            .iter()
+            .map(|truncation| ScanLimitReport {
+                kind: truncation.kind.clone(),
+                limit: ItemCount::new(truncation.limit),
+                path: truncation
+                    .path
+                    .as_ref()
+                    .map(|path| FilesystemPath::new(path.display().to_string())),
+            })
+            .collect();
         Ok(TranscriptDiscoveryOutcome {
             files: self.files,
             truncations: self.truncations,
             failures: self.failures,
+            scan_limits,
         })
     }
 }
@@ -1575,9 +1692,11 @@ impl<'a> TranscriptLineText<'a> {
 
     pub fn bounded_text(&self) -> TranscriptLineTextOutcome<'a> {
         if self.text.len() as u64 > self.limits.maximum_line_bytes() {
-            TranscriptLineTextOutcome::Truncated(TranscriptLimitTruncation::new(
+            TranscriptLineTextOutcome::Truncated(TranscriptLimitTruncation::with_kind(
                 Some(TranscriptLineLocator::new(self.path.to_path_buf(), self.line_number).path()),
                 Some(self.text.len() as u64),
+                self.limits.maximum_line_bytes(),
+                ScanLimitKind::LineBytes,
                 self.limits.maximum_line_bytes(),
             ))
         } else {
@@ -1621,17 +1740,30 @@ impl TranscriptFailureAccumulator {
     }
 
     pub fn finish(self) -> TranscriptFailureOutcome {
-        let truncations = if self.truncated {
-            vec![
-                TranscriptLimitTruncation::new(self.limit_path, None, 0)
-                    .into_truncation(self.source),
-            ]
+        let limit = if self.truncated {
+            Some(TranscriptLimitTruncation::with_kind(
+                self.limit_path,
+                None,
+                0,
+                ScanLimitKind::ReadFailures,
+                self.limit,
+            ))
         } else {
-            Vec::new()
+            None
         };
+        let truncations = limit
+            .iter()
+            .cloned()
+            .map(|truncation| truncation.into_truncation(self.source))
+            .collect();
+        let scan_limits = limit
+            .iter()
+            .map(TranscriptLimitTruncation::scan_limit_report)
+            .collect();
         TranscriptFailureOutcome {
             failures: self.failures,
             truncations,
+            scan_limits,
         }
     }
 }
@@ -1640,6 +1772,7 @@ impl TranscriptFailureAccumulator {
 pub struct TranscriptFailureOutcome {
     pub failures: Vec<ReadFailure>,
     pub truncations: Vec<Truncation>,
+    pub scan_limits: Vec<ScanLimitReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -7,8 +7,8 @@ use meta_signal_aggregator::{
 use signal_aggregator::{ByteLimit, LimitPolicy, Projection, SegmentLimit};
 
 use crate::{
-    ClaudeNativeSubagentOutputRoot, ClaudeProjectTranscriptRoot, HomeDirectory, TemporaryDirectory,
-    UserIdentifier, WorkspacePath,
+    ClaudeNativeSubagentOutputRoot, ClaudeProjectTranscriptRoot, HomeDirectory,
+    PiTintinwebSubagentOutputRoot, TemporaryDirectory, UserIdentifier, WorkspacePath,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +80,14 @@ impl LocalDefaultConfigurationRequest {
                 .path()
                 .to_path_buf(),
             ))
+            .chain(std::iter::once(
+                PiTintinwebSubagentOutputRoot::from_temporary_directory_and_user(
+                    &self.temporary_directory,
+                    self.user_identifier,
+                )
+                .path()
+                .to_path_buf(),
+            ))
             .collect()
     }
 
@@ -103,6 +111,19 @@ impl LocalDefaultConfigurationRequest {
                 TranscriptRoot {
                     path: FilesystemPath::new(
                         ClaudeNativeSubagentOutputRoot::from_temporary_directory_and_user(
+                            &self.temporary_directory,
+                            self.user_identifier,
+                        )
+                        .path()
+                        .display()
+                        .to_string(),
+                    ),
+                },
+            )))
+            .chain(std::iter::once(TranscriptSource::PiSubagentOutput(
+                TranscriptRoot {
+                    path: FilesystemPath::new(
+                        PiTintinwebSubagentOutputRoot::from_temporary_directory_and_user(
                             &self.temporary_directory,
                             self.user_identifier,
                         )
@@ -147,6 +168,7 @@ mod tests {
         let text = request.configuration().to_nota();
         assert!(text.contains("/.claude/projects/-fake-workspace"));
         assert!(text.contains("/fake/tmp/claude-123"));
+        assert!(text.contains("/fake/tmp/pi-subagents-123"));
         assert!(!text.contains("-home-li-primary"));
         assert!(!text.contains("/tmp/claude-1001"));
     }

@@ -15,7 +15,7 @@ use crate::{
         TranscriptFileDiscovery, TranscriptFileShape, TranscriptJsonMetadata,
         TranscriptLineLocator, TranscriptLineText, TranscriptLineTextOutcome,
         TranscriptRawReadOutcome, TranscriptReadOutcome, TranscriptReadRequest, TranscriptRecord,
-        TranscriptScanLimits,
+        TranscriptScanLimits, TranscriptSymbolicLinkPolicy,
     },
     configuration::TranscriptRootConfiguration,
     time_model::CanonicalTimestamp,
@@ -36,7 +36,10 @@ impl ClaudeTranscriptAdapter {
     }
 
     pub fn collect(&self, request: &TranscriptReadRequest) -> TranscriptReadOutcome {
-        let reader = ClaudeJsonlRootReader::new(self.root.path().to_path_buf());
+        let reader = ClaudeJsonlRootReader::with_limits(
+            self.root.path().to_path_buf(),
+            self.root.scan_limits().clone(),
+        );
         reader.collect(request)
     }
 }
@@ -50,7 +53,7 @@ pub enum ClaudeTranscriptFileShape {
 impl ClaudeTranscriptFileShape {
     pub fn new(source: SourceKind) -> Self {
         match source {
-            SourceKind::ClaudeSubagentOutput => Self::SubagentOutput,
+            SourceKind::ClaudeSubagentOutput | SourceKind::PiSubagentOutput => Self::SubagentOutput,
             _ => Self::SessionJsonl,
         }
     }
@@ -89,6 +92,14 @@ impl ClaudeJsonlRootReader {
             root,
             TranscriptScanLimits::default_runtime(),
             SourceKind::ClaudeSubagentOutput,
+        )
+    }
+
+    pub fn pi_subagent_output(root: PathBuf) -> Self {
+        Self::with_limits_and_source(
+            root,
+            TranscriptScanLimits::default_runtime(),
+            SourceKind::PiSubagentOutput,
         )
     }
 
@@ -132,6 +143,7 @@ impl ClaudeJsonlRootReader {
             self.limits.clone(),
             self.file_shape.discovery_file_shape(),
         )
+        .with_symbolic_link_policy(self.symbolic_link_policy())
         .discover_files()
         {
             Ok(discovery) => discovery,
@@ -147,6 +159,7 @@ impl ClaudeJsonlRootReader {
             }
         };
         let mut records = Vec::new();
+        let mut scan_limits = discovery.scan_limits;
         let mut failures = TranscriptFailureAccumulator::new(
             self.source,
             Some(self.root.clone()),
@@ -171,6 +184,7 @@ impl ClaudeJsonlRootReader {
                     &mut truncations,
                 ),
                 Ok(TranscriptBoundedFileRead::Truncated(truncation)) => {
+                    scan_limits.push(truncation.scan_limit_report());
                     truncations.push(truncation.into_truncation(self.source));
                 }
                 Err(error) => failures.push(self.failure_from_io(error, Some(file))),
@@ -178,6 +192,7 @@ impl ClaudeJsonlRootReader {
         }
         let failure_outcome = failures.finish();
         truncations.extend(failure_outcome.truncations);
+        scan_limits.extend(failure_outcome.scan_limits);
         TranscriptRawReadOutcome::with_discovered_file_count(
             self.source,
             source_identifier,
@@ -186,6 +201,7 @@ impl ClaudeJsonlRootReader {
             failure_outcome.failures,
             discovered_files,
         )
+        .with_scan_limits(scan_limits)
     }
 
     pub fn read_file_lines(
@@ -225,6 +241,13 @@ impl ClaudeJsonlRootReader {
                     ));
                 }
             }
+        }
+    }
+
+    pub fn symbolic_link_policy(&self) -> TranscriptSymbolicLinkPolicy {
+        match self.source {
+            SourceKind::ClaudeSubagentOutput => TranscriptSymbolicLinkPolicy::FollowOutputFileLinks,
+            _ => TranscriptSymbolicLinkPolicy::ConfinedToRoot,
         }
     }
 
@@ -627,6 +650,7 @@ impl ClaudeSourceName {
             SourceKind::ClaudeSubagentOutput => "claude-subagent-output",
             SourceKind::Codex => "codex",
             SourceKind::Pi => "pi",
+            SourceKind::PiSubagentOutput => "pi-subagent-output",
             SourceKind::Repository => "repository",
         }
     }

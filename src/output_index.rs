@@ -24,10 +24,10 @@ use signal_aggregator::{
     SessionInventoryCard, SessionInventoryCompleteness, SessionInventoryRequest,
     SessionInventoryScanReport, SessionInventorySourceReport, SessionLifecycleStatus,
     SessionListFilter, SessionListRequest, SessionLookedUp, SessionLookupRequest,
-    SessionLookupSelector, SessionsInventoried, SessionsListed, SizeCertainty, SizeMetadata,
-    SourceHealthCard, SourceHealthStatus, SourceKind, SourceLocator, SourceSelection, SubagentCard,
-    SubagentListFilter, SubagentListRequest, SubagentTaskMetadata, SubagentsListed, TaskIdentifier,
-    TimeWindow, Timestamp, TranscriptBlockCard, TranscriptBlockEstimateRequest,
+    SessionLookupSelector, SessionRole, SessionsInventoried, SessionsListed, SizeCertainty,
+    SizeMetadata, SourceHealthCard, SourceHealthStatus, SourceKind, SourceLocator, SourceSelection,
+    SubagentCard, SubagentListFilter, SubagentListRequest, SubagentTaskMetadata, SubagentsListed,
+    TaskIdentifier, TimeWindow, Timestamp, TranscriptBlockCard, TranscriptBlockEstimateRequest,
     TranscriptBlockEstimated, TranscriptBlockFilter, TranscriptBlockKind,
     TranscriptBlockKindSelection, TranscriptBlockListRequest, TranscriptBlockProvenance,
     TranscriptBlockRead, TranscriptBlockReadRequest, TranscriptBlockSearchEvidence,
@@ -78,6 +78,7 @@ impl OutputInterfaceRuntime {
                 health_observation: RuntimeCapabilityStatus::Supported,
                 transcript_only_configuration: RuntimeCapabilityStatus::Supported,
                 claude_subagent_output_sources: RuntimeCapabilityStatus::Supported,
+                pi_subagent_output_sources: RuntimeCapabilityStatus::Supported,
             },
             sources,
             index: IndexHealth {
@@ -1094,12 +1095,25 @@ impl CurrentIndexBuilder {
     pub fn read_source(&self, source: &TranscriptAdapterConfiguration) -> TranscriptRawReadOutcome {
         match source {
             TranscriptAdapterConfiguration::Claude(root) => {
-                crate::adapter::claude::ClaudeJsonlRootReader::new(root.path().to_path_buf())
-                    .read_records()
+                crate::adapter::claude::ClaudeJsonlRootReader::with_limits(
+                    root.path().to_path_buf(),
+                    root.scan_limits().clone(),
+                )
+                .read_records()
             }
             TranscriptAdapterConfiguration::ClaudeSubagentOutput(root) => {
-                crate::adapter::claude::ClaudeJsonlRootReader::subagent_output(
+                crate::adapter::claude::ClaudeJsonlRootReader::with_limits_and_source(
                     root.path().to_path_buf(),
+                    root.scan_limits().clone(),
+                    SourceKind::ClaudeSubagentOutput,
+                )
+                .read_records()
+            }
+            TranscriptAdapterConfiguration::PiSubagentOutput(root) => {
+                crate::adapter::claude::ClaudeJsonlRootReader::with_limits_and_source(
+                    root.path().to_path_buf(),
+                    root.scan_limits().clone(),
+                    SourceKind::PiSubagentOutput,
                 )
                 .read_records()
             }
@@ -1128,12 +1142,25 @@ impl SourceHealthObserver {
     pub fn observe(&self) -> SourceHealthCard {
         let outcome = match &self.source {
             TranscriptAdapterConfiguration::Claude(root) => {
-                crate::adapter::claude::ClaudeJsonlRootReader::new(root.path().to_path_buf())
-                    .read_records()
+                crate::adapter::claude::ClaudeJsonlRootReader::with_limits(
+                    root.path().to_path_buf(),
+                    root.scan_limits().clone(),
+                )
+                .read_records()
             }
             TranscriptAdapterConfiguration::ClaudeSubagentOutput(root) => {
-                crate::adapter::claude::ClaudeJsonlRootReader::subagent_output(
+                crate::adapter::claude::ClaudeJsonlRootReader::with_limits_and_source(
                     root.path().to_path_buf(),
+                    root.scan_limits().clone(),
+                    SourceKind::ClaudeSubagentOutput,
+                )
+                .read_records()
+            }
+            TranscriptAdapterConfiguration::PiSubagentOutput(root) => {
+                crate::adapter::claude::ClaudeJsonlRootReader::with_limits_and_source(
+                    root.path().to_path_buf(),
+                    root.scan_limits().clone(),
+                    SourceKind::PiSubagentOutput,
                 )
                 .read_records()
             }
@@ -1171,6 +1198,7 @@ impl SourceHealthObserver {
                 relative_path: None,
             },
             status,
+            scan_limits: outcome.scan_limits,
             discovered_files: ItemCount::new(outcome.discovered_files),
             indexed_records: ItemCount::new(outcome.records.len() as u64),
             malformed_records: ItemCount::new(malformed),
@@ -1309,6 +1337,7 @@ impl SessionInventoryBuilder {
                 relative_path: None,
             },
             completeness: SourceHealthCompleteness::new(health.status).completeness(),
+            scan_limits: health.scan_limits,
             discovered_files: health.discovered_files,
             indexed_sessions: ItemCount::new(sessions.len() as u64),
             byte_count: ByteCount::new(byte_count),
@@ -1346,8 +1375,18 @@ impl<'a> TranscriptSourceIdentifier<'a> {
                     .source_identifier()
             }
             TranscriptAdapterConfiguration::ClaudeSubagentOutput(root) => {
-                crate::adapter::claude::ClaudeJsonlRootReader::subagent_output(
+                crate::adapter::claude::ClaudeJsonlRootReader::with_limits_and_source(
                     root.path().to_path_buf(),
+                    root.scan_limits().clone(),
+                    SourceKind::ClaudeSubagentOutput,
+                )
+                .source_identifier()
+            }
+            TranscriptAdapterConfiguration::PiSubagentOutput(root) => {
+                crate::adapter::claude::ClaudeJsonlRootReader::with_limits_and_source(
+                    root.path().to_path_buf(),
+                    root.scan_limits().clone(),
+                    SourceKind::PiSubagentOutput,
                 )
                 .source_identifier()
             }
@@ -1845,6 +1884,7 @@ impl IndexedSession {
     ) -> SessionInventoryCard {
         SessionInventoryCard {
             reference: self.reference.clone(),
+            role: self.role(),
             source: self.source,
             source_identifier: self.source_identifier.clone(),
             producer_session_identifier: self.producer_session_identifier.clone(),
@@ -1881,6 +1921,16 @@ impl IndexedSession {
         }
     }
 
+    pub fn role(&self) -> SessionRole {
+        match self.source {
+            SourceKind::Claude => SessionRole::MainSession,
+            SourceKind::ClaudeSubagentOutput | SourceKind::PiSubagentOutput => {
+                SessionRole::SubagentOutputSession
+            }
+            _ => SessionRole::Unknown,
+        }
+    }
+
     pub fn lifecycle_status(&self) -> SessionLifecycleStatus {
         if self.path.exists() {
             SessionLifecycleStatus::Current
@@ -1904,6 +1954,7 @@ impl IndexedSession {
     pub fn card(&self) -> SessionCard {
         SessionCard {
             reference: self.reference.clone(),
+            role: self.role(),
             source: self.source,
             source_identifier: self.source_identifier.clone(),
             producer_session_identifier: self.producer_session_identifier.clone(),
@@ -2921,7 +2972,9 @@ impl TranscriptLineParser {
 
     pub fn parse(&self) -> Option<TranscriptRecord> {
         match self.source {
-            SourceKind::Claude | SourceKind::ClaudeSubagentOutput => {
+            SourceKind::Claude
+            | SourceKind::ClaudeSubagentOutput
+            | SourceKind::PiSubagentOutput => {
                 match ClaudeJsonlRecord::new(&self.line).into_transcript_record(
                     self.source,
                     self.path.clone(),
@@ -4452,6 +4505,8 @@ impl ListingOrderName {
         match self.order {
             ListingOrder::OldestFirst => "oldest",
             ListingOrder::NewestFirst => "newest",
+            ListingOrder::OldestModifiedFirst => "modified-oldest",
+            ListingOrder::NewestModifiedFirst => "modified-newest",
             ListingOrder::ReferenceAscending => "reference",
         }
     }
@@ -4460,6 +4515,8 @@ impl ListingOrderName {
         match value {
             "oldest" => Some(ListingOrder::OldestFirst),
             "newest" => Some(ListingOrder::NewestFirst),
+            "modified-oldest" => Some(ListingOrder::OldestModifiedFirst),
+            "modified-newest" => Some(ListingOrder::NewestModifiedFirst),
             "reference" => Some(ListingOrder::ReferenceAscending),
             _ => None,
         }
@@ -4497,10 +4554,19 @@ impl IndexedSessionSorter {
 
     pub fn sort(&self, sessions: &mut [IndexedSession]) {
         sessions.sort_by(|left, right| {
+            let (left_timestamp, right_timestamp) = match self.order {
+                ListingOrder::OldestModifiedFirst | ListingOrder::NewestModifiedFirst => {
+                    (left.modified_timestamp(), right.modified_timestamp())
+                }
+                _ => (
+                    left.chronology_timestamp().cloned(),
+                    right.chronology_timestamp().cloned(),
+                ),
+            };
             ChronologyOrdering::new(self.order).compare(
-                left.chronology_timestamp(),
+                left_timestamp.as_ref(),
                 left.reference.as_str(),
-                right.chronology_timestamp(),
+                right_timestamp.as_ref(),
                 right.reference.as_str(),
             )
         });
@@ -4566,12 +4632,12 @@ impl IndexedSegmentSorter {
             ListingOrder::ReferenceAscending => {
                 left.reference.as_str().cmp(right.reference.as_str())
             }
-            ListingOrder::OldestFirst => left
+            ListingOrder::OldestFirst | ListingOrder::OldestModifiedFirst => left
                 .segment_index
                 .into_u64()
                 .cmp(&right.segment_index.into_u64())
                 .then_with(|| left.reference.as_str().cmp(right.reference.as_str())),
-            ListingOrder::NewestFirst => right
+            ListingOrder::NewestFirst | ListingOrder::NewestModifiedFirst => right
                 .segment_index
                 .into_u64()
                 .cmp(&left.segment_index.into_u64())
@@ -4614,7 +4680,7 @@ impl TranscriptBlockOrdering {
             ListingOrder::ReferenceAscending => {
                 left.reference.as_str().cmp(right.reference.as_str())
             }
-            ListingOrder::OldestFirst => self
+            ListingOrder::OldestFirst | ListingOrder::OldestModifiedFirst => self
                 .compare_oldest(left.chronology_timestamp(), right.chronology_timestamp())
                 .then_with(|| {
                     left.source_sort_material()
@@ -4627,7 +4693,7 @@ impl TranscriptBlockOrdering {
                         .cmp(&right.block_index.into_u64())
                 })
                 .then_with(|| left.reference.as_str().cmp(right.reference.as_str())),
-            ListingOrder::NewestFirst => self
+            ListingOrder::NewestFirst | ListingOrder::NewestModifiedFirst => self
                 .compare_newest(left.chronology_timestamp(), right.chronology_timestamp())
                 .then_with(|| {
                     left.source_sort_material()
@@ -4671,10 +4737,10 @@ impl ChronologyOrdering {
     ) -> Ordering {
         match self.order {
             ListingOrder::ReferenceAscending => left_reference.cmp(right_reference),
-            ListingOrder::OldestFirst => self
+            ListingOrder::OldestFirst | ListingOrder::OldestModifiedFirst => self
                 .compare_oldest(left_timestamp, right_timestamp)
                 .then_with(|| left_reference.cmp(right_reference)),
-            ListingOrder::NewestFirst => self
+            ListingOrder::NewestFirst | ListingOrder::NewestModifiedFirst => self
                 .compare_newest(left_timestamp, right_timestamp)
                 .then_with(|| left_reference.cmp(right_reference)),
         }
@@ -5205,6 +5271,7 @@ impl SourceKindName {
             SourceKind::ClaudeSubagentOutput => "ClaudeSubagentOutput",
             SourceKind::Codex => "Codex",
             SourceKind::Pi => "Pi",
+            SourceKind::PiSubagentOutput => "PiSubagentOutput",
             SourceKind::Repository => "Repository",
         }
     }
@@ -5215,6 +5282,7 @@ impl SourceKindName {
             "ClaudeSubagentOutput" => Some(SourceKind::ClaudeSubagentOutput),
             "Codex" => Some(SourceKind::Codex),
             "Pi" => Some(SourceKind::Pi),
+            "PiSubagentOutput" => Some(SourceKind::PiSubagentOutput),
             "Repository" => Some(SourceKind::Repository),
             _ => None,
         }
