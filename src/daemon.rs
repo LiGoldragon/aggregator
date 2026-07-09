@@ -431,6 +431,65 @@ impl OrdinaryRequestHandler {
                 }
             }
             AggregatorRequest::Collect(request) => self.handle_collect(request),
+            AggregatorRequest::InventorySessions(request) => {
+                match self.nexus_for_operation(
+                    &request.request_identifier,
+                    OperationKind::InventorySessions,
+                ) {
+                    Ok(nexus) => match nexus.inventory_sessions(request) {
+                        Ok(reply) => AggregatorReply::SessionsInventoried(reply),
+                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    },
+                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                }
+            }
+            AggregatorRequest::LookupSession(request) => {
+                match self
+                    .nexus_for_operation(&request.request_identifier, OperationKind::LookupSession)
+                {
+                    Ok(nexus) => match nexus.lookup_session(request) {
+                        Ok(reply) => AggregatorReply::SessionLookedUp(reply),
+                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    },
+                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                }
+            }
+            AggregatorRequest::WriteSessionArchive(request) => {
+                match self.nexus_for_operation(
+                    &request.request_identifier,
+                    OperationKind::WriteSessionArchive,
+                ) {
+                    Ok(nexus) => match nexus.write_session_archive(request) {
+                        Ok(reply) => AggregatorReply::SessionArchiveWritten(reply),
+                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    },
+                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                }
+            }
+            AggregatorRequest::QuerySessionArchive(request) => {
+                match self.nexus_for_operation(
+                    &request.request_identifier,
+                    OperationKind::QuerySessionArchive,
+                ) {
+                    Ok(nexus) => match nexus.query_session_archive(request) {
+                        Ok(reply) => AggregatorReply::SessionArchiveQueried(reply),
+                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    },
+                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                }
+            }
+            AggregatorRequest::ReadSessionArchive(request) => {
+                match self.nexus_for_operation(
+                    &request.request_identifier,
+                    OperationKind::ReadSessionArchive,
+                ) {
+                    Ok(nexus) => match nexus.read_session_archive(request) {
+                        Ok(reply) => AggregatorReply::SessionArchiveRead(reply),
+                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    },
+                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                }
+            }
             AggregatorRequest::ListSessions(request) => {
                 match self
                     .nexus_for_operation(&request.request_identifier, OperationKind::ListSessions)

@@ -4,6 +4,7 @@
 //! review, recommend, score, or judge collected work.
 
 pub mod adapter;
+pub mod archive;
 pub mod client;
 pub mod clock;
 pub mod configuration;
@@ -18,6 +19,7 @@ pub mod signal;
 pub mod time_model;
 
 pub use adapter::AdapterKind;
+pub use archive::SessionArchiveStore;
 pub use client::{
     AggregatorClientCommand, ConfigurationWriterCommand, MetaAggregatorClientCommand,
 };

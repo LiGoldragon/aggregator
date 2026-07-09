@@ -2,11 +2,14 @@ use signal_aggregator::{
     EvidencePackage, EvidenceRequest, OperationKind, OperationRejectionReason,
     OutputEstimateRequest, OutputEstimated, OutputListRequest, OutputRead, OutputReadRequest,
     OutputSegmentListRequest, OutputSegmentsListed, OutputsListed, PackageIdentifier,
-    RequestIdentifier, RuntimeHealthObserved, RuntimeHealthRequest, SessionListRequest,
-    SessionsListed, SourceKind, SubagentListRequest, SubagentsListed, TimeWindow,
-    TranscriptBlockEstimateRequest, TranscriptBlockEstimated, TranscriptBlockListRequest,
-    TranscriptBlockRead, TranscriptBlockReadRequest, TranscriptBlockSearchRequest,
-    TranscriptBlocksListed, TranscriptBlocksSearched,
+    RequestIdentifier, RuntimeHealthObserved, RuntimeHealthRequest, SessionArchiveQueried,
+    SessionArchiveQueryRequest, SessionArchiveRead, SessionArchiveReadRequest,
+    SessionArchiveWriteRequest, SessionArchiveWritten, SessionInventoryRequest, SessionListRequest,
+    SessionLookedUp, SessionLookupRequest, SessionsInventoried, SessionsListed, SourceKind,
+    SubagentListRequest, SubagentsListed, TimeWindow, TranscriptBlockEstimateRequest,
+    TranscriptBlockEstimated, TranscriptBlockListRequest, TranscriptBlockRead,
+    TranscriptBlockReadRequest, TranscriptBlockSearchRequest, TranscriptBlocksListed,
+    TranscriptBlocksSearched,
 };
 
 use crate::{
@@ -108,6 +111,46 @@ impl NexusPlane {
         Ok(self
             .output_interface(&request.request_identifier, OperationKind::ObserveHealth)?
             .observe_health(request))
+    }
+
+    pub fn inventory_sessions(
+        &self,
+        request: SessionInventoryRequest,
+    ) -> OutputOperationResult<SessionsInventoried> {
+        self.output_interface(
+            &request.request_identifier,
+            OperationKind::InventorySessions,
+        )?
+        .inventory_sessions(request)
+    }
+
+    pub fn lookup_session(
+        &self,
+        request: SessionLookupRequest,
+    ) -> OutputOperationResult<SessionLookedUp> {
+        self.output_interface(&request.request_identifier, OperationKind::LookupSession)?
+            .lookup_session(request)
+    }
+
+    pub fn write_session_archive(
+        &self,
+        request: SessionArchiveWriteRequest,
+    ) -> OutputOperationResult<SessionArchiveWritten> {
+        crate::SessionArchiveStore::new(request.archive_path.clone()).write_record(request)
+    }
+
+    pub fn query_session_archive(
+        &self,
+        request: SessionArchiveQueryRequest,
+    ) -> OutputOperationResult<SessionArchiveQueried> {
+        crate::SessionArchiveStore::new(request.archive_path.clone()).query(request)
+    }
+
+    pub fn read_session_archive(
+        &self,
+        request: SessionArchiveReadRequest,
+    ) -> OutputOperationResult<SessionArchiveRead> {
+        crate::SessionArchiveStore::new(request.archive_path.clone()).read(request)
     }
 
     pub fn list_sessions(

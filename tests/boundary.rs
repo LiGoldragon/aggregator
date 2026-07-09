@@ -41,20 +41,25 @@ use meta_signal_aggregator::{
 use nota::{NotaEncode, NotaSource};
 use nota_text_query::{QueryTerm, WordDistance};
 use signal_aggregator::{
-    AggregatorReply, AggregatorRequest, AuthoredStatus, AuthoredStatusFilter,
-    BoundedTextProjection, ByteCount, ByteLimit, ByteRange, CardProjection, ContractName,
-    DurationAmount, DurationUnit, EvidenceRequest, FilesystemPath as SignalFilesystemPath,
-    FragileOutputReference, FragileTranscriptBlockReference, LimitPolicy, ListingOrder,
-    OperationRejectionReason, OutputListFilter, OutputListRequest, OutputReadRange,
-    OutputReadRequest, OutputSegmentListFilter, OutputSegmentListRequest, PageLimit, PageRequest,
-    Projection, ReadFailureReason, RejectionReason, RelativeDuration, RepositoryIdentifier,
-    RepositoryPath, RepositoryWorktreeState, RequestIdentifier, RuntimeHealthRequest, SegmentLimit,
-    SegmentProjection, SelectedSources, SessionListFilter, SessionListRequest, SourceHealthStatus,
-    SourceIdentifier, SourceKind, SourceSelection, SubagentListFilter, SubagentListRequest,
-    TextQuery, TimeRange, TimeWindow, Timestamp, TranscriptBlockEstimateRequest,
-    TranscriptBlockFilter, TranscriptBlockKind, TranscriptBlockKindSelection,
-    TranscriptBlockListRequest, TranscriptBlockReadRequest, TranscriptBlockSearchRequest,
-    TranscriptBlockTextAvailability, TranscriptBlockTextQuery, TruncationReason, Version,
+    AggregatorReply, AggregatorRequest, ArchivePath, ArchiveProvenanceText, ArchiveSummaryText,
+    ArchiveTextCompleteness, AuthoredStatus, AuthoredStatusFilter, BoundedTextProjection,
+    ByteCount, ByteLimit, ByteRange, CardProjection, ContractName, DurationAmount, DurationUnit,
+    EvidenceRequest, FilesystemPath as SignalFilesystemPath, FragileOutputReference,
+    FragileTranscriptBlockReference, LimitPolicy, ListingOrder, OperationRejectionReason,
+    OutputListFilter, OutputListRequest, OutputReadRange, OutputReadRequest,
+    OutputSegmentListFilter, OutputSegmentListRequest, PageLimit, PageRequest, Projection,
+    ReadFailureReason, RejectionReason, RelativeDuration, RepositoryIdentifier, RepositoryPath,
+    RepositoryWorktreeState, RequestIdentifier, RuntimeHealthRequest, SegmentLimit,
+    SegmentProjection, SelectedSources, SessionArchiveQueryRequest, SessionArchiveReadRequest,
+    SessionArchiveRecordDraft, SessionArchiveStatus, SessionArchiveWriteRequest,
+    SessionInventoryCompleteness, SessionInventoryRequest, SessionLifecycleStatus,
+    SessionListFilter, SessionListRequest, SessionLookupRequest, SessionLookupSelector,
+    SourceHealthStatus, SourceIdentifier, SourceKind, SourceSelection, SubagentListFilter,
+    SubagentListRequest, TextQuery, TimeRange, TimeWindow, Timestamp,
+    TranscriptBlockEstimateRequest, TranscriptBlockFilter, TranscriptBlockKind,
+    TranscriptBlockKindSelection, TranscriptBlockListRequest, TranscriptBlockReadRequest,
+    TranscriptBlockSearchRequest, TranscriptBlockTextAvailability, TranscriptBlockTextQuery,
+    TruncationReason, Version,
 };
 use tempfile::TempDir;
 
@@ -149,6 +154,11 @@ fn example_nota_files_match_contract_shapes() {
         include_str!("../examples/output-interface-replies.nota"),
     )
     .parse_as_replies();
+    ExampleNotaFile::new(
+        "examples/session-inventory-archive-requests.nota",
+        include_str!("../examples/session-inventory-archive-requests.nota"),
+    )
+    .parse_as_requests();
     ExampleNotaFile::new(
         "examples/transcript-block-search-requests.nota",
         include_str!("../examples/transcript-block-search-requests.nota"),
@@ -910,6 +920,108 @@ fn nexus_lowers_recent_window_before_transcript_adapters() {
             .read_failures
             .iter()
             .any(|failure| failure.reason == ReadFailureReason::UnsupportedFormat)
+    );
+}
+
+#[test]
+fn session_inventory_lookup_and_archive_round_trip_through_rkyv_store() {
+    let root = TempDir::new().expect("temporary root");
+    let configuration = accepted_configuration(&root);
+    fs::write(
+        root.path().join("claude/session.jsonl"),
+        concat!(
+            "{\"timestamp\":\"2026-01-02T00:10:00Z\",\"title\":\"first\",\"subagent_name\":\"writer\",\"sessionId\":\"session-uuid-1\",\"role\":\"assistant\",\"text\":\"alpha one\"}\n",
+            "{\"timestamp\":\"2026-01-02T00:20:00Z\",\"title\":\"second\",\"subagent_name\":\"writer\",\"sessionId\":\"session-uuid-1\",\"role\":\"assistant\",\"text\":\"beta two\"}\n",
+        ),
+    )
+    .expect("write transcript");
+    let runtime = RuntimeConfiguration::validate_from_meta(&configuration)
+        .accepted_configuration()
+        .expect("accepted configuration")
+        .clone();
+    let clock = CollectionClock::fixed(
+        ReferenceTime::from_timestamp(Timestamp::new("2026-01-02T01:00:00Z"))
+            .expect("reference timestamp"),
+    );
+    let nexus = NexusPlane::with_runtime_configuration(runtime, clock);
+    let archive_path = ArchivePath::new(root.path().join("archive.rkyv").display().to_string());
+
+    let inventory = nexus
+        .inventory_sessions(SessionInventoryRequest {
+            request_identifier: RequestIdentifier::new("inventory-sessions"),
+            source_selection: SourceSelection::Only(SelectedSources {
+                sources: vec![SourceKind::Claude],
+            }),
+            archive_path: Some(archive_path.clone()),
+        })
+        .expect("inventory sessions");
+    assert_eq!(inventory.sessions.len(), 1);
+    assert_eq!(
+        inventory.scan_report.completeness,
+        SessionInventoryCompleteness::Complete
+    );
+    assert_eq!(inventory.sessions[0].file_count.into_u64(), 1);
+    assert_eq!(
+        inventory.sessions[0].archive_status,
+        SessionArchiveStatus::ArchiveUnknown
+    );
+    assert_eq!(
+        inventory.sessions[0].lifecycle_status,
+        SessionLifecycleStatus::Current
+    );
+
+    let looked_up = nexus
+        .lookup_session(SessionLookupRequest {
+            request_identifier: RequestIdentifier::new("lookup-session"),
+            selector: SessionLookupSelector::ByReference(inventory.sessions[0].reference.clone()),
+            archive_path: None,
+        })
+        .expect("lookup session");
+    assert_eq!(looked_up.sessions.len(), 1);
+
+    let written = nexus
+        .write_session_archive(SessionArchiveWriteRequest {
+            request_identifier: RequestIdentifier::new("write-archive"),
+            archive_path: archive_path.clone(),
+            record: SessionArchiveRecordDraft {
+                session: inventory.sessions[0].clone(),
+                summary: ArchiveSummaryText::new("summary may include a direct quote"),
+                provenance: ArchiveProvenanceText::new("bounded transcript read references"),
+                created_at: Timestamp::new("2026-01-02T01:10:00Z"),
+            },
+        })
+        .expect("write archive");
+
+    let queried = nexus
+        .query_session_archive(SessionArchiveQueryRequest {
+            request_identifier: RequestIdentifier::new("query-archive"),
+            archive_path: archive_path.clone(),
+            session_reference: Some(inventory.sessions[0].reference.clone()),
+        })
+        .expect("query archive");
+    assert_eq!(queried.records, vec![written.card.clone()]);
+
+    let read = nexus
+        .read_session_archive(SessionArchiveReadRequest {
+            request_identifier: RequestIdentifier::new("read-archive"),
+            archive_path,
+            record_identifier: written.card.record_identifier.clone(),
+            maximum_summary_bytes: ByteLimit::new(12),
+            maximum_provenance_bytes: ByteLimit::new(64),
+        })
+        .expect("read archive");
+    assert_eq!(
+        read.record.card.record_identifier,
+        written.card.record_identifier
+    );
+    assert_eq!(read.record.summary.text.as_str(), "summary may ");
+    assert_eq!(
+        read.record.summary.completeness,
+        ArchiveTextCompleteness::Truncated
+    );
+    assert_eq!(
+        read.record.provenance.text.as_str(),
+        "bounded transcript read references"
     );
 }
 

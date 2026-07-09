@@ -13,7 +13,7 @@ impl SignalPlane {
     pub fn version_report(&self) -> AggregatorReply {
         AggregatorReply::VersionReported(VersionReport {
             contract_name: ContractName::new("signal-aggregator"),
-            contract_version: ContractVersion::new("0.4.0"),
+            contract_version: ContractVersion::new("0.5.0"),
         })
     }
 

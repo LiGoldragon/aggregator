@@ -9,6 +9,7 @@ dependencies = [
  "meta-signal-aggregator",
  "nota 0.5.1 (git+https://github.com/LiGoldragon/nota-next.git?branch=main)",
  "nota-text-query",
+ "rkyv",
  "serde_json",
  "signal-aggregator",
  "signal-frame",
@@ -443,8 +444,8 @@ dependencies = [
 
 [[package]]
 name = "signal-aggregator"
-version = "0.4.0"
-source = "git+https://github.com/LiGoldragon/signal-aggregator?branch=main#6a3f844468c5159db6441ca5044f4d1930ef688a"
+version = "0.5.0"
+source = "git+https://github.com/LiGoldragon/signal-aggregator?branch=main#ae923f9a61ff8d49deea86d9c5d4d79f39d8c7a9"
 dependencies = [
  "nota 0.5.1 (git+https://github.com/LiGoldragon/nota-next.git?branch=main)",
  "nota-text-query",

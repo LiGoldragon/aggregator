@@ -66,7 +66,10 @@ an implementation bridge, not the desired final coupling.
 
 The ordinary contract exposes metadata-first output operations:
 
-- `ListSessions` lists session cards.
+- `ListSessions` lists paged session cards.
+- `InventorySessions` lists metadata-only session inventory cards with per-source scan completeness.
+- `LookupSession` resolves sessions by fragile reference, producer session identifier, or source locator.
+- `WriteSessionArchive`, `QuerySessionArchive`, and `ReadSessionArchive` store and read agent-authored summaries in an explicit local rkyv archive path.
 - `ListSubagents` lists subagent cards for a selected session.
 - `ListOutputs` lists output cards with `MetadataOnly` or bounded-preview
   projection.
@@ -119,7 +122,8 @@ src/daemon.rs                             prototype Unix-socket daemon services 
 src/signal.rs                             Signal validation, version, and rejection helpers
 src/nexus.rs                              collection orchestration and output-interface routing
 src/sema.rs                               configuration state and meta operations
-src/output_index.rs                       durable fragile index, cards, cursors, estimates, reads, rejections
+src/output_index.rs                       durable fragile index, inventory cards, cursors, estimates, reads, rejections
+src/archive.rs                            local rkyv session archive read/write/query store
 src/configuration.rs                      configuration storage, validation, limits, legacy recovery boundaries
 src/adapter/claude.rs                     Claude JSONL transcript adapter
 src/adapter/codex.rs                      Codex session transcript adapter
@@ -134,6 +138,7 @@ tests/boundary.rs                         contract, daemon, adapter, and output-
 examples/collect.nota                     coarse evidence collection request example
 examples/configuration.nota               current configuration example
 examples/output-interface-requests.nota   metadata-first output operation request examples
+examples/session-inventory-archive-requests.nota inventory and local archive request examples
 examples/output-interface-replies.nota    output operation reply and rejection examples
 examples/transcript-block-search-requests.nota  transcript block scrape/search/read request examples
 examples/transcript-block-search-replies.nota   transcript block reply, evidence, and rejection examples
@@ -144,7 +149,7 @@ examples/transcript-block-search-replies.nota   transcript block reply, evidence
 The configured runtime path implements collection over configured transcript and
 repository evidence, and the daemon serves ordinary and meta frame requests over
 Unix sockets. The output interface implementation is present: session,
-subagent, output, segment, and transcript-block listings; transcript-block
+subagent, output, segment, and transcript-block listings; complete metadata-first session inventory and lookup; aggregator-local rkyv session archive write/query/read with explicit archive paths; transcript-block
 search with `nota-text-query` evidence; size estimates; bounded reads; durable
 store-derived fragile index; metadata-first cards; typed stale, missing, broken,
 oversized, invalid-range, invalid-query, and invalid-request rejections; and

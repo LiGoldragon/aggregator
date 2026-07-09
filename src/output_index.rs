@@ -19,18 +19,21 @@ use signal_aggregator::{
     OutputRead, OutputReadRange, OutputReadRequest, OutputSegmentCard, OutputSegmentListFilter,
     OutputSegmentListRequest, OutputSegmentsListed, OutputText, OutputTextExcerpt, OutputsListed,
     PageLimit, PageMetadata, PageRequest, RejectedFragileReference, RequestIdentifier,
-    RuntimeCapabilities, RuntimeCapabilityStatus, RuntimeHealthObserved, RuntimeHealthRequest,
-    SegmentIndex, SessionCard, SessionIdentifier, SessionListFilter, SessionListRequest,
-    SessionsListed, SizeCertainty, SizeMetadata, SourceHealthCard, SourceHealthStatus, SourceKind,
-    SourceLocator, SourceSelection, SubagentCard, SubagentListFilter, SubagentListRequest,
-    SubagentTaskMetadata, SubagentsListed, TaskIdentifier, TimeWindow, Timestamp,
-    TranscriptBlockCard, TranscriptBlockEstimateRequest, TranscriptBlockEstimated,
-    TranscriptBlockFilter, TranscriptBlockKind, TranscriptBlockKindSelection,
-    TranscriptBlockListRequest, TranscriptBlockProvenance, TranscriptBlockRead,
-    TranscriptBlockReadRequest, TranscriptBlockSearchEvidence, TranscriptBlockSearchMatch,
-    TranscriptBlockSearchRequest, TranscriptBlockTextAvailability, TranscriptBlockTextQuery,
-    TranscriptBlocksListed, TranscriptBlocksSearched, TranscriptText, TranscriptTextExcerpt,
-    Truncation, TruncationReason,
+    RootRelativePath, RuntimeCapabilities, RuntimeCapabilityStatus, RuntimeHealthObserved,
+    RuntimeHealthRequest, SegmentIndex, SessionArchiveStatus, SessionCard, SessionIdentifier,
+    SessionInventoryCard, SessionInventoryCompleteness, SessionInventoryRequest,
+    SessionInventoryScanReport, SessionInventorySourceReport, SessionLifecycleStatus,
+    SessionListFilter, SessionListRequest, SessionLookedUp, SessionLookupRequest,
+    SessionLookupSelector, SessionsInventoried, SessionsListed, SizeCertainty, SizeMetadata,
+    SourceHealthCard, SourceHealthStatus, SourceKind, SourceLocator, SourceSelection, SubagentCard,
+    SubagentListFilter, SubagentListRequest, SubagentTaskMetadata, SubagentsListed, TaskIdentifier,
+    TimeWindow, Timestamp, TranscriptBlockCard, TranscriptBlockEstimateRequest,
+    TranscriptBlockEstimated, TranscriptBlockFilter, TranscriptBlockKind,
+    TranscriptBlockKindSelection, TranscriptBlockListRequest, TranscriptBlockProvenance,
+    TranscriptBlockRead, TranscriptBlockReadRequest, TranscriptBlockSearchEvidence,
+    TranscriptBlockSearchMatch, TranscriptBlockSearchRequest, TranscriptBlockTextAvailability,
+    TranscriptBlockTextQuery, TranscriptBlocksListed, TranscriptBlocksSearched, TranscriptText,
+    TranscriptTextExcerpt, Truncation, TruncationReason,
 };
 
 use crate::{
@@ -84,6 +87,77 @@ impl OutputInterfaceRuntime {
                 output_count: ItemCount::new(current.outputs.len() as u64),
                 transcript_block_count: ItemCount::new(current.transcript_blocks.len() as u64),
             },
+        }
+    }
+
+    pub fn inventory_sessions(
+        &self,
+        request: SessionInventoryRequest,
+    ) -> OutputOperationResult<SessionsInventoried> {
+        let index = self.refreshed_index(
+            &request.request_identifier,
+            OperationKind::InventorySessions,
+        )?;
+        let archive_references = self.archive_references(request.archive_path.as_ref());
+        let inventory = SessionInventoryBuilder::new(
+            self.configuration.clone(),
+            index,
+            request.source_selection.clone(),
+            archive_references,
+        )
+        .build();
+        Ok(SessionsInventoried {
+            request_identifier: request.request_identifier,
+            sessions: inventory.sessions,
+            scan_report: inventory.scan_report,
+        })
+    }
+
+    pub fn lookup_session(
+        &self,
+        request: SessionLookupRequest,
+    ) -> OutputOperationResult<SessionLookedUp> {
+        let index =
+            self.refreshed_index(&request.request_identifier, OperationKind::LookupSession)?;
+        let archive_references = self.archive_references(request.archive_path.as_ref());
+        let inventory = SessionInventoryBuilder::new(
+            self.configuration.clone(),
+            index,
+            SourceSelection::AllConfigured,
+            archive_references,
+        )
+        .build();
+        let sessions = inventory
+            .sessions
+            .into_iter()
+            .filter(|session| SessionLookupMatcher::new(&request.selector).accepts(session))
+            .collect();
+        Ok(SessionLookedUp {
+            request_identifier: request.request_identifier,
+            sessions,
+            scan_report: inventory.scan_report,
+        })
+    }
+
+    pub fn archive_references(
+        &self,
+        archive_path: Option<&signal_aggregator::ArchivePath>,
+    ) -> BTreeSet<String> {
+        let Some(archive_path) = archive_path else {
+            return BTreeSet::new();
+        };
+        let request = signal_aggregator::SessionArchiveQueryRequest {
+            request_identifier: RequestIdentifier::new("archive-status-probe"),
+            archive_path: archive_path.clone(),
+            session_reference: None,
+        };
+        match crate::SessionArchiveStore::new(archive_path.clone()).query(request) {
+            Ok(reply) => reply
+                .records
+                .into_iter()
+                .map(|record| record.session_reference.as_str().to_string())
+                .collect(),
+            Err(_) => BTreeSet::new(),
         }
     }
 
@@ -1101,6 +1175,315 @@ impl SourceHealthObserver {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInventory {
+    sessions: Vec<SessionInventoryCard>,
+    scan_report: SessionInventoryScanReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInventoryBuilder {
+    configuration: RuntimeConfiguration,
+    index: DurableFragileIndex,
+    source_selection: SourceSelection,
+    archive_references: BTreeSet<String>,
+}
+
+impl SessionInventoryBuilder {
+    pub fn new(
+        configuration: RuntimeConfiguration,
+        index: DurableFragileIndex,
+        source_selection: SourceSelection,
+        archive_references: BTreeSet<String>,
+    ) -> Self {
+        Self {
+            configuration,
+            index,
+            source_selection,
+            archive_references,
+        }
+    }
+
+    pub fn build(&self) -> SessionInventory {
+        let source_reports = self.source_reports();
+        let source_statuses = source_reports
+            .iter()
+            .map(|report| {
+                (
+                    report.source_identifier.as_str().to_string(),
+                    SourceCompletenessStatus::new(report.completeness).status(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut sessions = self
+            .index
+            .current_sessions()
+            .into_iter()
+            .filter(|session| {
+                SourceSelectionFilter::new(&self.source_selection).accepts(session.source)
+            })
+            .map(|session| {
+                let source = self
+                    .configuration
+                    .transcript_sources()
+                    .iter()
+                    .find(|source| {
+                        source.kind() == session.source
+                            && TranscriptSourceIdentifier::new(source).identifier()
+                                == session.source_identifier
+                    });
+                let source_status = source_statuses
+                    .get(session.source_identifier.as_str())
+                    .copied()
+                    .unwrap_or(SourceHealthStatus::IndexStoreUnreadable);
+                session.inventory_card(
+                    source,
+                    source_status,
+                    self.archive_status(&session.reference),
+                )
+            })
+            .collect::<Vec<_>>();
+        sessions.sort_by(|left, right| left.reference.as_str().cmp(right.reference.as_str()));
+        let completeness = InventoryCompletenessAggregator::new(&source_reports).completeness();
+        SessionInventory {
+            scan_report: SessionInventoryScanReport {
+                sources: source_reports,
+                total_sessions: ItemCount::new(sessions.len() as u64),
+                completeness,
+            },
+            sessions,
+        }
+    }
+
+    pub fn source_reports(&self) -> Vec<SessionInventorySourceReport> {
+        self.configuration
+            .transcript_sources()
+            .iter()
+            .filter(|source| {
+                SourceSelectionFilter::new(&self.source_selection).accepts(source.kind())
+            })
+            .map(|source| self.source_report(source))
+            .collect()
+    }
+
+    pub fn source_report(
+        &self,
+        source: &TranscriptAdapterConfiguration,
+    ) -> SessionInventorySourceReport {
+        let health = SourceHealthObserver::new(source.clone()).observe();
+        let sessions = self
+            .index
+            .current_sessions()
+            .into_iter()
+            .filter(|session| {
+                session.source == source.kind()
+                    && session.source_identifier
+                        == TranscriptSourceIdentifier::new(source).identifier()
+            })
+            .collect::<Vec<_>>();
+        let mut byte_count = 0;
+        let mut earliest = None;
+        let mut latest = None;
+        for session in &sessions {
+            byte_count += session.file_byte_count();
+            if TimestampOrderingOption::new_option(session.modified_timestamp().as_ref())
+                .is_before_optional(earliest.as_ref())
+            {
+                earliest = session.modified_timestamp();
+            }
+            if TimestampOrderingOption::new_option(session.modified_timestamp().as_ref())
+                .is_after_optional(latest.as_ref())
+            {
+                latest = session.modified_timestamp();
+            }
+        }
+        SessionInventorySourceReport {
+            source: source.kind(),
+            source_identifier: TranscriptSourceIdentifier::new(source).identifier(),
+            locator: SourceLocator {
+                root: FilesystemPath::new(source.root().path().display().to_string()),
+                relative_path: None,
+            },
+            completeness: SourceHealthCompleteness::new(health.status).completeness(),
+            discovered_files: health.discovered_files,
+            indexed_sessions: ItemCount::new(sessions.len() as u64),
+            byte_count: ByteCount::new(byte_count),
+            earliest_modified_at: earliest,
+            latest_modified_at: latest,
+        }
+    }
+
+    pub fn archive_status(&self, reference: &FragileSessionReference) -> SessionArchiveStatus {
+        if self.archive_references.is_empty() {
+            return SessionArchiveStatus::ArchiveUnknown;
+        }
+        if self.archive_references.contains(reference.as_str()) {
+            SessionArchiveStatus::Archived
+        } else {
+            SessionArchiveStatus::NotArchived
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptSourceIdentifier<'a> {
+    source: &'a TranscriptAdapterConfiguration,
+}
+
+impl<'a> TranscriptSourceIdentifier<'a> {
+    pub fn new(source: &'a TranscriptAdapterConfiguration) -> Self {
+        Self { source }
+    }
+
+    pub fn identifier(&self) -> signal_aggregator::SourceIdentifier {
+        match self.source {
+            TranscriptAdapterConfiguration::Claude(root) => {
+                crate::adapter::claude::ClaudeJsonlRootReader::new(root.path().to_path_buf())
+                    .source_identifier()
+            }
+            TranscriptAdapterConfiguration::ClaudeSubagentOutput(root) => {
+                crate::adapter::claude::ClaudeJsonlRootReader::subagent_output(
+                    root.path().to_path_buf(),
+                )
+                .source_identifier()
+            }
+            TranscriptAdapterConfiguration::Codex(root) => {
+                crate::adapter::codex::CodexSessionRootReader::new(root.path().to_path_buf())
+                    .source_identifier()
+            }
+            TranscriptAdapterConfiguration::Pi(root) => {
+                crate::adapter::pi::PiRunHistoryRootReader::new(root.path().to_path_buf())
+                    .source_identifier()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceHealthCompleteness {
+    status: SourceHealthStatus,
+}
+
+impl SourceHealthCompleteness {
+    pub fn new(status: SourceHealthStatus) -> Self {
+        Self { status }
+    }
+
+    pub fn completeness(self) -> SessionInventoryCompleteness {
+        match self.status {
+            SourceHealthStatus::DiscoveryTruncated => SessionInventoryCompleteness::Truncated,
+            SourceHealthStatus::UnreadableRoot | SourceHealthStatus::IndexStoreUnreadable => {
+                SessionInventoryCompleteness::Failed
+            }
+            SourceHealthStatus::ReadableEmpty
+            | SourceHealthStatus::ReadableIndexed
+            | SourceHealthStatus::MalformedRecords => SessionInventoryCompleteness::Complete,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceCompletenessStatus {
+    completeness: SessionInventoryCompleteness,
+}
+
+impl SourceCompletenessStatus {
+    pub fn new(completeness: SessionInventoryCompleteness) -> Self {
+        Self { completeness }
+    }
+
+    pub fn status(self) -> SourceHealthStatus {
+        match self.completeness {
+            SessionInventoryCompleteness::Complete => SourceHealthStatus::ReadableIndexed,
+            SessionInventoryCompleteness::Resumable | SessionInventoryCompleteness::Truncated => {
+                SourceHealthStatus::DiscoveryTruncated
+            }
+            SessionInventoryCompleteness::Failed => SourceHealthStatus::UnreadableRoot,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InventoryCompletenessAggregator<'a> {
+    reports: &'a [SessionInventorySourceReport],
+}
+
+impl<'a> InventoryCompletenessAggregator<'a> {
+    pub fn new(reports: &'a [SessionInventorySourceReport]) -> Self {
+        Self { reports }
+    }
+
+    pub fn completeness(self) -> SessionInventoryCompleteness {
+        if self
+            .reports
+            .iter()
+            .any(|report| report.completeness == SessionInventoryCompleteness::Failed)
+        {
+            SessionInventoryCompleteness::Failed
+        } else if self
+            .reports
+            .iter()
+            .any(|report| report.completeness == SessionInventoryCompleteness::Truncated)
+        {
+            SessionInventoryCompleteness::Truncated
+        } else if self
+            .reports
+            .iter()
+            .any(|report| report.completeness == SessionInventoryCompleteness::Resumable)
+        {
+            SessionInventoryCompleteness::Resumable
+        } else {
+            SessionInventoryCompleteness::Complete
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLookupMatcher<'a> {
+    selector: &'a SessionLookupSelector,
+}
+
+impl<'a> SessionLookupMatcher<'a> {
+    pub fn new(selector: &'a SessionLookupSelector) -> Self {
+        Self { selector }
+    }
+
+    pub fn accepts(&self, session: &SessionInventoryCard) -> bool {
+        match self.selector {
+            SessionLookupSelector::ByReference(reference) => &session.reference == reference,
+            SessionLookupSelector::ByProducerSession(identifier) => {
+                session.producer_session_identifier.as_ref() == Some(identifier)
+            }
+            SessionLookupSelector::BySourceLocator(locator) => &session.locator == locator,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimestampOrderingOption<'a> {
+    timestamp: Option<&'a Timestamp>,
+}
+
+impl<'a> TimestampOrderingOption<'a> {
+    pub fn new_option(timestamp: Option<&'a Timestamp>) -> Self {
+        Self { timestamp }
+    }
+
+    pub fn is_before_optional(&self, other: Option<&Timestamp>) -> bool {
+        match self.timestamp {
+            Some(timestamp) => TimestampOrdering::new(timestamp).is_before_optional(other),
+            None => false,
+        }
+    }
+
+    pub fn is_after_optional(&self, other: Option<&Timestamp>) -> bool {
+        match self.timestamp {
+            Some(timestamp) => TimestampOrdering::new(timestamp).is_after_optional(other),
+            None => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CurrentIndexAccumulator {
     sessions: BTreeMap<String, SessionAccumulator>,
     preview_limit: ByteLimit,
@@ -1449,6 +1832,70 @@ pub struct IndexedSession {
 }
 
 impl IndexedSession {
+    pub fn inventory_card(
+        &self,
+        source: Option<&TranscriptAdapterConfiguration>,
+        source_status: SourceHealthStatus,
+        archive_status: SessionArchiveStatus,
+    ) -> SessionInventoryCard {
+        SessionInventoryCard {
+            reference: self.reference.clone(),
+            source: self.source,
+            source_identifier: self.source_identifier.clone(),
+            producer_session_identifier: self.producer_session_identifier.clone(),
+            locator: self.source_locator(source),
+            file_count: ItemCount::new(1),
+            byte_count: ByteCount::new(self.file_byte_count()),
+            earliest_modified_at: self.modified_timestamp(),
+            latest_modified_at: self.modified_timestamp(),
+            started_at: self.started_at.clone(),
+            last_observed_at: self.last_observed_at.clone(),
+            subagent_count: Some(ItemCount::new(self.subagent_references.len() as u64)),
+            output_count: Some(ItemCount::new(self.output_references.len() as u64)),
+            lifecycle_status: self.lifecycle_status(),
+            source_status,
+            archive_status,
+        }
+    }
+
+    pub fn source_locator(&self, source: Option<&TranscriptAdapterConfiguration>) -> SourceLocator {
+        let Some(source) = source else {
+            return SourceLocator {
+                root: FilesystemPath::new(self.path.display().to_string()),
+                relative_path: None,
+            };
+        };
+        let relative_path = self
+            .path
+            .strip_prefix(source.root().path())
+            .ok()
+            .map(|path| RootRelativePath::new(path.display().to_string()));
+        SourceLocator {
+            root: FilesystemPath::new(source.root().path().display().to_string()),
+            relative_path,
+        }
+    }
+
+    pub fn lifecycle_status(&self) -> SessionLifecycleStatus {
+        if self.path.exists() {
+            SessionLifecycleStatus::Current
+        } else {
+            SessionLifecycleStatus::SourceMissing
+        }
+    }
+
+    pub fn file_byte_count(&self) -> u64 {
+        if self.fingerprint.byte_count > 0 {
+            self.fingerprint.byte_count
+        } else {
+            self.size.byte_count.map_or(0, ByteCount::into_u64)
+        }
+    }
+
+    pub fn modified_timestamp(&self) -> Option<Timestamp> {
+        self.fingerprint.modified_timestamp()
+    }
+
     pub fn card(&self) -> SessionCard {
         SessionCard {
             reference: self.reference.clone(),
@@ -2858,6 +3305,18 @@ impl SourceFingerprint {
             "{}:{}:{}",
             self.byte_count, self.modified_seconds, self.modified_nanoseconds
         )
+    }
+
+    pub fn modified_timestamp(&self) -> Option<Timestamp> {
+        let instant = time::OffsetDateTime::from_unix_timestamp(self.modified_seconds)
+            .ok()?
+            .replace_nanosecond(self.modified_nanoseconds)
+            .ok()?;
+        Some(Timestamp::new(
+            instant
+                .format(&time::format_description::well_known::Rfc3339)
+                .ok()?,
+        ))
     }
 
     pub fn to_json(&self) -> Value {
