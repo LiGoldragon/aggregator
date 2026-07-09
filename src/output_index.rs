@@ -1118,12 +1118,18 @@ impl CurrentIndexBuilder {
                 .read_records()
             }
             TranscriptAdapterConfiguration::Codex(root) => {
-                crate::adapter::codex::CodexSessionRootReader::new(root.path().to_path_buf())
-                    .read_records()
+                crate::adapter::codex::CodexSessionRootReader::with_limits(
+                    root.path().to_path_buf(),
+                    root.scan_limits().clone(),
+                )
+                .read_records()
             }
             TranscriptAdapterConfiguration::Pi(root) => {
-                crate::adapter::pi::PiRunHistoryRootReader::new(root.path().to_path_buf())
-                    .read_records()
+                crate::adapter::pi::PiRunHistoryRootReader::with_limits(
+                    root.path().to_path_buf(),
+                    root.scan_limits().clone(),
+                )
+                .read_records()
             }
         }
     }
@@ -1165,12 +1171,18 @@ impl SourceHealthObserver {
                 .read_records()
             }
             TranscriptAdapterConfiguration::Codex(root) => {
-                crate::adapter::codex::CodexSessionRootReader::new(root.path().to_path_buf())
-                    .read_records()
+                crate::adapter::codex::CodexSessionRootReader::with_limits(
+                    root.path().to_path_buf(),
+                    root.scan_limits().clone(),
+                )
+                .read_records()
             }
             TranscriptAdapterConfiguration::Pi(root) => {
-                crate::adapter::pi::PiRunHistoryRootReader::new(root.path().to_path_buf())
-                    .read_records()
+                crate::adapter::pi::PiRunHistoryRootReader::with_limits(
+                    root.path().to_path_buf(),
+                    root.scan_limits().clone(),
+                )
+                .read_records()
             }
         };
         let malformed = outcome

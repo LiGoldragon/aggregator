@@ -34,7 +34,11 @@ impl PiTranscriptAdapter {
     }
 
     pub fn collect(&self, request: &TranscriptReadRequest) -> TranscriptReadOutcome {
-        PiRunHistoryRootReader::new(self.root.path().to_path_buf()).collect(request)
+        PiRunHistoryRootReader::with_limits(
+            self.root.path().to_path_buf(),
+            self.root.scan_limits().clone(),
+        )
+        .collect(request)
     }
 }
 
@@ -100,6 +104,7 @@ impl PiRunHistoryRootReader {
         for failure in discovery.failures {
             failures.push(self.failure(failure.reason, Some(failure.path)));
         }
+        let mut scan_limits = discovery.scan_limits;
         let mut truncations = discovery
             .truncations
             .into_iter()
@@ -114,8 +119,10 @@ impl PiRunHistoryRootReader {
                     &mut records,
                     &mut failures,
                     &mut truncations,
+                    &mut scan_limits,
                 ),
                 Ok(TranscriptBoundedFileRead::Truncated(truncation)) => {
+                    scan_limits.push(truncation.scan_limit_report());
                     truncations.push(truncation.into_truncation(SourceKind::Pi));
                 }
                 Err(error) => failures.push(self.failure_from_io(error, Some(file))),
@@ -123,6 +130,7 @@ impl PiRunHistoryRootReader {
         }
         let failure_outcome = failures.finish();
         truncations.extend(failure_outcome.truncations);
+        scan_limits.extend(failure_outcome.scan_limits);
         TranscriptRawReadOutcome::with_discovered_file_count(
             SourceKind::Pi,
             source_identifier,
@@ -131,6 +139,7 @@ impl PiRunHistoryRootReader {
             failure_outcome.failures,
             discovered_files,
         )
+        .with_scan_limits(scan_limits)
     }
 
     pub fn read_file_lines(
@@ -140,6 +149,7 @@ impl PiRunHistoryRootReader {
         records: &mut Vec<TranscriptRecord>,
         failures: &mut TranscriptFailureAccumulator,
         truncations: &mut Vec<signal_aggregator::Truncation>,
+        scan_limits: &mut Vec<signal_aggregator::ScanLimitReport>,
     ) {
         for (line_index, line) in text.lines().enumerate() {
             let line_number = line_index as u64 + 1;
@@ -147,6 +157,7 @@ impl PiRunHistoryRootReader {
             let line = match line_text.bounded_text() {
                 TranscriptLineTextOutcome::Text(line) => line,
                 TranscriptLineTextOutcome::Truncated(truncation) => {
+                    scan_limits.push(truncation.scan_limit_report());
                     truncations.push(truncation.into_truncation(SourceKind::Pi));
                     failures.push(self.failure(
                         ReadFailureReason::Malformed,

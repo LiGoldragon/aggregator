@@ -34,7 +34,11 @@ impl CodexTranscriptAdapter {
     }
 
     pub fn collect(&self, request: &TranscriptReadRequest) -> TranscriptReadOutcome {
-        CodexSessionRootReader::new(self.root.path().to_path_buf()).collect(request)
+        CodexSessionRootReader::with_limits(
+            self.root.path().to_path_buf(),
+            self.root.scan_limits().clone(),
+        )
+        .collect(request)
     }
 }
 
@@ -98,6 +102,7 @@ impl CodexSessionRootReader {
             failures.push(failure);
         }
         let mut truncations = session_files.truncations;
+        let mut scan_limits = session_files.scan_limits;
         let discovered_files = session_files.files.len() as u64;
         for file in session_files.files {
             match TranscriptBoundedFile::new(file.clone(), self.limits.clone()).read_to_string() {
@@ -107,8 +112,10 @@ impl CodexSessionRootReader {
                     &mut records,
                     &mut failures,
                     &mut truncations,
+                    &mut scan_limits,
                 ),
                 Ok(TranscriptBoundedFileRead::Truncated(truncation)) => {
+                    scan_limits.push(truncation.scan_limit_report());
                     truncations.push(truncation.into_truncation(SourceKind::Codex));
                 }
                 Err(error) => failures.push(self.failure_from_io(error, Some(file))),
@@ -116,6 +123,7 @@ impl CodexSessionRootReader {
         }
         let failure_outcome = failures.finish();
         truncations.extend(failure_outcome.truncations);
+        scan_limits.extend(failure_outcome.scan_limits);
         TranscriptRawReadOutcome::with_discovered_file_count(
             SourceKind::Codex,
             source_identifier,
@@ -124,6 +132,7 @@ impl CodexSessionRootReader {
             failure_outcome.failures,
             discovered_files,
         )
+        .with_scan_limits(scan_limits)
     }
 
     pub fn session_files(&self) -> std::io::Result<CodexSessionFiles> {
@@ -149,6 +158,7 @@ impl CodexSessionRootReader {
                 .into_iter()
                 .map(|truncation| truncation.into_truncation(SourceKind::Codex))
                 .collect(),
+            scan_limits: discovery.scan_limits,
         })
     }
 
@@ -159,6 +169,7 @@ impl CodexSessionRootReader {
         records: &mut Vec<TranscriptRecord>,
         failures: &mut TranscriptFailureAccumulator,
         truncations: &mut Vec<signal_aggregator::Truncation>,
+        scan_limits: &mut Vec<signal_aggregator::ScanLimitReport>,
     ) {
         for (line_index, line) in text.lines().enumerate() {
             let line_number = line_index as u64 + 1;
@@ -166,6 +177,7 @@ impl CodexSessionRootReader {
             let line = match line_text.bounded_text() {
                 TranscriptLineTextOutcome::Text(line) => line,
                 TranscriptLineTextOutcome::Truncated(truncation) => {
+                    scan_limits.push(truncation.scan_limit_report());
                     truncations.push(truncation.into_truncation(SourceKind::Codex));
                     failures.push(self.failure(
                         ReadFailureReason::Malformed,
@@ -218,6 +230,7 @@ pub struct CodexSessionFiles {
     pub files: Vec<PathBuf>,
     pub read_failures: Vec<ReadFailure>,
     pub truncations: Vec<signal_aggregator::Truncation>,
+    pub scan_limits: Vec<signal_aggregator::ScanLimitReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,6 +253,7 @@ impl CodexIndex {
             self.limits.maximum_failures(),
         );
         let mut truncations = Vec::new();
+        let mut scan_limits = Vec::new();
         match TranscriptBoundedFile::new(self.path.clone(), self.limits.clone()).read_to_string()? {
             TranscriptBoundedFileRead::Text(text) => {
                 for (line_index, line) in text.lines().enumerate() {
@@ -249,6 +263,7 @@ impl CodexIndex {
                     let line = match line_text.bounded_text() {
                         TranscriptLineTextOutcome::Text(line) => line,
                         TranscriptLineTextOutcome::Truncated(truncation) => {
+                            scan_limits.push(truncation.scan_limit_report());
                             truncations.push(truncation.into_truncation(SourceKind::Codex));
                             read_failures.push(self.read_failure(
                                 ReadFailureReason::Malformed,
@@ -287,16 +302,19 @@ impl CodexIndex {
                 }
             }
             TranscriptBoundedFileRead::Truncated(truncation) => {
+                scan_limits.push(truncation.scan_limit_report());
                 truncations.push(truncation.into_truncation(SourceKind::Codex));
             }
         }
         files.sort();
         let failure_outcome = read_failures.finish();
         truncations.extend(failure_outcome.truncations);
+        scan_limits.extend(failure_outcome.scan_limits);
         Ok(CodexSessionFiles {
             files,
             read_failures: failure_outcome.failures,
             truncations,
+            scan_limits,
         })
     }
 

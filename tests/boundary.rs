@@ -31,12 +31,14 @@ use aggregator::{
     },
     configuration::LegacyAggregatorConfiguration,
     daemon::{PrototypeDaemon, PrototypeSocket},
+    output_index::SourceHealthObserver,
 };
 use meta_signal_aggregator::{
     ActiveRepository, AggregatorConfiguration, ConfigurationCandidate, ConfigurationChange,
     ConfigurationObservation, FilesystemPath, LegacyRecoveryAccess, LegacyRecoveryRoot,
     LegacyRecoverySource, MetaAggregatorReply, MetaAggregatorRequest, ObserveConfiguration,
-    OutputInterfaceConfiguration, RepositoryName, SocketMode, TranscriptRoot, TranscriptSource,
+    OutputInterfaceConfiguration, OutputInterfaceLimitPolicy, RepositoryName, SocketMode,
+    TranscriptRoot, TranscriptSource,
 };
 use nota::{NotaEncode, NotaSource};
 use nota_text_query::{QueryTerm, WordDistance};
@@ -45,17 +47,17 @@ use signal_aggregator::{
     ArchiveTextCompleteness, AuthoredStatus, AuthoredStatusFilter, BoundedTextProjection,
     ByteCount, ByteLimit, ByteRange, CardProjection, ContractName, DurationAmount, DurationUnit,
     EvidenceRequest, FilesystemPath as SignalFilesystemPath, FragileOutputReference,
-    FragileTranscriptBlockReference, LimitPolicy, ListingOrder, OperationRejectionReason,
-    OutputListFilter, OutputListRequest, OutputReadRange, OutputReadRequest,
-    OutputSegmentListFilter, OutputSegmentListRequest, PageLimit, PageRequest, Projection,
-    ReadFailureReason, RejectionReason, RelativeDuration, RepositoryIdentifier, RepositoryPath,
-    RepositoryWorktreeState, RequestIdentifier, RuntimeHealthRequest, ScanLimitKind, SegmentLimit,
-    SegmentProjection, SelectedSources, SessionArchiveQueryRequest, SessionArchiveReadRequest,
-    SessionArchiveRecordDraft, SessionArchiveStatus, SessionArchiveWriteRequest,
-    SessionInventoryCompleteness, SessionInventoryRequest, SessionLifecycleStatus,
-    SessionListFilter, SessionListRequest, SessionLookupRequest, SessionLookupSelector,
-    SourceHealthStatus, SourceIdentifier, SourceKind, SourceSelection, SubagentListFilter,
-    SubagentListRequest, TextQuery, TimeRange, TimeWindow, Timestamp,
+    FragileTranscriptBlockReference, ItemCount, LimitPolicy, ListingOrder,
+    OperationRejectionReason, OutputListFilter, OutputListRequest, OutputReadRange,
+    OutputReadRequest, OutputSegmentListFilter, OutputSegmentListRequest, PageLimit, PageRequest,
+    Projection, ReadFailureReason, RejectionReason, RelativeDuration, RepositoryIdentifier,
+    RepositoryPath, RepositoryWorktreeState, RequestIdentifier, RuntimeHealthRequest,
+    ScanLimitKind, SegmentLimit, SegmentProjection, SelectedSources, SessionArchiveQueryRequest,
+    SessionArchiveReadRequest, SessionArchiveRecordDraft, SessionArchiveStatus,
+    SessionArchiveWriteRequest, SessionInventoryCompleteness, SessionInventoryRequest,
+    SessionLifecycleStatus, SessionListFilter, SessionListRequest, SessionLookupRequest,
+    SessionLookupSelector, SourceHealthStatus, SourceIdentifier, SourceKind, SourceSelection,
+    SubagentListFilter, SubagentListRequest, TextQuery, TimeRange, TimeWindow, Timestamp,
     TranscriptBlockEstimateRequest, TranscriptBlockFilter, TranscriptBlockKind,
     TranscriptBlockKindSelection, TranscriptBlockListRequest, TranscriptBlockReadRequest,
     TranscriptBlockSearchRequest, TranscriptBlockTextAvailability, TranscriptBlockTextQuery,
@@ -198,6 +200,16 @@ fn read_request_with_byte_limit(
             maximum_bytes: ByteLimit::new(maximum_bytes),
         },
     )
+}
+
+fn small_discovery_limits(maximum_discovered_files: u64) -> TranscriptScanLimits {
+    TranscriptScanLimits::new(TranscriptScanLimitConfiguration::new(
+        MaximumScanEntries::new(16),
+        MaximumDiscoveredFiles::new(maximum_discovered_files),
+        MaximumFileBytes::new(4096),
+        MaximumLineBytes::new(1024),
+        MaximumReadFailures::new(8),
+    ))
 }
 
 fn transcript_block_filter(kind_selection: TranscriptBlockKindSelection) -> TranscriptBlockFilter {
@@ -2089,6 +2101,62 @@ fn codex_adapter_reads_session_index_and_tolerates_unknown_fields() {
 }
 
 #[test]
+fn codex_adapter_honors_configured_discovery_limit() {
+    let root = TempDir::new().expect("temporary root");
+    for index in 0..2 {
+        fs::write(
+            root.path().join(format!("{index}.jsonl")),
+            format!(
+                "{{\"timestamp\":\"2026-02-01T00:00:0{index}Z\",\"content\":\"codex {index}\"}}\n"
+            ),
+        )
+        .expect("write codex fixture");
+    }
+    let adapter = CodexTranscriptAdapter::new(
+        TranscriptRootConfiguration::new(root.path().to_path_buf())
+            .with_scan_limits(small_discovery_limits(1)),
+    );
+    let outcome = adapter.collect(&read_request(
+        TimeWindow::Since(Timestamp::new("2026-01-01T00:00:00Z")),
+        Projection::MetadataOnly,
+        8,
+    ));
+
+    assert_eq!(outcome.transcript_segments.len(), 1);
+    assert!(outcome.truncations.iter().any(|truncation| {
+        truncation
+            .path
+            .as_ref()
+            .is_some_and(|path| path.as_str().contains("1.jsonl"))
+    }));
+}
+
+#[test]
+fn codex_health_observation_reports_configured_discovery_limit() {
+    let root = TempDir::new().expect("temporary root");
+    for index in 0..2 {
+        fs::write(
+            root.path().join(format!("{index}.jsonl")),
+            format!(
+                "{{\"timestamp\":\"2026-02-01T00:00:0{index}Z\",\"content\":\"codex {index}\"}}\n"
+            ),
+        )
+        .expect("write codex fixture");
+    }
+    let source = TranscriptAdapterConfiguration::Codex(
+        TranscriptRootConfiguration::new(root.path().to_path_buf())
+            .with_scan_limits(small_discovery_limits(1)),
+    );
+    let health = SourceHealthObserver::new(source).observe();
+
+    assert_eq!(health.status, SourceHealthStatus::DiscoveryTruncated);
+    assert_eq!(health.discovered_files.into_u64(), 1);
+    assert!(health.scan_limits.iter().any(|limit| {
+        limit.kind == ScanLimitKind::DiscoveredFiles && limit.limit.into_u64() == 1
+    }));
+}
+
+#[test]
 fn codex_adapter_reports_index_paths_that_escape_root_as_read_failure() {
     let root = TempDir::new().expect("temporary root");
     fs::write(
@@ -2280,6 +2348,151 @@ fn pi_adapter_reads_run_history_records() {
         outcome.transcript_segments[0].projection,
         SegmentProjection::IdentifiersOnly
     ));
+}
+
+#[test]
+fn pi_adapter_honors_configured_discovery_limit() {
+    let root = TempDir::new().expect("temporary root");
+    for index in 0..2 {
+        fs::write(
+            root.path().join(format!("run-history-{index}.jsonl")),
+            format!(
+                "{{\"started_at\":\"2026-03-01T00:00:0{index}Z\",\"output\":\"pi {index}\"}}\n"
+            ),
+        )
+        .expect("write pi fixture");
+    }
+    let adapter = PiTranscriptAdapter::new(
+        TranscriptRootConfiguration::new(root.path().to_path_buf())
+            .with_scan_limits(small_discovery_limits(1)),
+    );
+    let outcome = adapter.collect(&read_request(
+        TimeWindow::Since(Timestamp::new("2026-02-01T00:00:00Z")),
+        Projection::IdentifiersOnly,
+        8,
+    ));
+
+    assert_eq!(outcome.transcript_segments.len(), 1);
+    assert!(outcome.truncations.iter().any(|truncation| {
+        truncation
+            .path
+            .as_ref()
+            .is_some_and(|path| path.as_str().contains("run-history-1.jsonl"))
+    }));
+}
+
+#[test]
+fn pi_health_observation_reports_configured_discovery_limit() {
+    let root = TempDir::new().expect("temporary root");
+    for index in 0..2 {
+        fs::write(
+            root.path().join(format!("run-history-{index}.jsonl")),
+            format!(
+                "{{\"started_at\":\"2026-03-01T00:00:0{index}Z\",\"output\":\"pi {index}\"}}\n"
+            ),
+        )
+        .expect("write pi fixture");
+    }
+    let source = TranscriptAdapterConfiguration::Pi(
+        TranscriptRootConfiguration::new(root.path().to_path_buf())
+            .with_scan_limits(small_discovery_limits(1)),
+    );
+    let health = SourceHealthObserver::new(source).observe();
+
+    assert_eq!(health.status, SourceHealthStatus::DiscoveryTruncated);
+    assert_eq!(health.discovered_files.into_u64(), 1);
+    assert!(health.scan_limits.iter().any(|limit| {
+        limit.kind == ScanLimitKind::DiscoveredFiles && limit.limit.into_u64() == 1
+    }));
+}
+
+#[test]
+fn session_inventory_reports_configured_codex_and_pi_discovery_limits() {
+    let root = TempDir::new().expect("temporary root");
+    let repository = root.path().join("repository");
+    let codex = root.path().join("codex");
+    let pi = root.path().join("pi");
+    fs::create_dir_all(&repository).expect("repository directory");
+    fs::create_dir_all(&codex).expect("codex directory");
+    fs::create_dir_all(&pi).expect("pi directory");
+    for index in 0..2 {
+        fs::write(
+            codex.join(format!("{index}.jsonl")),
+            format!(
+                "{{\"timestamp\":\"2026-02-01T00:00:0{index}Z\",\"content\":\"codex {index}\"}}\n"
+            ),
+        )
+        .expect("write codex fixture");
+        fs::write(
+            pi.join(format!("run-history-{index}.jsonl")),
+            format!(
+                "{{\"started_at\":\"2026-03-01T00:00:0{index}Z\",\"output\":\"pi {index}\"}}\n"
+            ),
+        )
+        .expect("write pi fixture");
+    }
+    let output_interfaces = OutputInterfaceConfiguration {
+        limits: OutputInterfaceLimitPolicy {
+            maximum_transcript_discovered_files: ItemCount::new(1),
+            ..OutputInterfaceLimitPolicy::default()
+        },
+        ..OutputInterfaceConfiguration::default()
+    };
+    let configuration = AggregatorConfiguration {
+        ordinary_socket_path: FilesystemPath::new(
+            root.path().join("ordinary.sock").display().to_string(),
+        ),
+        ordinary_socket_mode: SocketMode::new(0o660),
+        meta_socket_path: FilesystemPath::new(root.path().join("meta.sock").display().to_string()),
+        meta_socket_mode: SocketMode::new(0o600),
+        store_path: FilesystemPath::new(root.path().join("store.sema").display().to_string()),
+        active_repositories: vec![ActiveRepository {
+            name: RepositoryName::new("fixture-repository"),
+            path: FilesystemPath::new(repository.display().to_string()),
+        }],
+        transcript_sources: vec![
+            TranscriptSource::Codex(TranscriptRoot {
+                path: FilesystemPath::new(codex.display().to_string()),
+            }),
+            TranscriptSource::Pi(TranscriptRoot {
+                path: FilesystemPath::new(pi.display().to_string()),
+            }),
+        ],
+        default_projection: Projection::MetadataOnly,
+        default_limit_policy: LimitPolicy {
+            maximum_segments: SegmentLimit::new(16),
+            maximum_bytes: ByteLimit::new(4096),
+        },
+        output_interfaces,
+    };
+    let runtime = RuntimeConfiguration::validate_from_meta(&configuration)
+        .accepted_configuration()
+        .expect("accepted configuration")
+        .clone();
+    let clock = CollectionClock::fixed(
+        ReferenceTime::from_timestamp(Timestamp::new("2026-03-01T01:00:00Z"))
+            .expect("reference timestamp"),
+    );
+    let inventory = NexusPlane::with_runtime_configuration(runtime, clock)
+        .inventory_sessions(SessionInventoryRequest {
+            request_identifier: RequestIdentifier::new("inventory-configured-limits"),
+            source_selection: SourceSelection::AllConfigured,
+            archive_path: None,
+        })
+        .expect("inventory sessions");
+
+    for source in [SourceKind::Codex, SourceKind::Pi] {
+        let report = inventory
+            .scan_report
+            .sources
+            .iter()
+            .find(|report| report.source == source)
+            .expect("source report");
+        assert_eq!(report.discovered_files.into_u64(), 1);
+        assert!(report.scan_limits.iter().any(|limit| {
+            limit.kind == ScanLimitKind::DiscoveredFiles && limit.limit.into_u64() == 1
+        }));
+    }
 }
 
 #[test]
