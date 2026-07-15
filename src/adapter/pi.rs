@@ -10,9 +10,9 @@ use crate::{
     AdapterKind,
     adapter::{
         TranscriptBlockCollector, TranscriptBlockSourceContext, TranscriptBlockTextJoiner,
-        TranscriptBoundedFile, TranscriptBoundedFileRead, TranscriptFailureAccumulator,
-        TranscriptFileDiscovery, TranscriptJsonMetadata, TranscriptLineLocator, TranscriptLineText,
-        TranscriptLineTextOutcome, TranscriptRawReadOutcome, TranscriptReadOutcome,
+        TranscriptBoundedFile, TranscriptBoundedFileRead, TranscriptBoundedLine,
+        TranscriptFailureAccumulator, TranscriptFileDiscovery, TranscriptJsonMetadata,
+        TranscriptLineLocator, TranscriptRawReadOutcome, TranscriptReadOutcome,
         TranscriptReadRequest, TranscriptRecord, TranscriptRecordSink, TranscriptScanLimits,
     },
     configuration::TranscriptRootConfiguration,
@@ -149,21 +149,13 @@ impl PiRunHistoryRootReader {
             .collect::<Vec<_>>();
         let discovered_files = discovery.files.len() as u64;
         for file in discovery.files {
-            match TranscriptBoundedFile::new(file.clone(), self.limits.clone()).read_to_string() {
-                Ok(TranscriptBoundedFileRead::Text(text)) => self.read_file_lines(
-                    &file,
-                    &text,
-                    sink,
-                    &mut failures,
-                    &mut truncations,
-                    &mut scan_limits,
-                ),
-                Ok(TranscriptBoundedFileRead::Truncated(truncation)) => {
-                    scan_limits.push(truncation.scan_limit_report());
-                    truncations.push(truncation.into_truncation(SourceKind::Pi));
-                }
-                Err(error) => failures.push(self.failure_from_io(error, Some(file))),
-            }
+            self.read_file_lines(
+                &file,
+                sink,
+                &mut failures,
+                &mut truncations,
+                &mut scan_limits,
+            );
         }
         let failure_outcome = failures.finish();
         truncations.extend(failure_outcome.truncations);
@@ -182,40 +174,40 @@ impl PiRunHistoryRootReader {
     pub fn read_file_lines<S: TranscriptRecordSink>(
         &self,
         file: &Path,
-        text: &str,
         sink: &mut S,
         failures: &mut TranscriptFailureAccumulator,
         truncations: &mut Vec<signal_aggregator::Truncation>,
         scan_limits: &mut Vec<signal_aggregator::ScanLimitReport>,
     ) {
-        for (line_index, line) in text.lines().enumerate() {
-            let line_number = line_index as u64 + 1;
-            let line_text = TranscriptLineText::new(file, line_number, line, self.limits.clone());
-            let line = match line_text.bounded_text() {
-                TranscriptLineTextOutcome::Text(line) => line,
-                TranscriptLineTextOutcome::Truncated(truncation) => {
-                    scan_limits.push(truncation.scan_limit_report());
-                    truncations.push(truncation.into_truncation(SourceKind::Pi));
-                    failures.push(self.failure(
+        let mut receive = |bounded_line| match bounded_line {
+            TranscriptBoundedLine::Text { line_number, text } => {
+                match PiJsonlRecord::new(&text).into_transcript_record(
+                    file.to_path_buf(),
+                    line_number,
+                    self.source_identifier(),
+                ) {
+                    PiJsonlRecordResult::Record(record) => sink.observe_record(record),
+                    PiJsonlRecordResult::Malformed => failures.push(self.failure(
                         ReadFailureReason::Malformed,
                         Some(TranscriptLineLocator::new(file.to_path_buf(), line_number).path()),
-                    ));
-                    continue;
-                }
-            };
-            match PiJsonlRecord::new(line).into_transcript_record(
-                file.to_path_buf(),
-                line_number,
-                self.source_identifier(),
-            ) {
-                PiJsonlRecordResult::Record(record) => sink.observe_record(record),
-                PiJsonlRecordResult::Malformed => {
-                    failures.push(self.failure(
-                        ReadFailureReason::Malformed,
-                        Some(TranscriptLineLocator::new(file.to_path_buf(), line_number).path()),
-                    ));
+                    )),
                 }
             }
+            TranscriptBoundedLine::Truncated(truncation) => {
+                scan_limits.push(truncation.scan_limit_report());
+                truncations.push(truncation.clone().into_truncation(SourceKind::Pi));
+                failures.push(self.failure(ReadFailureReason::Malformed, truncation.path.clone()));
+            }
+        };
+        match TranscriptBoundedFile::new(file.to_path_buf(), self.limits.clone())
+            .read_lines(&mut receive)
+        {
+            Ok(TranscriptBoundedFileRead::Complete) => {}
+            Ok(TranscriptBoundedFileRead::Truncated(truncation)) => {
+                scan_limits.push(truncation.scan_limit_report());
+                truncations.push(truncation.into_truncation(SourceKind::Pi));
+            }
+            Err(error) => failures.push(self.failure_from_io(error, Some(file.to_path_buf()))),
         }
     }
 

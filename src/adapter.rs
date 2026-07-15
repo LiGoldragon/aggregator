@@ -6,6 +6,7 @@ pub mod repository;
 use std::{
     collections::BTreeSet,
     ffi::OsStr,
+    io::{BufReader, Read},
     path::{Path, PathBuf},
 };
 
@@ -1667,9 +1668,16 @@ impl TranscriptBoundedFile {
         Self { path, limits }
     }
 
-    pub fn read_to_string(&self) -> std::io::Result<TranscriptBoundedFileRead> {
-        let metadata = std::fs::metadata(&self.path)?;
-        let byte_count = metadata.len();
+    /// Delivers each line while retaining only a capped line and a fixed read buffer.
+    ///
+    /// A line beyond the configured cap is drained before the next line is delivered. This
+    /// deliberately avoids `BufRead::read_line`, whose allocation follows hostile input.
+    pub fn read_lines<F>(&self, receive: &mut F) -> std::io::Result<TranscriptBoundedFileRead>
+    where
+        F: FnMut(TranscriptBoundedLine),
+    {
+        let before = std::fs::metadata(&self.path)?;
+        let byte_count = before.len();
         if byte_count > self.limits.maximum_file_bytes() {
             return Ok(TranscriptBoundedFileRead::Truncated(
                 TranscriptLimitTruncation::new(
@@ -1679,15 +1687,114 @@ impl TranscriptBoundedFile {
                 ),
             ));
         }
-        Ok(TranscriptBoundedFileRead::Text(std::fs::read_to_string(
-            &self.path,
-        )?))
+
+        let maximum_line_bytes = self.limits.maximum_line_bytes() as usize;
+        let mut reader = BufReader::with_capacity(8 * 1024, std::fs::File::open(&self.path)?);
+        let mut input = [0_u8; 8 * 1024];
+        let mut line = Vec::with_capacity(maximum_line_bytes.min(8 * 1024));
+        let mut line_number = 1_u64;
+        let mut line_bytes = 0_u64;
+        let mut line_is_oversized = false;
+        let mut saw_bytes = false;
+
+        loop {
+            let count = reader.read(&mut input)?;
+            if count == 0 {
+                break;
+            }
+            for byte in &input[..count] {
+                saw_bytes = true;
+                if *byte == b'\n' {
+                    Self::deliver_line(
+                        &self.path,
+                        &self.limits,
+                        line_number,
+                        line_bytes,
+                        line_is_oversized,
+                        &mut line,
+                        receive,
+                    )?;
+                    line_number += 1;
+                    line_bytes = 0;
+                    line_is_oversized = false;
+                    continue;
+                }
+                line_bytes += 1;
+                if line_bytes > self.limits.maximum_line_bytes() {
+                    line_is_oversized = true;
+                    continue;
+                }
+                line.push(*byte);
+            }
+        }
+        if saw_bytes && (line_bytes > 0 || line_is_oversized) {
+            Self::deliver_line(
+                &self.path,
+                &self.limits,
+                line_number,
+                line_bytes,
+                line_is_oversized,
+                &mut line,
+                receive,
+            )?;
+        }
+
+        let after = std::fs::metadata(&self.path)?;
+        if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+            return Err(std::io::Error::other(
+                "transcript changed during bounded scan",
+            ));
+        }
+        Ok(TranscriptBoundedFileRead::Complete)
+    }
+
+    fn deliver_line<F>(
+        path: &Path,
+        limits: &TranscriptScanLimits,
+        line_number: u64,
+        line_bytes: u64,
+        line_is_oversized: bool,
+        line: &mut Vec<u8>,
+        receive: &mut F,
+    ) -> std::io::Result<()>
+    where
+        F: FnMut(TranscriptBoundedLine),
+    {
+        if line_is_oversized {
+            receive(TranscriptBoundedLine::Truncated(
+                TranscriptLimitTruncation::with_kind(
+                    Some(TranscriptLineLocator::new(path.to_path_buf(), line_number).path()),
+                    Some(line_bytes),
+                    limits.maximum_line_bytes(),
+                    ScanLimitKind::LineBytes,
+                    limits.maximum_line_bytes(),
+                ),
+            ));
+        } else {
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            let text = std::str::from_utf8(line)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            receive(TranscriptBoundedLine::Text {
+                line_number,
+                text: text.to_owned(),
+            });
+        }
+        line.clear();
+        Ok(())
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptBoundedFileRead {
-    Text(String),
+    Complete,
+    Truncated(TranscriptLimitTruncation),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptBoundedLine {
+    Text { line_number: u64, text: String },
     Truncated(TranscriptLimitTruncation),
 }
 

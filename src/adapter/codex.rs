@@ -10,11 +10,11 @@ use crate::{
     AdapterKind,
     adapter::{
         TranscriptBlockCollector, TranscriptBlockSourceContext, TranscriptBlockTextJoiner,
-        TranscriptBoundedFile, TranscriptBoundedFileRead, TranscriptDiscoveryState,
-        TranscriptFailureAccumulator, TranscriptFileDiscovery, TranscriptJsonMetadata,
-        TranscriptLineLocator, TranscriptLineText, TranscriptLineTextOutcome,
-        TranscriptRawReadOutcome, TranscriptReadOutcome, TranscriptReadRequest, TranscriptRecord,
-        TranscriptRecordSink, TranscriptScanLimits,
+        TranscriptBoundedFile, TranscriptBoundedFileRead, TranscriptBoundedLine,
+        TranscriptDiscoveryState, TranscriptFailureAccumulator, TranscriptFileDiscovery,
+        TranscriptJsonMetadata, TranscriptLineLocator, TranscriptRawReadOutcome,
+        TranscriptReadOutcome, TranscriptReadRequest, TranscriptRecord, TranscriptRecordSink,
+        TranscriptScanLimits,
     },
     configuration::TranscriptRootConfiguration,
     time_model::CanonicalTimestamp,
@@ -143,21 +143,13 @@ impl CodexSessionRootReader {
         let mut scan_limits = session_files.scan_limits;
         let discovered_files = session_files.files.len() as u64;
         for file in session_files.files {
-            match TranscriptBoundedFile::new(file.clone(), self.limits.clone()).read_to_string() {
-                Ok(TranscriptBoundedFileRead::Text(text)) => self.read_file_lines(
-                    &file,
-                    &text,
-                    sink,
-                    &mut failures,
-                    &mut truncations,
-                    &mut scan_limits,
-                ),
-                Ok(TranscriptBoundedFileRead::Truncated(truncation)) => {
-                    scan_limits.push(truncation.scan_limit_report());
-                    truncations.push(truncation.into_truncation(SourceKind::Codex));
-                }
-                Err(error) => failures.push(self.failure_from_io(error, Some(file))),
-            }
+            self.read_file_lines(
+                &file,
+                sink,
+                &mut failures,
+                &mut truncations,
+                &mut scan_limits,
+            );
         }
         let failure_outcome = failures.finish();
         truncations.extend(failure_outcome.truncations);
@@ -203,40 +195,40 @@ impl CodexSessionRootReader {
     pub fn read_file_lines<S: TranscriptRecordSink>(
         &self,
         file: &Path,
-        text: &str,
         sink: &mut S,
         failures: &mut TranscriptFailureAccumulator,
         truncations: &mut Vec<signal_aggregator::Truncation>,
         scan_limits: &mut Vec<signal_aggregator::ScanLimitReport>,
     ) {
-        for (line_index, line) in text.lines().enumerate() {
-            let line_number = line_index as u64 + 1;
-            let line_text = TranscriptLineText::new(file, line_number, line, self.limits.clone());
-            let line = match line_text.bounded_text() {
-                TranscriptLineTextOutcome::Text(line) => line,
-                TranscriptLineTextOutcome::Truncated(truncation) => {
-                    scan_limits.push(truncation.scan_limit_report());
-                    truncations.push(truncation.into_truncation(SourceKind::Codex));
-                    failures.push(self.failure(
+        let mut receive = |bounded_line| match bounded_line {
+            TranscriptBoundedLine::Text { line_number, text } => {
+                match CodexJsonlRecord::new(&text).into_transcript_record(
+                    file.to_path_buf(),
+                    line_number,
+                    self.source_identifier(),
+                ) {
+                    CodexJsonlRecordResult::Record(record) => sink.observe_record(record),
+                    CodexJsonlRecordResult::Malformed => failures.push(self.failure(
                         ReadFailureReason::Malformed,
                         Some(TranscriptLineLocator::new(file.to_path_buf(), line_number).path()),
-                    ));
-                    continue;
-                }
-            };
-            match CodexJsonlRecord::new(line).into_transcript_record(
-                file.to_path_buf(),
-                line_number,
-                self.source_identifier(),
-            ) {
-                CodexJsonlRecordResult::Record(record) => sink.observe_record(record),
-                CodexJsonlRecordResult::Malformed => {
-                    failures.push(self.failure(
-                        ReadFailureReason::Malformed,
-                        Some(TranscriptLineLocator::new(file.to_path_buf(), line_number).path()),
-                    ));
+                    )),
                 }
             }
+            TranscriptBoundedLine::Truncated(truncation) => {
+                scan_limits.push(truncation.scan_limit_report());
+                truncations.push(truncation.clone().into_truncation(SourceKind::Codex));
+                failures.push(self.failure(ReadFailureReason::Malformed, truncation.path.clone()));
+            }
+        };
+        match TranscriptBoundedFile::new(file.to_path_buf(), self.limits.clone())
+            .read_lines(&mut receive)
+        {
+            Ok(TranscriptBoundedFileRead::Complete) => {}
+            Ok(TranscriptBoundedFileRead::Truncated(truncation)) => {
+                scan_limits.push(truncation.scan_limit_report());
+                truncations.push(truncation.into_truncation(SourceKind::Codex));
+            }
+            Err(error) => failures.push(self.failure_from_io(error, Some(file.to_path_buf()))),
         }
     }
 
@@ -292,58 +284,42 @@ impl CodexIndex {
         );
         let mut truncations = Vec::new();
         let mut scan_limits = Vec::new();
-        match TranscriptBoundedFile::new(self.path.clone(), self.limits.clone()).read_to_string()? {
-            TranscriptBoundedFileRead::Text(text) => {
-                for (line_index, line) in text.lines().enumerate() {
-                    let line_number = line_index as u64 + 1;
-                    let line_text =
-                        TranscriptLineText::new(&self.path, line_number, line, self.limits.clone());
-                    let line = match line_text.bounded_text() {
-                        TranscriptLineTextOutcome::Text(line) => line,
-                        TranscriptLineTextOutcome::Truncated(truncation) => {
-                            scan_limits.push(truncation.scan_limit_report());
-                            truncations.push(truncation.into_truncation(SourceKind::Codex));
-                            read_failures.push(self.read_failure(
-                                ReadFailureReason::Malformed,
-                                line_number,
-                                None,
-                            ));
-                            continue;
-                        }
-                    };
-                    let record = CodexIndexRecord::new(line).path();
-                    match record {
-                        CodexIndexRecordPath::Path(path) => {
-                            match CodexIndexPath::new(self.root.clone(), path.clone())
-                                .session_path()
-                            {
-                                Ok(path) => {
-                                    discovery_state.observe_transcript_file(path);
-                                    if discovery_state.is_complete() {
-                                        break;
+        let mut receive = |bounded_line| match bounded_line {
+            TranscriptBoundedLine::Text { line_number, text } => {
+                match CodexIndexRecord::new(&text).path() {
+                    CodexIndexRecordPath::Path(path) => {
+                        match CodexIndexPath::new(self.root.clone(), path.clone()).session_path() {
+                            Ok(path) => discovery_state.observe_transcript_file(path),
+                            Err(error) => read_failures.push(self.read_failure(
+                                match error.kind() {
+                                    std::io::ErrorKind::PermissionDenied => {
+                                        ReadFailureReason::PermissionDenied
                                     }
-                                }
-                                Err(error) => read_failures.push(self.read_failure(
-                                    match error.kind() {
-                                        std::io::ErrorKind::PermissionDenied => {
-                                            ReadFailureReason::PermissionDenied
-                                        }
-                                        std::io::ErrorKind::NotFound => ReadFailureReason::Missing,
-                                        _ => ReadFailureReason::IoFailure,
-                                    },
-                                    line_number,
-                                    Some(path),
-                                )),
-                            }
+                                    std::io::ErrorKind::NotFound => ReadFailureReason::Missing,
+                                    _ => ReadFailureReason::IoFailure,
+                                },
+                                line_number,
+                                Some(path),
+                            )),
                         }
-                        CodexIndexRecordPath::Malformed => read_failures.push(self.read_failure(
-                            ReadFailureReason::Malformed,
-                            line_number,
-                            None,
-                        )),
                     }
+                    CodexIndexRecordPath::Malformed => read_failures.push(self.read_failure(
+                        ReadFailureReason::Malformed,
+                        line_number,
+                        None,
+                    )),
                 }
             }
+            TranscriptBoundedLine::Truncated(truncation) => {
+                scan_limits.push(truncation.scan_limit_report());
+                truncations.push(truncation.clone().into_truncation(SourceKind::Codex));
+                read_failures.push(self.read_failure(ReadFailureReason::Malformed, 0, None));
+            }
+        };
+        match TranscriptBoundedFile::new(self.path.clone(), self.limits.clone())
+            .read_lines(&mut receive)?
+        {
+            TranscriptBoundedFileRead::Complete => {}
             TranscriptBoundedFileRead::Truncated(truncation) => {
                 scan_limits.push(truncation.scan_limit_report());
                 truncations.push(truncation.into_truncation(SourceKind::Codex));
