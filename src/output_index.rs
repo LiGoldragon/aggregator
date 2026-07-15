@@ -3161,10 +3161,13 @@ impl TranscriptBlockBackingReader {
                 return Err(factory.unauthorized(reference));
             }
         }
+        // The persisted card's size is untrusted for allocation: a changed backing line must
+        // be rejected as oversized rather than expanding the single-line buffer to its claimed
+        // corpus size.  JSON framing gets a fixed allowance while payload remains read-capped.
         let line_limit = self
             .maximum_line_bytes
             .into_u64()
-            .max(self.block.size_byte_count().saturating_add(4096))
+            .saturating_add(4096)
             .max(4096);
         let line = BoundedLineReader::new(
             self.block.path.clone(),
@@ -5417,9 +5420,11 @@ impl OneBackingLineCache {
             block.reference.clone(),
         ));
         if self.path.as_ref() != Some(&block.path) || self.line_number != block.source_line_number {
+            // Search has exactly one bounded backing-line buffer.  Do not trust a card's
+            // recorded size to widen that buffer after its backing evidence changes.
             let line_limit = maximum_read_bytes
                 .into_u64()
-                .max(block.size_byte_count().saturating_add(4096))
+                .saturating_add(4096)
                 .max(4096);
             let line =
                 BoundedLineReader::new(block.path.clone(), block.source_line_number, line_limit)
