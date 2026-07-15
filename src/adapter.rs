@@ -148,11 +148,24 @@ pub struct TranscriptReadOutcome {
     pub read_failures: Vec<signal_aggregator::ReadFailure>,
 }
 
+/// Receives one parsed transcript record while its source line is still bounded.
+pub trait TranscriptRecordSink {
+    fn observe_record(&mut self, record: TranscriptRecord);
+}
+
+impl TranscriptRecordSink for Vec<TranscriptRecord> {
+    fn observe_record(&mut self, record: TranscriptRecord) {
+        self.push(record);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptRawReadOutcome {
     pub source: SourceKind,
     pub source_identifier: SourceIdentifier,
     pub records: Vec<TranscriptRecord>,
+    /// Counts parsed records even when a streaming caller elects not to retain them.
+    pub record_count: u64,
     pub truncations: Vec<Truncation>,
     pub read_failures: Vec<signal_aggregator::ReadFailure>,
     pub discovered_files: u64,
@@ -187,15 +200,22 @@ impl TranscriptRawReadOutcome {
         read_failures: Vec<signal_aggregator::ReadFailure>,
         discovered_files: u64,
     ) -> Self {
+        let record_count = records.len() as u64;
         Self {
             source,
             source_identifier,
             records,
+            record_count,
             truncations,
             read_failures,
             discovered_files,
             scan_limits: Vec::new(),
         }
+    }
+
+    pub fn with_record_count(mut self, record_count: u64) -> Self {
+        self.record_count = record_count;
+        self
     }
 
     pub fn with_scan_limits(mut self, scan_limits: Vec<ScanLimitReport>) -> Self {

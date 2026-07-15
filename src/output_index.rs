@@ -40,8 +40,8 @@ use crate::{
     CollectionClock, Error, Result, RuntimeConfiguration, TranscriptAdapterConfiguration,
     adapter::{
         OutputLineCounter, TimeWindowAcceptance, TimeWindowMatcher, TranscriptBlockRecord,
-        TranscriptRawReadOutcome, TranscriptRecord, claude::ClaudeJsonlRecord,
-        codex::CodexJsonlRecord, pi::PiJsonlRecord,
+        TranscriptRawReadOutcome, TranscriptRecord, TranscriptRecordSink,
+        claude::ClaudeJsonlRecord, codex::CodexJsonlRecord, pi::PiJsonlRecord,
     },
     configuration::RuntimeStorePath,
 };
@@ -70,7 +70,8 @@ impl OutputInterfaceRuntime {
             .configuration
             .transcript_sources()
             .iter()
-            .map(|source| SourceHealthObserver::new(source.clone()).observe())
+            .zip(current.scan_outcomes())
+            .map(|(source, outcome)| SourceHealthObserver::new(source.clone()).from_scan(outcome))
             .collect::<Vec<_>>();
         let counts = current.health_counts();
         RuntimeHealthObserved {
@@ -96,16 +97,17 @@ impl OutputInterfaceRuntime {
         &self,
         request: SessionInventoryRequest,
     ) -> OutputOperationResult<SessionsInventoried> {
-        let index = self.refreshed_index(
+        let refreshed = self.refreshed_index_with_scan(
             &request.request_identifier,
             OperationKind::InventorySessions,
         )?;
         let archive_references = self.archive_references(request.archive_path.as_ref());
         let inventory = SessionInventoryBuilder::new(
             self.configuration.clone(),
-            index,
+            refreshed.index,
             request.source_selection.clone(),
             archive_references,
+            refreshed.scans,
         )
         .build();
         Ok(SessionsInventoried {
@@ -119,14 +121,15 @@ impl OutputInterfaceRuntime {
         &self,
         request: SessionLookupRequest,
     ) -> OutputOperationResult<SessionLookedUp> {
-        let index =
-            self.refreshed_index(&request.request_identifier, OperationKind::LookupSession)?;
+        let refreshed = self
+            .refreshed_index_with_scan(&request.request_identifier, OperationKind::LookupSession)?;
         let archive_references = self.archive_references(request.archive_path.as_ref());
         let inventory = SessionInventoryBuilder::new(
             self.configuration.clone(),
-            index,
+            refreshed.index,
             SourceSelection::AllConfigured,
             archive_references,
+            refreshed.scans,
         )
         .build();
         let sessions = inventory
@@ -688,28 +691,50 @@ impl OutputInterfaceRuntime {
         request_identifier: &RequestIdentifier,
         operation: OperationKind,
     ) -> OutputOperationResult<DurableFragileIndex> {
+        self.refreshed_index_with_scan(request_identifier, operation)
+            .map(RefreshedFragileIndex::into_index)
+    }
+
+    /// Refreshes once and carries the scan facts to projections that need coverage metadata.
+    pub fn refreshed_index_with_scan(
+        &self,
+        request_identifier: &RequestIdentifier,
+        operation: OperationKind,
+    ) -> OutputOperationResult<RefreshedFragileIndex> {
         let store = FragileIndexStore::from_store_path(self.configuration.store_path());
         let existing_format = store.format().map_err(|_| {
             OperationRejectedFactory::new(request_identifier.clone(), operation).unsupported()
         })?;
         match CurrentIndexBuilder::new(self.configuration.clone()).build() {
-            CurrentIndexBuild::Complete(current) => {
+            CurrentIndexBuild::Complete {
+                index: current,
+                scans,
+            } => {
                 let durable = DurableFragileIndex::from_current(current);
                 store.write(&durable).map_err(|_| {
                     OperationRejectedFactory::new(request_identifier.clone(), operation)
                         .unsupported()
                 })?;
-                Ok(durable)
+                Ok(RefreshedFragileIndex::new(durable, scans))
             }
-            CurrentIndexBuild::Incomplete(current) => {
+            CurrentIndexBuild::Incomplete {
+                index: current,
+                scans,
+            } => {
                 if existing_format == FragileIndexFormat::Current {
                     drop(current);
-                    store.read_current().map_err(|_| {
-                        OperationRejectedFactory::new(request_identifier.clone(), operation)
-                            .unsupported()
-                    })
+                    store
+                        .read_current()
+                        .map(|index| RefreshedFragileIndex::new(index, scans))
+                        .map_err(|_| {
+                            OperationRejectedFactory::new(request_identifier.clone(), operation)
+                                .unsupported()
+                        })
                 } else {
-                    Ok(DurableFragileIndex::from_current(current))
+                    Ok(RefreshedFragileIndex::new(
+                        DurableFragileIndex::from_current(current),
+                        scans,
+                    ))
                 }
             }
         }
@@ -745,6 +770,22 @@ impl OutputInterfaceRuntime {
                 })
             })
             .transpose()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshedFragileIndex {
+    index: DurableFragileIndex,
+    scans: Vec<TranscriptRawReadOutcome>,
+}
+
+impl RefreshedFragileIndex {
+    pub fn new(index: DurableFragileIndex, scans: Vec<TranscriptRawReadOutcome>) -> Self {
+        Self { index, scans }
+    }
+
+    pub fn into_index(self) -> DurableFragileIndex {
+        self.index
     }
 }
 
@@ -931,25 +972,36 @@ impl CurrentFragileIndex {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CurrentIndexBuild {
-    Complete(CurrentFragileIndex),
-    Incomplete(CurrentFragileIndex),
+    Complete {
+        index: CurrentFragileIndex,
+        scans: Vec<TranscriptRawReadOutcome>,
+    },
+    Incomplete {
+        index: CurrentFragileIndex,
+        scans: Vec<TranscriptRawReadOutcome>,
+    },
 }
 
 impl CurrentIndexBuild {
     pub fn health_counts(&self) -> (u64, u64, u64, u64) {
+        let index = self.index();
+        (
+            index.sessions.len() as u64,
+            index.subagents.len() as u64,
+            index.outputs.len() as u64,
+            index.transcript_blocks.len() as u64,
+        )
+    }
+
+    pub fn index(&self) -> &CurrentFragileIndex {
         match self {
-            Self::Complete(index) => (
-                index.sessions.len() as u64,
-                index.subagents.len() as u64,
-                index.outputs.len() as u64,
-                index.transcript_blocks.len() as u64,
-            ),
-            Self::Incomplete(index) => (
-                index.sessions.len() as u64,
-                index.subagents.len() as u64,
-                index.outputs.len() as u64,
-                index.transcript_blocks.len() as u64,
-            ),
+            Self::Complete { index, .. } | Self::Incomplete { index, .. } => index,
+        }
+    }
+
+    pub fn scan_outcomes(&self) -> &[TranscriptRawReadOutcome] {
+        match self {
+            Self::Complete { scans, .. } | Self::Incomplete { scans, .. } => scans,
         }
     }
 }
@@ -972,27 +1024,33 @@ impl CurrentIndexBuilder {
                 .maximum_preview_bytes,
         );
         let mut complete = true;
+        let mut scans = Vec::new();
         for source in self.configuration.transcript_sources() {
-            let outcome = self.read_source(source);
+            let outcome = self.scan_source_into(source, &mut accumulator);
             complete &= outcome.is_complete();
-            accumulator.merge(outcome);
+            scans.push(outcome);
         }
         let index = accumulator.finish();
         if complete {
-            CurrentIndexBuild::Complete(index)
+            CurrentIndexBuild::Complete { index, scans }
         } else {
-            CurrentIndexBuild::Incomplete(index)
+            CurrentIndexBuild::Incomplete { index, scans }
         }
     }
 
-    pub fn read_source(&self, source: &TranscriptAdapterConfiguration) -> TranscriptRawReadOutcome {
+    /// Streams a configured source directly into its derived accumulator.
+    pub fn scan_source_into<S: TranscriptRecordSink>(
+        &self,
+        source: &TranscriptAdapterConfiguration,
+        sink: &mut S,
+    ) -> TranscriptRawReadOutcome {
         match source {
             TranscriptAdapterConfiguration::Claude(root) => {
                 crate::adapter::claude::ClaudeJsonlRootReader::with_limits(
                     root.path().to_path_buf(),
                     root.scan_limits().clone(),
                 )
-                .read_records()
+                .scan_records(sink)
             }
             TranscriptAdapterConfiguration::ClaudeSubagentOutput(root) => {
                 crate::adapter::claude::ClaudeJsonlRootReader::with_limits_and_source(
@@ -1000,7 +1058,7 @@ impl CurrentIndexBuilder {
                     root.scan_limits().clone(),
                     SourceKind::ClaudeSubagentOutput,
                 )
-                .read_records()
+                .scan_records(sink)
             }
             TranscriptAdapterConfiguration::PiSubagentOutput(root) => {
                 crate::adapter::claude::ClaudeJsonlRootReader::with_limits_and_source(
@@ -1008,21 +1066,21 @@ impl CurrentIndexBuilder {
                     root.scan_limits().clone(),
                     SourceKind::PiSubagentOutput,
                 )
-                .read_records()
+                .scan_records(sink)
             }
             TranscriptAdapterConfiguration::Codex(root) => {
                 crate::adapter::codex::CodexSessionRootReader::with_limits(
                     root.path().to_path_buf(),
                     root.scan_limits().clone(),
                 )
-                .read_records()
+                .scan_records(sink)
             }
             TranscriptAdapterConfiguration::Pi(root) => {
                 crate::adapter::pi::PiRunHistoryRootReader::with_limits(
                     root.path().to_path_buf(),
                     root.scan_limits().clone(),
                 )
-                .read_records()
+                .scan_records(sink)
             }
         }
     }
@@ -1078,6 +1136,11 @@ impl SourceHealthObserver {
                 .read_records()
             }
         };
+        self.from_scan(&outcome)
+    }
+
+    /// Projects the facts from an already-completed scan without rereading the source.
+    pub fn from_scan(&self, outcome: &TranscriptRawReadOutcome) -> SourceHealthCard {
         let malformed = outcome
             .read_failures
             .iter()
@@ -1090,22 +1153,22 @@ impl SourceHealthObserver {
             SourceHealthStatus::DiscoveryTruncated
         } else if malformed > 0 {
             SourceHealthStatus::MalformedRecords
-        } else if outcome.records.is_empty() {
+        } else if outcome.record_count == 0 {
             SourceHealthStatus::ReadableEmpty
         } else {
             SourceHealthStatus::ReadableIndexed
         };
         SourceHealthCard {
             source: self.source.kind(),
-            source_identifier: outcome.source_identifier,
+            source_identifier: outcome.source_identifier.clone(),
             locator: SourceLocator {
                 root: FilesystemPath::new(self.source.root().path().display().to_string()),
                 relative_path: None,
             },
             status,
-            scan_limits: outcome.scan_limits,
+            scan_limits: outcome.scan_limits.clone(),
             discovered_files: ItemCount::new(outcome.discovered_files),
-            indexed_records: ItemCount::new(outcome.records.len() as u64),
+            indexed_records: ItemCount::new(outcome.record_count),
             malformed_records: ItemCount::new(malformed),
             unreadable_records: ItemCount::new(unreadable),
         }
@@ -1124,6 +1187,7 @@ pub struct SessionInventoryBuilder {
     index: DurableFragileIndex,
     source_selection: SourceSelection,
     archive_references: BTreeSet<String>,
+    scans: Vec<TranscriptRawReadOutcome>,
 }
 
 impl SessionInventoryBuilder {
@@ -1132,12 +1196,14 @@ impl SessionInventoryBuilder {
         index: DurableFragileIndex,
         source_selection: SourceSelection,
         archive_references: BTreeSet<String>,
+        scans: Vec<TranscriptRawReadOutcome>,
     ) -> Self {
         Self {
             configuration,
             index,
             source_selection,
             archive_references,
+            scans,
         }
     }
 
@@ -1207,7 +1273,26 @@ impl SessionInventoryBuilder {
         &self,
         source: &TranscriptAdapterConfiguration,
     ) -> SessionInventorySourceReport {
-        let health = SourceHealthObserver::new(source.clone()).observe();
+        let identifier = TranscriptSourceIdentifier::new(source).identifier();
+        let health = self
+            .scans
+            .iter()
+            .find(|outcome| outcome.source_identifier == identifier)
+            .map(|outcome| SourceHealthObserver::new(source.clone()).from_scan(outcome))
+            .unwrap_or_else(|| SourceHealthCard {
+                source: source.kind(),
+                source_identifier: identifier.clone(),
+                locator: SourceLocator {
+                    root: FilesystemPath::new(source.root().path().display().to_string()),
+                    relative_path: None,
+                },
+                status: SourceHealthStatus::IndexStoreUnreadable,
+                scan_limits: Vec::new(),
+                discovered_files: ItemCount::new(0),
+                indexed_records: ItemCount::new(0),
+                malformed_records: ItemCount::new(0),
+                unreadable_records: ItemCount::new(0),
+            });
         let sessions = self
             .index
             .current_sessions()
@@ -1436,6 +1521,12 @@ impl<'a> TimestampOrderingOption<'a> {
 pub struct CurrentIndexAccumulator {
     sessions: BTreeMap<String, SessionAccumulator>,
     preview_limit: ByteLimit,
+}
+
+impl TranscriptRecordSink for CurrentIndexAccumulator {
+    fn observe_record(&mut self, record: TranscriptRecord) {
+        self.observe(record);
+    }
 }
 
 impl CurrentIndexAccumulator {

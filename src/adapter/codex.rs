@@ -14,11 +14,30 @@ use crate::{
         TranscriptFailureAccumulator, TranscriptFileDiscovery, TranscriptJsonMetadata,
         TranscriptLineLocator, TranscriptLineText, TranscriptLineTextOutcome,
         TranscriptRawReadOutcome, TranscriptReadOutcome, TranscriptReadRequest, TranscriptRecord,
-        TranscriptScanLimits,
+        TranscriptRecordSink, TranscriptScanLimits,
     },
     configuration::TranscriptRootConfiguration,
     time_model::CanonicalTimestamp,
 };
+
+#[derive(Debug)]
+pub struct CountingTranscriptRecordSink<'a, S> {
+    sink: &'a mut S,
+    count: &'a mut u64,
+}
+
+impl<'a, S> CountingTranscriptRecordSink<'a, S> {
+    pub fn new(sink: &'a mut S, count: &'a mut u64) -> Self {
+        Self { sink, count }
+    }
+}
+
+impl<S: TranscriptRecordSink> TranscriptRecordSink for CountingTranscriptRecordSink<'_, S> {
+    fn observe_record(&mut self, record: TranscriptRecord) {
+        *self.count += 1;
+        self.sink.observe_record(record);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexTranscriptAdapter {
@@ -69,6 +88,24 @@ impl CodexSessionRootReader {
     }
 
     pub fn read_records(&self) -> TranscriptRawReadOutcome {
+        let mut records = Vec::new();
+        let mut outcome = self.scan_records(&mut records);
+        outcome.records = records;
+        outcome
+    }
+
+    /// Streams records to the caller; parsed JSON and record text are dropped after each callback.
+    pub fn scan_records<S: TranscriptRecordSink>(&self, sink: &mut S) -> TranscriptRawReadOutcome {
+        let mut record_count = 0_u64;
+        let mut counted = CountingTranscriptRecordSink::new(sink, &mut record_count);
+        let outcome = self.scan_records_into(&mut counted);
+        outcome.with_record_count(record_count)
+    }
+
+    pub fn scan_records_into<S: TranscriptRecordSink>(
+        &self,
+        sink: &mut S,
+    ) -> TranscriptRawReadOutcome {
         let source_identifier = self.source_identifier();
         if !self.root.exists() {
             return TranscriptRawReadOutcome::with_discovered_file_count(
@@ -93,7 +130,7 @@ impl CodexSessionRootReader {
                 );
             }
         };
-        let mut records = Vec::new();
+
         let mut failures = TranscriptFailureAccumulator::new(
             SourceKind::Codex,
             Some(self.root.clone()),
@@ -110,7 +147,7 @@ impl CodexSessionRootReader {
                 Ok(TranscriptBoundedFileRead::Text(text)) => self.read_file_lines(
                     &file,
                     &text,
-                    &mut records,
+                    sink,
                     &mut failures,
                     &mut truncations,
                     &mut scan_limits,
@@ -128,7 +165,7 @@ impl CodexSessionRootReader {
         TranscriptRawReadOutcome::with_discovered_file_count(
             SourceKind::Codex,
             source_identifier,
-            records,
+            Vec::new(),
             truncations,
             failure_outcome.failures,
             discovered_files,
@@ -163,11 +200,11 @@ impl CodexSessionRootReader {
         })
     }
 
-    pub fn read_file_lines(
+    pub fn read_file_lines<S: TranscriptRecordSink>(
         &self,
         file: &Path,
         text: &str,
-        records: &mut Vec<TranscriptRecord>,
+        sink: &mut S,
         failures: &mut TranscriptFailureAccumulator,
         truncations: &mut Vec<signal_aggregator::Truncation>,
         scan_limits: &mut Vec<signal_aggregator::ScanLimitReport>,
@@ -192,7 +229,7 @@ impl CodexSessionRootReader {
                 line_number,
                 self.source_identifier(),
             ) {
-                CodexJsonlRecordResult::Record(record) => records.push(record),
+                CodexJsonlRecordResult::Record(record) => sink.observe_record(record),
                 CodexJsonlRecordResult::Malformed => {
                     failures.push(self.failure(
                         ReadFailureReason::Malformed,

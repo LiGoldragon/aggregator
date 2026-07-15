@@ -13,11 +13,30 @@ use crate::{
         TranscriptBoundedFile, TranscriptBoundedFileRead, TranscriptFailureAccumulator,
         TranscriptFileDiscovery, TranscriptJsonMetadata, TranscriptLineLocator, TranscriptLineText,
         TranscriptLineTextOutcome, TranscriptRawReadOutcome, TranscriptReadOutcome,
-        TranscriptReadRequest, TranscriptRecord, TranscriptScanLimits,
+        TranscriptReadRequest, TranscriptRecord, TranscriptRecordSink, TranscriptScanLimits,
     },
     configuration::TranscriptRootConfiguration,
     time_model::CanonicalTimestamp,
 };
+
+#[derive(Debug)]
+pub struct CountingTranscriptRecordSink<'a, S> {
+    sink: &'a mut S,
+    count: &'a mut u64,
+}
+
+impl<'a, S> CountingTranscriptRecordSink<'a, S> {
+    pub fn new(sink: &'a mut S, count: &'a mut u64) -> Self {
+        Self { sink, count }
+    }
+}
+
+impl<S: TranscriptRecordSink> TranscriptRecordSink for CountingTranscriptRecordSink<'_, S> {
+    fn observe_record(&mut self, record: TranscriptRecord) {
+        *self.count += 1;
+        self.sink.observe_record(record);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PiTranscriptAdapter {
@@ -68,6 +87,24 @@ impl PiRunHistoryRootReader {
     }
 
     pub fn read_records(&self) -> TranscriptRawReadOutcome {
+        let mut records = Vec::new();
+        let mut outcome = self.scan_records(&mut records);
+        outcome.records = records;
+        outcome
+    }
+
+    /// Streams records to the caller; parsed JSON and record text are dropped after each callback.
+    pub fn scan_records<S: TranscriptRecordSink>(&self, sink: &mut S) -> TranscriptRawReadOutcome {
+        let mut record_count = 0_u64;
+        let mut counted = CountingTranscriptRecordSink::new(sink, &mut record_count);
+        let outcome = self.scan_records_into(&mut counted);
+        outcome.with_record_count(record_count)
+    }
+
+    pub fn scan_records_into<S: TranscriptRecordSink>(
+        &self,
+        sink: &mut S,
+    ) -> TranscriptRawReadOutcome {
         let source_identifier = self.source_identifier();
         if !self.root.exists() {
             return TranscriptRawReadOutcome::with_discovered_file_count(
@@ -95,7 +132,7 @@ impl PiRunHistoryRootReader {
                     );
                 }
             };
-        let mut records = Vec::new();
+
         let mut failures = TranscriptFailureAccumulator::new(
             SourceKind::Pi,
             Some(self.root.clone()),
@@ -116,7 +153,7 @@ impl PiRunHistoryRootReader {
                 Ok(TranscriptBoundedFileRead::Text(text)) => self.read_file_lines(
                     &file,
                     &text,
-                    &mut records,
+                    sink,
                     &mut failures,
                     &mut truncations,
                     &mut scan_limits,
@@ -134,7 +171,7 @@ impl PiRunHistoryRootReader {
         TranscriptRawReadOutcome::with_discovered_file_count(
             SourceKind::Pi,
             source_identifier,
-            records,
+            Vec::new(),
             truncations,
             failure_outcome.failures,
             discovered_files,
@@ -142,11 +179,11 @@ impl PiRunHistoryRootReader {
         .with_scan_limits(scan_limits)
     }
 
-    pub fn read_file_lines(
+    pub fn read_file_lines<S: TranscriptRecordSink>(
         &self,
         file: &Path,
         text: &str,
-        records: &mut Vec<TranscriptRecord>,
+        sink: &mut S,
         failures: &mut TranscriptFailureAccumulator,
         truncations: &mut Vec<signal_aggregator::Truncation>,
         scan_limits: &mut Vec<signal_aggregator::ScanLimitReport>,
@@ -171,7 +208,7 @@ impl PiRunHistoryRootReader {
                 line_number,
                 self.source_identifier(),
             ) {
-                PiJsonlRecordResult::Record(record) => records.push(record),
+                PiJsonlRecordResult::Record(record) => sink.observe_record(record),
                 PiJsonlRecordResult::Malformed => {
                     failures.push(self.failure(
                         ReadFailureReason::Malformed,

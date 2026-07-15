@@ -20,7 +20,7 @@ use aggregator::{
     adapter::{
         MaximumDiscoveredFiles, MaximumFileBytes, MaximumLineBytes, MaximumReadFailures,
         MaximumScanEntries, TranscriptReadOutcome, TranscriptReadRequest, TranscriptRecord,
-        TranscriptScanLimitConfiguration, TranscriptScanLimits,
+        TranscriptRecordSink, TranscriptScanLimitConfiguration, TranscriptScanLimits,
         claude::{ClaudeJsonlRootReader, ClaudeTranscriptAdapter},
         codex::{CodexSessionRootReader, CodexTranscriptAdapter},
         pi::{PiRunHistoryRootReader, PiTranscriptAdapter},
@@ -674,6 +674,40 @@ fn transcript_reader_caps_file_discovery_line_size_and_failure_reports() {
             .as_ref()
             .is_some_and(|path| path.as_str().contains("first.jsonl:2"))
     }));
+}
+
+#[derive(Debug, Default)]
+struct StreamingRecordCounter {
+    count: u64,
+    maximum_record_bytes: u64,
+}
+
+impl TranscriptRecordSink for StreamingRecordCounter {
+    fn observe_record(&mut self, record: TranscriptRecord) {
+        self.count += 1;
+        self.maximum_record_bytes = self.maximum_record_bytes.max(record.byte_count());
+    }
+}
+
+#[test]
+fn transcript_scanner_streams_records_without_retaining_source_records() {
+    let root = TempDir::new().expect("temporary root");
+    let payload = "x".repeat(32 * 1024);
+    fs::write(
+        root.path().join("session.jsonl"),
+        format!(
+            "{{\"timestamp\":\"2026-01-02T00:00:00Z\",\"text\":\"{payload}\"}}\n{{\"timestamp\":\"2026-01-02T00:00:01Z\",\"text\":\"{payload}\"}}\n"
+        ),
+    )
+    .expect("write synthetic transcript fixture");
+
+    let mut counter = StreamingRecordCounter::default();
+    let outcome = ClaudeJsonlRootReader::new(root.path().to_path_buf()).scan_records(&mut counter);
+
+    assert_eq!(counter.count, 2);
+    assert_eq!(outcome.record_count, 2);
+    assert!(outcome.records.is_empty());
+    assert_eq!(counter.maximum_record_bytes, 32 * 1024);
 }
 
 #[test]
