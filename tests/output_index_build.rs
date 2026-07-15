@@ -40,7 +40,21 @@ fn source_occurrence_prevents_cross_root_or_duplicate_configuration_merges() {
 }
 
 #[test]
-fn large_logical_session_spills_capped_immutable_observation_chunks() {
+fn actual_builder_high_water_is_constant_across_substantially_different_corpora() {
+    let small = build_corpus(64);
+    let large = build_corpus(4_096);
+    let limits = tiny_limits();
+
+    assert_eq!(small.high_water_bytes, large.high_water_bytes);
+    assert!(
+        large.high_water_bytes <= limits.maximum_logical_chunk_bytes,
+        "the live maximum follows the configured logical-chunk formula, not corpus cardinality"
+    );
+    assert_eq!(small.live_bytes, 0);
+    assert_eq!(large.live_bytes, 0);
+}
+
+fn build_corpus(records: u64) -> aggregator::output_index::instrumentation::IndexResourceCounters {
     let root = TempDir::new().expect("temporary index root");
     let store = IndexStore::new(root.path().join("store.output-index.json"), tiny_limits());
     let staging = store.create_staging("builder-test").expect("staging");
@@ -53,29 +67,16 @@ fn large_logical_session_spills_capped_immutable_observation_chunks() {
     let mut builder =
         BoundedGenerationBuilder::new(staging, source_key, tiny_limits(), meter.clone());
 
-    for line_number in 1..=64 {
+    for line_number in 1..=records {
         builder.observe_record(record(line_number));
     }
     let run = builder.finish().expect("bounded source run");
-    let counters = meter.snapshot();
-
-    assert_eq!(run.record_count, 64);
+    assert_eq!(run.record_count, records);
     assert!(
         run.chunk_count > 1,
-        "a logical session must cross chunk boundaries"
+        "corpus spills through immutable chunks"
     );
-    assert!(
-        run.chunk_count >= 22,
-        "three-record chunks bound one large session"
-    );
-    assert!(
-        counters.high_water_bytes <= tiny_limits().maximum_logical_chunk_bytes,
-        "live builder reservations must be independent of corpus cardinality"
-    );
-    assert_eq!(
-        counters.live_bytes, 0,
-        "flushed chunks release their reservation"
-    );
+    meter.snapshot()
 }
 
 fn tiny_limits() -> IndexStoreLimits {

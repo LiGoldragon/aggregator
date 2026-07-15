@@ -106,15 +106,19 @@ collection live in its adjacent `.output-index.json.d/` directory. Each chunk
 has fixed logical, serialized, record, and query-work limits and is validated
 for kind, checksum, and size before decoding.
 
-Refreshes publish snapshot-bound v3 state atomically. Complete sources advance
-independently; incomplete sources retain their last-complete view and report
-provisional/resumable coverage rather than being mistaken for complete data.
-A v2 document is migration-only: it is boundedly imported and copied once to an
-immutable rollback backup before the pointer is replaced. Version-1 data is
-obsolete and is discarded without decoding. Backing evidence remains the read
-source, so references can become stale, missing, or broken when those files
-change; operations reject those cases with typed `OperationRejected` replies
-instead of guessing.
+The v3 disk primitives define the intended snapshot-bound model: complete
+sources advance independently, incomplete sources retain a last-complete view
+with provisional/resumable coverage, and v2 is boundedly imported before its
+pointer is replaced. **They are not yet the live runtime implementation.** The
+current runtime still materializes a legacy in-memory snapshot for build and
+query, and its v2 importer/reconciler are not wired into publication. A v2
+pointer is now explicitly rejected while an incomplete refresh is present, so
+it cannot be misrepresented as an empty index or an ephemeral partial view;
+version-1 data is discarded without decoding. The remaining v3 runtime cutover
+is a deployment blocker, not architecture evidence. Backing evidence remains
+the read source, so references can become stale, missing, or broken when those
+files change; operations reject those cases with typed `OperationRejected`
+replies instead of guessing.
 
 ## Privacy and projection
 

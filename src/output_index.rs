@@ -756,20 +756,29 @@ impl OutputInterfaceRuntime {
                 index: current,
                 scans,
             } => {
-                if existing_format == FragileIndexFormat::Current {
-                    drop(current);
-                    store
+                // A v2 pointer is the only complete evidence until a bounded migration has
+                // published its replacement; an incomplete first refresh must not expose a
+                // subset in its place.  A missing/v1 store has no such prior evidence, so its
+                // provisional scan remains available solely to report current coverage.
+                match existing_format {
+                    FragileIndexFormat::Current => store
                         .read_current()
                         .map(|index| RefreshedFragileIndex::new(index, scans))
                         .map_err(|_| {
                             OperationRejectedFactory::new(request_identifier.clone(), operation)
                                 .unsupported()
-                        })
-                } else {
-                    Ok(RefreshedFragileIndex::new(
-                        DurableFragileIndex::from_current(current),
-                        scans,
-                    ))
+                        }),
+                    FragileIndexFormat::MigratableV2 => Err(OperationRejectedFactory::new(
+                        request_identifier.clone(),
+                        operation,
+                    )
+                    .unsupported()),
+                    FragileIndexFormat::Missing | FragileIndexFormat::ObsoleteV1 => {
+                        Ok(RefreshedFragileIndex::new(
+                            DurableFragileIndex::from_current(current),
+                            scans,
+                        ))
+                    }
                 }
             }
         }
@@ -2616,9 +2625,15 @@ impl FragileIndexStore {
 
     pub fn read_or_empty(&self) -> Result<DurableFragileIndex> {
         match self.format()? {
-            FragileIndexFormat::Missing | FragileIndexFormat::Legacy => {
+            FragileIndexFormat::Missing | FragileIndexFormat::ObsoleteV1 => {
                 Ok(DurableFragileIndex::empty())
             }
+            // A v2 pointer is evidence awaiting a bounded migration, not an empty index.  Making
+            // it look empty used to send reference operations through an incomplete refresh.
+            FragileIndexFormat::MigratableV2 => Err(Error::protocol(
+                "fragile output index migration",
+                "v2 evidence requires a complete bounded replacement",
+            )),
             FragileIndexFormat::Current => self.read_current(),
         }
     }
@@ -2629,8 +2644,12 @@ impl FragileIndexStore {
                 Ok(_) => SourceHealthStatus::ReadableIndexed,
                 Err(_) => SourceHealthStatus::IndexStoreUnreadable,
             },
-            Ok(FragileIndexFormat::Missing) => SourceHealthStatus::ReadableEmpty,
-            Ok(FragileIndexFormat::Legacy) | Err(_) => SourceHealthStatus::IndexStoreUnreadable,
+            Ok(FragileIndexFormat::Missing) | Ok(FragileIndexFormat::ObsoleteV1) => {
+                SourceHealthStatus::ReadableEmpty
+            }
+            Ok(FragileIndexFormat::MigratableV2) | Err(_) => {
+                SourceHealthStatus::IndexStoreUnreadable
+            }
         }
     }
 
@@ -2644,10 +2663,20 @@ impl FragileIndexStore {
         // A v2 document is never decoded on the live path. Preserve its immutable migration
         // evidence, then remove only the compatibility pointer so v3 publication can establish
         // the normal compare-and-swap root without accepting an oversized JSON pointer.
-        if matches!(self.format(), Ok(FragileIndexFormat::Legacy)) {
-            store.retain_v2_backup(&self.path)?;
-            fs::remove_file(&self.path)
-                .map_err(|error| Error::io("retiring migrated v2 index pointer", error))?;
+        match self.format()? {
+            FragileIndexFormat::MigratableV2 => {
+                // Keep the immutable legacy evidence until a complete replacement is ready.
+                // The pointer changes only after the new generation has been fully staged.
+                store.retain_v2_backup(&self.path)?;
+                fs::remove_file(&self.path)
+                    .map_err(|error| Error::io("retiring migrated v2 index pointer", error))?;
+            }
+            FragileIndexFormat::ObsoleteV1 => {
+                // Version 1 is intentionally discarded without decoding it.
+                fs::remove_file(&self.path)
+                    .map_err(|error| Error::io("retiring obsolete v1 index pointer", error))?;
+            }
+            FragileIndexFormat::Missing | FragileIndexFormat::Current => {}
         }
         let identity = *blake3::hash(
             &serde_json::to_vec(&index.collection_signature()).map_err(|error| {
@@ -2847,9 +2876,8 @@ impl FragileIndexStore {
         match migration_v2::IndexFormatProbe::new(&prefix[..read]).format() {
             migration_v2::IndexFormat::CurrentV3 => Ok(FragileIndexFormat::Current),
             migration_v2::IndexFormat::Missing => Ok(FragileIndexFormat::Missing),
-            migration_v2::IndexFormat::ObsoleteV1 | migration_v2::IndexFormat::MigratableV2 => {
-                Ok(FragileIndexFormat::Legacy)
-            }
+            migration_v2::IndexFormat::ObsoleteV1 => Ok(FragileIndexFormat::ObsoleteV1),
+            migration_v2::IndexFormat::MigratableV2 => Ok(FragileIndexFormat::MigratableV2),
             migration_v2::IndexFormat::Unsupported => Err(Error::protocol(
                 "fragile output index version",
                 "unsupported version header",
@@ -2916,7 +2944,10 @@ impl FragileIndexStore {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FragileIndexFormat {
     Missing,
-    Legacy,
+    /// Version 1 is intentionally discarded without decoding.
+    ObsoleteV1,
+    /// Version 2 remains authoritative until a complete v3 replacement is published.
+    MigratableV2,
     Current,
 }
 
