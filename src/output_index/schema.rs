@@ -56,17 +56,7 @@ impl DiskPath {
         }
     }
 }
-#[derive(
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-    serde::Deserialize,
-    serde::Serialize,
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct CurrentPointer {
     pub schema_version: u32,
     pub format_version: u32,

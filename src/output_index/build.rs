@@ -105,7 +105,8 @@ pub struct SourceGenerationRun {
 /// The immutable publication result contains only scalar source facts and opaque chunk locators.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundedGenerationPublication {
-    pub pointer: CurrentPointer,
+    /// The pointer is absent when an incomplete first scan has no last-complete v3 truth.
+    pub pointer: Option<CurrentPointer>,
     pub source_runs: Vec<SourceGenerationRun>,
     pub scan_outcomes: Vec<TranscriptRawReadOutcome>,
     pub resource_high_water_bytes: u64,
@@ -161,6 +162,29 @@ impl BoundedIndexRefresher {
             source_runs.push(run);
         }
         let snapshot_identity = SnapshotIdentity::new(&source_runs).value();
+        let complete = scan_outcomes
+            .iter()
+            .all(TranscriptRawReadOutcome::is_complete);
+        if !complete {
+            // A partially scanned first generation never becomes query truth. Existing complete
+            // truth remains pointed to while the scan facts report the provisional coverage.
+            return Ok(BoundedGenerationPublication {
+                pointer: self.store.read_current_pointer()?,
+                source_runs,
+                scan_outcomes,
+                resource_high_water_bytes: self.meter.snapshot().high_water_bytes,
+            });
+        }
+        if let Some(current) = self.store.read_current_pointer()?
+            && current.snapshot_identity == snapshot_identity
+        {
+            return Ok(BoundedGenerationPublication {
+                pointer: Some(current),
+                source_runs,
+                scan_outcomes,
+                resource_high_water_bytes: self.meter.snapshot().high_water_bytes,
+            });
+        }
         let manifest = IndexManifestRecord::new(&source_runs).chunk();
         let manifest_locator = IndexLocator::new("manifest");
         staging.write_chunk(&manifest_locator, IndexFileKind::Manifest, &manifest)?;
@@ -168,7 +192,7 @@ impl BoundedIndexRefresher {
             .store
             .publish(&staging, &manifest_locator, snapshot_identity)?;
         Ok(BoundedGenerationPublication {
-            pointer,
+            pointer: Some(pointer),
             source_runs,
             scan_outcomes,
             resource_high_water_bytes: self.meter.snapshot().high_water_bytes,
@@ -387,18 +411,20 @@ impl BoundedGenerationBuilder {
     fn emit_typed_projection(&mut self, record: &TranscriptRecord) -> Result<()> {
         let fingerprint = SourceFingerprint::from_path(&record.path)
             .unwrap_or_else(|_| SourceFingerprint::missing());
-        let session_reference = FragileSessionReference::new(
-            StableReference::new(
-                "session",
+        let session_material = record.session_identifier.as_ref().map_or_else(
+            || {
                 format!(
                     "{}|{}|{}|{}",
                     SourceKindName::new(record.source).as_str(),
                     record.source_identifier.as_str(),
                     record.path.display(),
                     fingerprint.material(),
-                ),
-            )
-            .as_string(),
+                )
+            },
+            |identifier| format!("producer-session|{}", identifier.as_str()),
+        );
+        let session_reference = FragileSessionReference::new(
+            StableReference::new("session", session_material).as_string(),
         );
         let subagent_reference = record.subagent_name.as_ref().map(|name| {
             FragileSubagentReference::new(

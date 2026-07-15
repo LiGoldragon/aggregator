@@ -376,18 +376,21 @@ impl ParentSummarySink for TestSummarySink {
 
 #[test]
 fn v2_pointer_is_not_misrepresented_as_an_empty_v3_index() {
-    use aggregator::output_index::FragileIndexStore;
+    use aggregator::output_index::{limits::IndexStoreLimits, store::IndexStore};
 
     let root = TempDir::new().expect("temporary root");
-    let index = FragileIndexStore::from_store_path(&root.path().join("store"));
-    fs::write(index.path(), v2_fixture("synthetic-preview")).expect("v2 evidence");
+    let index = IndexStore::new(
+        root.path().join("store.output-index.json"),
+        IndexStoreLimits::default(),
+    );
+    fs::write(index.pointer_path(), v2_fixture("synthetic-preview")).expect("v2 evidence");
 
     let error = index
-        .read_or_empty()
+        .read_current_pointer()
         .expect_err("v2 must remain explicit migration evidence");
-    assert!(matches!(error, Error::Protocol { .. }));
+    assert!(matches!(error, Error::IndexStore { .. }));
     assert_eq!(
-        fs::read(index.path()).expect("unchanged v2 pointer"),
+        fs::read(index.pointer_path()).expect("unchanged v2 pointer"),
         v2_fixture("synthetic-preview").as_bytes(),
         "probing does not destroy the only complete legacy evidence"
     );

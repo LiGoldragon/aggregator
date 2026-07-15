@@ -21,6 +21,7 @@ use super::{
 const ENVELOPE_MAGIC: [u8; 8] = *b"AGGIDX03";
 const ENVELOPE_BYTES: usize = 54;
 const POINTER_SCHEMA_VERSION: u32 = 1;
+const POINTER_MAGIC: [u8; 8] = *b"AGGIDX03";
 static GENERATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Owns the compatibility pointer and its adjacent immutable typed data root.
@@ -145,6 +146,69 @@ impl IndexStore {
         Ok(ChunkReader::new(path, kind, self.limits))
     }
 
+    /// Visits projection leaves in the published generation in deterministic locator order.
+    /// The visitor owns only the current validated chunk; it never receives a corpus-sized
+    /// locator collection.
+    pub fn visit_projection_chunks<F>(
+        &self,
+        pointer: &CurrentPointer,
+        visitor: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(IndexChunk) -> Result<()>,
+    {
+        let manifest = IndexLocator::new(pointer.manifest_locator.clone());
+        manifest.validate()?;
+        let manifest_path = self.chunk_path(&manifest)?;
+        self.verify_regular_file(&manifest_path)?;
+        let generation = manifest_path
+            .parent()
+            .ok_or_else(|| Error::index_store(IndexStoreError::UnsafePath))?;
+        self.verify_directory(generation)?;
+        let relative_generation = generation
+            .strip_prefix(&self.data_root)
+            .map_err(|_| Error::index_store(IndexStoreError::UnsafePath))?;
+        let mut entries = fs::read_dir(generation)
+            .map_err(|error| {
+                Error::index_store(IndexStoreError::io("reading published generation", error))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| {
+                Error::index_store(IndexStoreError::io(
+                    "reading published generation entry",
+                    error,
+                ))
+            })?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let kind = entry.file_type().map_err(|error| {
+                Error::index_store(IndexStoreError::io(
+                    "reading published generation entry type",
+                    error,
+                ))
+            })?;
+            if kind.is_symlink() || !kind.is_file() {
+                return Err(Error::index_store(IndexStoreError::UnsafePath));
+            }
+            if !name.contains("-projection-") {
+                continue;
+            }
+            let locator = IndexLocator::new(
+                relative_generation
+                    .join(entry.file_name())
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            locator.validate()?;
+            visitor(
+                self.open_reader(&locator, IndexFileKind::Projection)?
+                    .read()?,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Reads the typed compatibility pointer without decoding any referenced manifest.
     pub fn read_current_pointer(&self) -> Result<Option<CurrentPointer>> {
         let Some(bytes) = self.read_pointer_bytes()? else {
@@ -157,7 +221,10 @@ impl IndexStore {
                 limit: self.limits.maximum_manifest_bytes,
             }));
         }
-        let pointer = serde_json::from_slice::<CurrentPointer>(&bytes)
+        let archived = bytes
+            .strip_prefix(&POINTER_MAGIC)
+            .ok_or_else(|| Error::index_store(IndexStoreError::CorruptArchive))?;
+        let pointer = rkyv::from_bytes::<CurrentPointer, rkyv::rancor::Error>(archived)
             .map_err(|_| Error::index_store(IndexStoreError::CorruptArchive))?;
         if pointer.schema_version != POINTER_SCHEMA_VERSION
             || pointer.format_version != IndexStoreFormatVersion::V3Chunked as u32
@@ -329,11 +396,13 @@ impl IndexStore {
     }
 
     fn write_pointer(&self, pointer: &CurrentPointer) -> Result<()> {
-        let bytes = serde_json::to_vec(pointer).map_err(|error| {
+        let archived = rkyv::to_bytes::<rkyv::rancor::Error>(pointer).map_err(|error| {
             Error::index_store(IndexStoreError::Serialization {
                 detail: error.to_string(),
             })
         })?;
+        let mut bytes = POINTER_MAGIC.to_vec();
+        bytes.extend_from_slice(&archived);
         if bytes.len() as u64 > self.limits.maximum_manifest_bytes {
             return Err(Error::index_store(IndexStoreError::OversizedEnvelope {
                 kind: "current pointer",

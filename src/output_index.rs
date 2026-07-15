@@ -16,8 +16,11 @@ use std::{
     time::UNIX_EPOCH,
 };
 
+use self::{
+    schema::{ProjectionRecordDto, ProjectionSizeDto, ProjectionTaskDto},
+    store::IndexStore,
+};
 use nota_text_query::{Query, QueryTerm, SearchText};
-use serde_json::{Value, json};
 use signal_aggregator::{
     AuthoredStatus, AuthoredStatusFilter, ByteCount, ByteLimit, ByteRange, CardProjection,
     DurationUnit, FilesystemPath, FragileOutputReference, FragileOutputSegmentReference,
@@ -49,8 +52,8 @@ use crate::{
     CollectionClock, Error, Result, RuntimeConfiguration, TranscriptAdapterConfiguration,
     adapter::{
         OutputLineCounter, TimeWindowAcceptance, TimeWindowMatcher, TranscriptBlockRecord,
-        TranscriptRawReadOutcome, TranscriptRecord, TranscriptRecordSink,
-        claude::ClaudeJsonlRecord, codex::CodexJsonlRecord, pi::PiJsonlRecord,
+        TranscriptRawReadOutcome, TranscriptRecord, claude::ClaudeJsonlRecord,
+        codex::CodexJsonlRecord, pi::PiJsonlRecord,
     },
     configuration::RuntimeStorePath,
 };
@@ -72,17 +75,32 @@ impl OutputInterfaceRuntime {
     }
 
     pub fn observe_health(&self, request: RuntimeHealthRequest) -> RuntimeHealthObserved {
-        let current = RuntimeIndexBuild::new(self.configuration.clone()).build();
-        let index_status =
-            FragileIndexStore::from_store_path(self.configuration.store_path()).health_status();
+        let refreshed = self.refresh_typed_snapshot();
+        let (snapshot, scans, index_status) = match refreshed {
+            Ok(refreshed) => (
+                refreshed.index,
+                refreshed.scans,
+                SourceHealthStatus::ReadableIndexed,
+            ),
+            Err(_) => (
+                IndexSnapshot::empty(),
+                Vec::new(),
+                SourceHealthStatus::IndexStoreUnreadable,
+            ),
+        };
         let sources = self
             .configuration
             .transcript_sources()
             .iter()
-            .zip(current.scan_outcomes())
+            .zip(scans.iter())
             .map(|(source, outcome)| SourceHealthObserver::new(source.clone()).from_scan(outcome))
             .collect::<Vec<_>>();
-        let counts = current.health_counts();
+        let counts = (
+            snapshot.sessions.len() as u64,
+            snapshot.subagents.len() as u64,
+            snapshot.outputs.len() as u64,
+            snapshot.transcript_blocks.len() as u64,
+        );
         RuntimeHealthObserved {
             request_identifier: request.request_identifier,
             capabilities: RuntimeCapabilities {
@@ -229,7 +247,7 @@ impl OutputInterfaceRuntime {
             OperationKind::ListSessions,
         )?;
         let mut sessions = index
-            .all_sessions()
+            .session_records()
             .filter(|session| {
                 SourceSelectionFilter::new(&request.filter.source_selection).accepts(session.source)
             })
@@ -275,7 +293,7 @@ impl OutputInterfaceRuntime {
             OperationKind::ListSubagents,
         )?;
         let mut subagents = index
-            .all_subagents()
+            .subagent_records()
             .filter(|subagent| subagent.session_reference == request.filter.session_reference)
             .filter(|subagent| {
                 AuthoredStatusFilterMatcher::new(&request.filter.authored_status)
@@ -343,7 +361,7 @@ impl OutputInterfaceRuntime {
             OperationKind::ListOutputs,
         )?;
         let mut outputs = index
-            .all_outputs()
+            .output_records()
             .filter(|output| {
                 SourceSelectionFilter::new(&request.filter.source_selection)
                     .accepts(output.provenance.source)
@@ -427,7 +445,7 @@ impl OutputInterfaceRuntime {
             OperationKind::ListOutputSegments,
         )?;
         let mut segments = index
-            .all_segments()
+            .segment_records()
             .filter(|segment| segment.output_reference == request.filter.output_reference)
             .collect::<Vec<_>>();
         IndexedSegmentSorter::new(request.page.order).sort(&mut segments);
@@ -554,7 +572,7 @@ impl OutputInterfaceRuntime {
         )?;
         let mut blocks =
             TranscriptBlockFilterMatcher::new(&request.filter, lowered_time_window.as_ref())
-                .matching_blocks(index.all_transcript_blocks());
+                .matching_blocks(index.transcript_block_records());
         IndexedTranscriptBlockSorter::new(request.page.order).sort(&mut blocks);
         let page = PaginationWindow::new(
             request.request_identifier.clone(),
@@ -615,7 +633,7 @@ impl OutputInterfaceRuntime {
         )?;
         let mut blocks =
             TranscriptBlockFilterMatcher::new(&request.filter, lowered_time_window.as_ref())
-                .matching_blocks(index.all_transcript_blocks());
+                .matching_blocks(index.transcript_block_records());
         IndexedTranscriptBlockSorter::new(request.page.order).sort(&mut blocks);
         let matches = StreamingTranscriptBlockSearch::new(
             request.query.clone(),
@@ -725,9 +743,9 @@ impl OutputInterfaceRuntime {
         &self,
         request_identifier: &RequestIdentifier,
         operation: OperationKind,
-    ) -> OutputOperationResult<DurableFragileIndex> {
+    ) -> OutputOperationResult<IndexSnapshot> {
         self.refreshed_index_with_scan(request_identifier, operation)
-            .map(RefreshedFragileIndex::into_index)
+            .map(RefreshedIndexSnapshot::into_index)
     }
 
     /// Refreshes once and carries the scan facts to projections that need coverage metadata.
@@ -735,69 +753,45 @@ impl OutputInterfaceRuntime {
         &self,
         request_identifier: &RequestIdentifier,
         operation: OperationKind,
-    ) -> OutputOperationResult<RefreshedFragileIndex> {
-        let store = FragileIndexStore::from_store_path(self.configuration.store_path());
-        let existing_format = store.format().map_err(|_| {
+    ) -> OutputOperationResult<RefreshedIndexSnapshot> {
+        self.refresh_typed_snapshot().map_err(|_| {
             OperationRejectedFactory::new(request_identifier.clone(), operation).unsupported()
-        })?;
-        match RuntimeIndexBuild::new(self.configuration.clone()).build() {
-            RuntimeIndexBuildResult::Complete {
-                index: current,
-                scans,
-            } => {
-                let durable = DurableFragileIndex::from_current(current);
-                store.write(&durable).map_err(|_| {
-                    OperationRejectedFactory::new(request_identifier.clone(), operation)
-                        .unsupported()
-                })?;
-                Ok(RefreshedFragileIndex::new(durable, scans))
-            }
-            RuntimeIndexBuildResult::Incomplete {
-                index: current,
-                scans,
-            } => {
-                // A v2 pointer is the only complete evidence until a bounded migration has
-                // published its replacement; an incomplete first refresh must not expose a
-                // subset in its place.  A missing/v1 store has no such prior evidence, so its
-                // provisional scan remains available solely to report current coverage.
-                match existing_format {
-                    FragileIndexFormat::Current => store
-                        .read_current()
-                        .map(|index| RefreshedFragileIndex::new(index, scans))
-                        .map_err(|_| {
-                            OperationRejectedFactory::new(request_identifier.clone(), operation)
-                                .unsupported()
-                        }),
-                    FragileIndexFormat::MigratableV2 => Err(OperationRejectedFactory::new(
-                        request_identifier.clone(),
-                        operation,
-                    )
-                    .unsupported()),
-                    FragileIndexFormat::Missing | FragileIndexFormat::ObsoleteV1 => {
-                        Ok(RefreshedFragileIndex::new(
-                            DurableFragileIndex::from_current(current),
-                            scans,
-                        ))
-                    }
-                }
-            }
-        }
+        })
     }
 
     pub fn index_for_reference_operation(
         &self,
         request_identifier: &RequestIdentifier,
         operation: OperationKind,
-    ) -> OutputOperationResult<DurableFragileIndex> {
-        let store = FragileIndexStore::from_store_path(self.configuration.store_path());
-        let durable = store.read_or_empty().map_err(|_| {
-            OperationRejectedFactory::new(request_identifier.clone(), operation).unsupported()
-        })?;
-        if durable.is_empty() {
-            self.refreshed_index(request_identifier, operation)
-        } else {
-            Ok(durable)
+    ) -> OutputOperationResult<IndexSnapshot> {
+        let store = self.typed_store();
+        match IndexSnapshot::from_typed_store(&store) {
+            Ok(snapshot) if !snapshot.is_empty() => Ok(snapshot),
+            _ => self.refreshed_index(request_identifier, operation),
         }
+    }
+
+    fn refresh_typed_snapshot(&self) -> Result<RefreshedIndexSnapshot> {
+        let store = self.typed_store();
+        let publication = build::BoundedIndexRefresher::new(
+            self.configuration.clone(),
+            store.clone(),
+            limits::IndexStoreLimits::default(),
+            instrumentation::IndexResourceMeter::default(),
+        )
+        .refresh()?;
+        Ok(RefreshedIndexSnapshot::new(
+            IndexSnapshot::from_typed_store(&store)?,
+            publication.scan_outcomes,
+        ))
+    }
+
+    fn typed_store(&self) -> IndexStore {
+        IndexStore::new(
+            RuntimeStorePath::new(self.configuration.store_path().to_path_buf())
+                .fragile_index_path(),
+            limits::IndexStoreLimits::default(),
+        )
     }
 
     pub fn lower_optional_time_window(
@@ -818,23 +812,23 @@ impl OutputInterfaceRuntime {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RefreshedFragileIndex {
-    index: DurableFragileIndex,
+pub struct RefreshedIndexSnapshot {
+    index: IndexSnapshot,
     scans: Vec<TranscriptRawReadOutcome>,
 }
 
-impl RefreshedFragileIndex {
-    pub fn new(index: DurableFragileIndex, scans: Vec<TranscriptRawReadOutcome>) -> Self {
+impl RefreshedIndexSnapshot {
+    pub fn new(index: IndexSnapshot, scans: Vec<TranscriptRawReadOutcome>) -> Self {
         Self { index, scans }
     }
 
-    pub fn into_index(self) -> DurableFragileIndex {
+    pub fn into_index(self) -> IndexSnapshot {
         self.index
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DurableFragileIndex {
+pub struct IndexSnapshot {
     sessions: Vec<IndexedSession>,
     subagents: Vec<IndexedSubagent>,
     outputs: Vec<IndexedOutput>,
@@ -842,7 +836,7 @@ pub struct DurableFragileIndex {
     transcript_blocks: Vec<IndexedTranscriptBlock>,
 }
 
-impl DurableFragileIndex {
+impl IndexSnapshot {
     pub fn empty() -> Self {
         Self {
             sessions: Vec::new(),
@@ -853,39 +847,45 @@ impl DurableFragileIndex {
         }
     }
 
-    pub fn from_current(current: RuntimeBuildIndex) -> Self {
-        Self {
-            sessions: current.sessions,
-            subagents: current.subagents,
-            outputs: current.outputs,
-            segments: current.segments,
-            transcript_blocks: current.transcript_blocks,
-        }
-    }
-
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty() && self.outputs.is_empty() && self.transcript_blocks.is_empty()
     }
 
+    /// Reopens only the published v3 projection leaves. The persisted representation is typed;
+    /// JSON is not part of live publication or query.
+    pub fn from_typed_store(store: &IndexStore) -> Result<Self> {
+        let Some(pointer) = store.read_current_pointer()? else {
+            return Ok(Self::empty());
+        };
+        let mut decoder = TypedProjectionDecoder::new();
+        store.visit_projection_chunks(&pointer, &mut |chunk| {
+            if let Some(projection) = chunk.projection {
+                decoder.observe(projection)?;
+            }
+            Ok(())
+        })?;
+        Ok(decoder.finish())
+    }
+
     /// Streams one card at a time. This compatibility snapshot does not hand callers a cloned
     /// collection, which keeps request-owned page memory independent of the stored collection.
-    pub fn all_sessions(&self) -> impl Iterator<Item = IndexedSession> + '_ {
+    pub fn session_records(&self) -> impl Iterator<Item = IndexedSession> + '_ {
         self.sessions.iter().cloned()
     }
 
-    pub fn all_subagents(&self) -> impl Iterator<Item = IndexedSubagent> + '_ {
+    pub fn subagent_records(&self) -> impl Iterator<Item = IndexedSubagent> + '_ {
         self.subagents.iter().cloned()
     }
 
-    pub fn all_outputs(&self) -> impl Iterator<Item = IndexedOutput> + '_ {
+    pub fn output_records(&self) -> impl Iterator<Item = IndexedOutput> + '_ {
         self.outputs.iter().cloned()
     }
 
-    pub fn all_segments(&self) -> impl Iterator<Item = IndexedOutputSegment> + '_ {
+    pub fn segment_records(&self) -> impl Iterator<Item = IndexedOutputSegment> + '_ {
         self.segments.iter().cloned()
     }
 
-    pub fn all_transcript_blocks(&self) -> impl Iterator<Item = IndexedTranscriptBlock> + '_ {
+    pub fn transcript_block_records(&self) -> impl Iterator<Item = IndexedTranscriptBlock> + '_ {
         self.transcript_blocks.iter().cloned()
     }
 
@@ -958,179 +958,299 @@ impl DurableFragileIndex {
         }
         hasher.finalize().to_hex().to_string()
     }
-
-    pub fn from_json(value: &Value) -> Self {
-        let reader = JsonReader::new(value);
-        Self {
-            sessions: reader
-                .array("sessions")
-                .into_iter()
-                .filter_map(IndexedSession::from_json)
-                .collect(),
-            subagents: reader
-                .array("subagents")
-                .into_iter()
-                .filter_map(IndexedSubagent::from_json)
-                .collect(),
-            outputs: reader
-                .array("outputs")
-                .into_iter()
-                .filter_map(IndexedOutput::from_json)
-                .collect(),
-            segments: reader
-                .array("segments")
-                .into_iter()
-                .filter_map(IndexedOutputSegment::from_json)
-                .collect(),
-            transcript_blocks: reader
-                .array("transcript_blocks")
-                .into_iter()
-                .filter_map(IndexedTranscriptBlock::from_json)
-                .collect(),
-        }
-    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeBuildIndex {
-    sessions: Vec<IndexedSession>,
-    subagents: Vec<IndexedSubagent>,
-    outputs: Vec<IndexedOutput>,
-    segments: Vec<IndexedOutputSegment>,
-    transcript_blocks: Vec<IndexedTranscriptBlock>,
+#[derive(Debug, Default)]
+struct TypedProjectionDecoder {
+    sessions: BTreeMap<String, IndexedSession>,
+    subagents: BTreeMap<String, IndexedSubagent>,
+    outputs: BTreeMap<String, IndexedOutput>,
+    segments: BTreeMap<String, IndexedOutputSegment>,
+    transcript_blocks: BTreeMap<String, IndexedTranscriptBlock>,
 }
 
-impl RuntimeBuildIndex {
-    pub fn new(
-        sessions: Vec<IndexedSession>,
-        subagents: Vec<IndexedSubagent>,
-        outputs: Vec<IndexedOutput>,
-        segments: Vec<IndexedOutputSegment>,
-        transcript_blocks: Vec<IndexedTranscriptBlock>,
-    ) -> Self {
-        Self {
-            sessions,
-            subagents,
-            outputs,
-            segments,
-            transcript_blocks,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RuntimeIndexBuildResult {
-    Complete {
-        index: RuntimeBuildIndex,
-        scans: Vec<TranscriptRawReadOutcome>,
-    },
-    Incomplete {
-        index: RuntimeBuildIndex,
-        scans: Vec<TranscriptRawReadOutcome>,
-    },
-}
-
-impl RuntimeIndexBuildResult {
-    pub fn health_counts(&self) -> (u64, u64, u64, u64) {
-        let index = self.index();
-        (
-            index.sessions.len() as u64,
-            index.subagents.len() as u64,
-            index.outputs.len() as u64,
-            index.transcript_blocks.len() as u64,
-        )
+impl TypedProjectionDecoder {
+    fn new() -> Self {
+        Self::default()
     }
 
-    pub fn index(&self) -> &RuntimeBuildIndex {
-        match self {
-            Self::Complete { index, .. } | Self::Incomplete { index, .. } => index,
-        }
-    }
-
-    pub fn scan_outcomes(&self) -> &[TranscriptRawReadOutcome] {
-        match self {
-            Self::Complete { scans, .. } | Self::Incomplete { scans, .. } => scans,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeIndexBuild {
-    configuration: RuntimeConfiguration,
-}
-
-impl RuntimeIndexBuild {
-    pub fn new(configuration: RuntimeConfiguration) -> Self {
-        Self { configuration }
-    }
-
-    pub fn build(&self) -> RuntimeIndexBuildResult {
-        let mut accumulator = RuntimeBuildAccumulator::new(
-            self.configuration
-                .output_interfaces()
-                .limits()
-                .maximum_preview_bytes,
-        );
-        let mut complete = true;
-        let mut scans = Vec::new();
-        for source in self.configuration.transcript_sources() {
-            let outcome = self.scan_source_into(source, &mut accumulator);
-            complete &= outcome.is_complete();
-            scans.push(outcome);
-        }
-        let index = accumulator.finish();
-        if complete {
-            RuntimeIndexBuildResult::Complete { index, scans }
-        } else {
-            RuntimeIndexBuildResult::Incomplete { index, scans }
-        }
-    }
-
-    /// Streams a configured source directly into its derived accumulator.
-    pub fn scan_source_into<S: TranscriptRecordSink>(
-        &self,
-        source: &TranscriptAdapterConfiguration,
-        sink: &mut S,
-    ) -> TranscriptRawReadOutcome {
-        match source {
-            TranscriptAdapterConfiguration::Claude(root) => {
-                crate::adapter::claude::ClaudeJsonlRootReader::with_limits(
-                    root.path().to_path_buf(),
-                    root.scan_limits().clone(),
-                )
-                .scan_records(sink)
+    fn observe(&mut self, projection: ProjectionRecordDto) -> Result<()> {
+        match projection {
+            ProjectionRecordDto::Session(dto) => {
+                let started_at = dto.started_at.map(Timestamp::new);
+                let last_observed_at = dto.last_observed_at.map(Timestamp::new);
+                match self.sessions.entry(dto.reference.clone()) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(IndexedSession {
+                            reference: FragileSessionReference::new(dto.reference),
+                            source: TypedProjectionValue::source(dto.source)?,
+                            source_identifier: signal_aggregator::SourceIdentifier::new(
+                                dto.source_identifier,
+                            ),
+                            path: PathBuf::from(dto.path.display),
+                            fingerprint: SourceFingerprint {
+                                byte_count: dto.fingerprint_bytes,
+                                modified_seconds: dto.fingerprint_seconds,
+                                modified_nanoseconds: dto.fingerprint_nanoseconds,
+                            },
+                            started_at,
+                            last_observed_at,
+                            producer_session_identifier: dto
+                                .producer_session_identifier
+                                .map(SessionIdentifier::new),
+                            subagent_references: Vec::new(),
+                            output_references: Vec::new(),
+                            size: TypedProjectionValue::size(dto.size)?,
+                        });
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        let session = entry.get_mut();
+                        if started_at.as_ref().is_some_and(|timestamp| {
+                            TimestampOrdering::new(timestamp)
+                                .is_before_optional(session.started_at.as_ref())
+                        }) {
+                            session.started_at = started_at;
+                        }
+                        if last_observed_at.as_ref().is_some_and(|timestamp| {
+                            TimestampOrdering::new(timestamp)
+                                .is_after_optional(session.last_observed_at.as_ref())
+                        }) {
+                            session.last_observed_at = last_observed_at;
+                        }
+                    }
+                }
             }
-            TranscriptAdapterConfiguration::ClaudeSubagentOutput(root) => {
-                crate::adapter::claude::ClaudeJsonlRootReader::with_limits_and_source(
-                    root.path().to_path_buf(),
-                    root.scan_limits().clone(),
-                    SourceKind::ClaudeSubagentOutput,
-                )
-                .scan_records(sink)
+            ProjectionRecordDto::Subagent(dto) => {
+                self.subagents
+                    .entry(dto.reference.clone())
+                    .or_insert(IndexedSubagent {
+                        reference: FragileSubagentReference::new(dto.reference),
+                        session_reference: FragileSessionReference::new(dto.session_reference),
+                        name: signal_aggregator::SubagentName::new(dto.name),
+                        authored_status: TypedProjectionValue::authored_status(
+                            dto.authored_status,
+                        )?,
+                        output_references: Vec::new(),
+                        task: TypedProjectionValue::task(dto.task),
+                        size: TypedProjectionValue::size(dto.size)?,
+                        first_observed_at: dto.first_observed_at.map(Timestamp::new),
+                        last_observed_at: dto.last_observed_at.map(Timestamp::new),
+                    });
             }
-            TranscriptAdapterConfiguration::PiSubagentOutput(root) => {
-                crate::adapter::claude::ClaudeJsonlRootReader::with_limits_and_source(
-                    root.path().to_path_buf(),
-                    root.scan_limits().clone(),
-                    SourceKind::PiSubagentOutput,
-                )
-                .scan_records(sink)
+            ProjectionRecordDto::Output(dto) => {
+                self.outputs
+                    .entry(dto.reference.clone())
+                    .or_insert(IndexedOutput {
+                        reference: FragileOutputReference::new(dto.reference),
+                        session_reference: FragileSessionReference::new(dto.session_reference),
+                        subagent_reference: dto
+                            .subagent_reference
+                            .map(FragileSubagentReference::new),
+                        title: dto.title.map(signal_aggregator::OutputTitle::new),
+                        provenance: OutputProvenance {
+                            source: TypedProjectionValue::source(dto.source)?,
+                            source_identifier: signal_aggregator::SourceIdentifier::new(
+                                dto.source_identifier,
+                            ),
+                            authored_status: TypedProjectionValue::authored_status(
+                                dto.authored_status,
+                            )?,
+                            produced_at: dto.produced_at.map(Timestamp::new),
+                        },
+                        task: TypedProjectionValue::task(dto.task),
+                        path: PathBuf::from(dto.path.display),
+                        fingerprint: SourceFingerprint {
+                            byte_count: dto.fingerprint_bytes,
+                            modified_seconds: dto.fingerprint_seconds,
+                            modified_nanoseconds: dto.fingerprint_nanoseconds,
+                        },
+                        source_line_number: dto.source_line_number,
+                        text_hash: dto.text_hash,
+                        size: TypedProjectionValue::size(dto.size)?,
+                        preview_text: dto.preview_text,
+                        preview_original_bytes: dto.preview_original_bytes,
+                    });
             }
-            TranscriptAdapterConfiguration::Codex(root) => {
-                crate::adapter::codex::CodexSessionRootReader::with_limits(
-                    root.path().to_path_buf(),
-                    root.scan_limits().clone(),
-                )
-                .scan_records(sink)
+            ProjectionRecordDto::Segment(dto) => {
+                self.segments
+                    .entry(dto.reference.clone())
+                    .or_insert(IndexedOutputSegment {
+                        reference: FragileOutputSegmentReference::new(dto.reference),
+                        output_reference: FragileOutputReference::new(dto.output_reference),
+                        segment_index: SegmentIndex::new(dto.segment_index),
+                        byte_range: dto.byte_range.map(|(start, end)| ByteRange {
+                            start: ByteCount::new(start),
+                            end: ByteCount::new(end),
+                        }),
+                        line_range: dto.line_range.map(|(start, end)| LineRange {
+                            start: LineNumber::new(start),
+                            end: LineNumber::new(end),
+                        }),
+                        size: TypedProjectionValue::size(dto.size)?,
+                        preview_text: dto.preview_text,
+                        preview_original_bytes: dto.preview_original_bytes,
+                        source: TypedProjectionValue::source(dto.source)?,
+                        path: PathBuf::from(dto.path.display),
+                    });
             }
-            TranscriptAdapterConfiguration::Pi(root) => {
-                crate::adapter::pi::PiRunHistoryRootReader::with_limits(
-                    root.path().to_path_buf(),
-                    root.scan_limits().clone(),
-                )
-                .scan_records(sink)
+            ProjectionRecordDto::TranscriptBlock(dto) => {
+                self.transcript_blocks
+                    .entry(dto.reference.clone())
+                    .or_insert(IndexedTranscriptBlock {
+                        reference: FragileTranscriptBlockReference::new(dto.reference),
+                        session_reference: FragileSessionReference::new(dto.session_reference),
+                        subagent_reference: dto
+                            .subagent_reference
+                            .map(FragileSubagentReference::new),
+                        kind: TypedProjectionValue::block_kind(dto.kind)?,
+                        block_index: signal_aggregator::TranscriptBlockIndex::new(dto.block_index),
+                        provenance: TranscriptBlockProvenance {
+                            source: TypedProjectionValue::source(dto.source)?,
+                            source_identifier: signal_aggregator::SourceIdentifier::new(
+                                dto.source_identifier,
+                            ),
+                            authored_status: TypedProjectionValue::authored_status(
+                                dto.authored_status,
+                            )?,
+                            observed_at: dto.observed_at.map(Timestamp::new),
+                        },
+                        task: TypedProjectionValue::task(dto.task),
+                        path: PathBuf::from(dto.path.display),
+                        fingerprint: SourceFingerprint {
+                            byte_count: dto.fingerprint_bytes,
+                            modified_seconds: dto.fingerprint_seconds,
+                            modified_nanoseconds: dto.fingerprint_nanoseconds,
+                        },
+                        source_line_number: dto.source_line_number,
+                        text_hash: dto.text_hash,
+                        size: TypedProjectionValue::size(dto.size)?,
+                        text_availability: TypedProjectionValue::availability(
+                            dto.text_availability,
+                        )?,
+                        preview_text: dto.preview_text,
+                        preview_original_bytes: dto.preview_original_bytes,
+                    });
             }
         }
+        Ok(())
+    }
+
+    fn finish(mut self) -> IndexSnapshot {
+        for output in self.outputs.values() {
+            if let Some(session) = self.sessions.get_mut(output.session_reference.as_str()) {
+                session.output_references.push(output.reference.clone());
+            }
+            if let Some(subagent_reference) = &output.subagent_reference
+                && let Some(subagent) = self.subagents.get_mut(subagent_reference.as_str())
+            {
+                subagent.output_references.push(output.reference.clone());
+            }
+        }
+        for subagent in self.subagents.values() {
+            if let Some(session) = self.sessions.get_mut(subagent.session_reference.as_str()) {
+                session.subagent_references.push(subagent.reference.clone());
+            }
+        }
+        IndexSnapshot {
+            sessions: self.sessions.into_values().collect(),
+            subagents: self.subagents.into_values().collect(),
+            outputs: self.outputs.into_values().collect(),
+            segments: self.segments.into_values().collect(),
+            transcript_blocks: self.transcript_blocks.into_values().collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TypedProjectionValue;
+
+impl TypedProjectionValue {
+    fn source(value: u8) -> Result<SourceKind> {
+        match value {
+            1 => Ok(SourceKind::Claude),
+            2 => Ok(SourceKind::ClaudeSubagentOutput),
+            3 => Ok(SourceKind::Codex),
+            4 => Ok(SourceKind::Pi),
+            5 => Ok(SourceKind::PiSubagentOutput),
+            6 => Ok(SourceKind::Repository),
+            _ => Err(Error::protocol("typed projection", "unknown source kind")),
+        }
+    }
+
+    fn authored_status(value: u8) -> Result<AuthoredStatus> {
+        match value {
+            1 => Ok(AuthoredStatus::AgentAuthored),
+            2 => Ok(AuthoredStatus::HumanAuthored),
+            3 => Ok(AuthoredStatus::MixedAuthorship),
+            4 => Ok(AuthoredStatus::UnknownAuthorship),
+            _ => Err(Error::protocol(
+                "typed projection",
+                "unknown authored status",
+            )),
+        }
+    }
+
+    fn block_kind(value: u8) -> Result<TranscriptBlockKind> {
+        match value {
+            1 => Ok(TranscriptBlockKind::UserPrompt),
+            2 => Ok(TranscriptBlockKind::AgentResponse),
+            3 => Ok(TranscriptBlockKind::ToolCall),
+            4 => Ok(TranscriptBlockKind::ToolResult),
+            5 => Ok(TranscriptBlockKind::Inference),
+            6 => Ok(TranscriptBlockKind::SystemInstruction),
+            7 => Ok(TranscriptBlockKind::Attachment),
+            8 => Ok(TranscriptBlockKind::SessionEvent),
+            9 => Ok(TranscriptBlockKind::Unclassified),
+            _ => Err(Error::protocol(
+                "typed projection",
+                "unknown transcript block kind",
+            )),
+        }
+    }
+
+    fn availability(value: u8) -> Result<TranscriptBlockTextAvailability> {
+        match value {
+            1 => Ok(TranscriptBlockTextAvailability::ReadableText),
+            2 => Ok(TranscriptBlockTextAvailability::UnavailableText),
+            3 => Ok(TranscriptBlockTextAvailability::EncryptedText),
+            _ => Err(Error::protocol(
+                "typed projection",
+                "unknown transcript text availability",
+            )),
+        }
+    }
+
+    fn size(dto: ProjectionSizeDto) -> Result<SizeMetadata> {
+        let certainty = match dto.certainty {
+            1 => SizeCertainty::Exact,
+            2 => SizeCertainty::Estimated,
+            3 => SizeCertainty::Unknown,
+            _ => {
+                return Err(Error::protocol(
+                    "typed projection",
+                    "unknown size certainty",
+                ));
+            }
+        };
+        Ok(SizeMetadata {
+            byte_count: dto.byte_count.map(ByteCount::new),
+            line_count: dto.line_count.map(LineCount::new),
+            segment_count: dto.segment_count.map(ItemCount::new),
+            certainty,
+        })
+    }
+
+    fn task(dto: Option<ProjectionTaskDto>) -> Option<SubagentTaskMetadata> {
+        dto.map(|task| SubagentTaskMetadata {
+            task_identifier: TaskIdentifier::new(task.task_identifier),
+            title: None,
+            tool_use_identifier: None,
+            output_locator: None,
+            source_status: SourceHealthStatus::ReadableIndexed,
+            result: None,
+            usage: None,
+            duration: None,
+        })
     }
 }
 
@@ -1232,7 +1352,7 @@ pub struct SessionInventory {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionInventoryBuilder {
     configuration: RuntimeConfiguration,
-    index: DurableFragileIndex,
+    index: IndexSnapshot,
     source_selection: SourceSelection,
     archive_references: BTreeSet<String>,
     scans: Vec<TranscriptRawReadOutcome>,
@@ -1241,7 +1361,7 @@ pub struct SessionInventoryBuilder {
 impl SessionInventoryBuilder {
     pub fn new(
         configuration: RuntimeConfiguration,
-        index: DurableFragileIndex,
+        index: IndexSnapshot,
         source_selection: SourceSelection,
         archive_references: BTreeSet<String>,
         scans: Vec<TranscriptRawReadOutcome>,
@@ -1268,7 +1388,7 @@ impl SessionInventoryBuilder {
             .collect::<BTreeMap<_, _>>();
         let mut sessions = self
             .index
-            .all_sessions()
+            .session_records()
             .filter(|session| {
                 SourceSelectionFilter::new(&self.source_selection).accepts(session.source)
             })
@@ -1342,7 +1462,7 @@ impl SessionInventoryBuilder {
             });
         let sessions = self
             .index
-            .all_sessions()
+            .session_records()
             .filter(|session| {
                 session.source == source.kind()
                     && session.source_identifier
@@ -1564,345 +1684,6 @@ impl<'a> TimestampOrderingOption<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeBuildAccumulator {
-    sessions: BTreeMap<String, SessionReducer>,
-    preview_limit: ByteLimit,
-}
-
-impl TranscriptRecordSink for RuntimeBuildAccumulator {
-    fn observe_record(&mut self, record: TranscriptRecord) {
-        self.observe(record);
-    }
-}
-
-impl RuntimeBuildAccumulator {
-    pub fn new(preview_limit: ByteLimit) -> Self {
-        Self {
-            sessions: BTreeMap::new(),
-            preview_limit,
-        }
-    }
-
-    pub fn merge(&mut self, outcome: TranscriptRawReadOutcome) {
-        for record in outcome.records {
-            self.observe(record);
-        }
-    }
-
-    pub fn observe(&mut self, record: TranscriptRecord) {
-        let session_key = TranscriptRecordSessionKey::new(&record).key();
-        self.sessions
-            .entry(session_key)
-            .or_insert_with(|| {
-                SessionReducer::new(
-                    record.source,
-                    record.source_identifier.clone(),
-                    record.path.clone(),
-                    self.preview_limit,
-                )
-            })
-            .observe(record);
-    }
-
-    pub fn finish(self) -> RuntimeBuildIndex {
-        let mut sessions = Vec::new();
-        let mut subagents = Vec::new();
-        let mut outputs = Vec::new();
-        let mut segments = Vec::new();
-        let mut transcript_blocks = Vec::new();
-        for accumulator in self.sessions.into_values() {
-            let indexed = accumulator.finish();
-            sessions.push(indexed.session);
-            subagents.extend(indexed.subagents);
-            outputs.extend(indexed.outputs);
-            segments.extend(indexed.segments);
-            transcript_blocks.extend(indexed.transcript_blocks);
-        }
-        sessions.sort_by(|left, right| left.reference.as_str().cmp(right.reference.as_str()));
-        subagents.sort_by(|left, right| left.reference.as_str().cmp(right.reference.as_str()));
-        outputs.sort_by(|left, right| left.reference.as_str().cmp(right.reference.as_str()));
-        segments.sort_by(|left, right| left.reference.as_str().cmp(right.reference.as_str()));
-        transcript_blocks
-            .sort_by(|left, right| left.reference.as_str().cmp(right.reference.as_str()));
-        RuntimeBuildIndex::new(sessions, subagents, outputs, segments, transcript_blocks)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TranscriptRecordSessionKey<'a> {
-    record: &'a TranscriptRecord,
-}
-
-impl<'a> TranscriptRecordSessionKey<'a> {
-    pub fn new(record: &'a TranscriptRecord) -> Self {
-        Self { record }
-    }
-
-    pub fn key(&self) -> String {
-        match (&self.record.session_identifier, &self.record.task_metadata) {
-            (Some(session), Some(task)) => {
-                format!("{}|{}", session.as_str(), task.task_identifier.as_str())
-            }
-            (Some(session), None) => format!(
-                "{}|{}",
-                SourceKindName::new(self.record.source).as_str(),
-                session.as_str()
-            ),
-            (None, Some(task)) => format!(
-                "{}|{}",
-                SourceKindName::new(self.record.source).as_str(),
-                task.task_identifier.as_str()
-            ),
-            (None, None) => self.record.path.display().to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionReducer {
-    source: SourceKind,
-    source_identifier: signal_aggregator::SourceIdentifier,
-    path: PathBuf,
-    fingerprint: SourceFingerprint,
-    preview_limit: ByteLimit,
-    outputs: Vec<IndexedOutput>,
-    segments: Vec<IndexedOutputSegment>,
-    transcript_blocks: Vec<IndexedTranscriptBlock>,
-    subagents: BTreeMap<String, SubagentReducer>,
-    size: SizeAccumulator,
-    started_at: Option<Timestamp>,
-    last_observed_at: Option<Timestamp>,
-    session_identifier: Option<SessionIdentifier>,
-}
-
-impl SessionReducer {
-    pub fn new(
-        source: SourceKind,
-        source_identifier: signal_aggregator::SourceIdentifier,
-        path: PathBuf,
-        preview_limit: ByteLimit,
-    ) -> Self {
-        let fingerprint =
-            SourceFingerprint::from_path(&path).unwrap_or_else(|_| SourceFingerprint::missing());
-        Self {
-            source,
-            source_identifier,
-            path,
-            fingerprint,
-            preview_limit,
-            outputs: Vec::new(),
-            segments: Vec::new(),
-            transcript_blocks: Vec::new(),
-            subagents: BTreeMap::new(),
-            size: SizeAccumulator::new(),
-            started_at: None,
-            last_observed_at: None,
-            session_identifier: None,
-        }
-    }
-
-    pub fn observe(&mut self, record: TranscriptRecord) {
-        self.size.observe_text(&record.text);
-        if self.session_identifier.is_none() {
-            self.session_identifier = record.session_identifier.clone();
-        }
-        self.observe_timestamp(record.timestamp.clone());
-        let session_reference = self.session_reference();
-        let subagent_reference = record
-            .subagent_name
-            .as_ref()
-            .map(|name| self.subagent_reference(name));
-        let record_fingerprint = SourceFingerprint::from_path(&record.path)
-            .unwrap_or_else(|_| SourceFingerprint::missing());
-        let output = IndexedOutput::from_record(
-            record.clone(),
-            session_reference.clone(),
-            subagent_reference.clone(),
-            record_fingerprint.clone(),
-            self.preview_limit,
-        );
-        let segment = IndexedOutputSegment::from_output(&output);
-        if let Some(name) = record.subagent_name.clone() {
-            let key = name.as_str().to_string();
-            let subagent_reference = self.subagent_reference(&name);
-            self.subagents
-                .entry(key)
-                .or_insert_with(|| {
-                    SubagentReducer::new(session_reference.clone(), subagent_reference, name)
-                })
-                .observe(&output);
-        }
-        for block_record in record.transcript_blocks() {
-            let block_subagent_reference = block_record
-                .subagent_name
-                .as_ref()
-                .map(|name| self.subagent_reference(name));
-            self.transcript_blocks
-                .push(IndexedTranscriptBlock::from_record(
-                    block_record,
-                    session_reference.clone(),
-                    block_subagent_reference,
-                    record_fingerprint.clone(),
-                    self.preview_limit,
-                ));
-        }
-        self.segments.push(segment);
-        self.outputs.push(output);
-    }
-
-    pub fn observe_timestamp(&mut self, timestamp: Option<Timestamp>) {
-        let Some(timestamp) = timestamp else {
-            return;
-        };
-        if TimestampOrdering::new(&timestamp).is_before_optional(self.started_at.as_ref()) {
-            self.started_at = Some(timestamp.clone());
-        }
-        if TimestampOrdering::new(&timestamp).is_after_optional(self.last_observed_at.as_ref()) {
-            self.last_observed_at = Some(timestamp);
-        }
-    }
-
-    pub fn session_reference(&self) -> FragileSessionReference {
-        FragileSessionReference::new(
-            StableReference::new("session", self.session_reference_material()).as_string(),
-        )
-    }
-
-    pub fn session_reference_material(&self) -> String {
-        format!(
-            "{}|{}|{}|{}",
-            SourceKindName::new(self.source).as_str(),
-            self.source_identifier.as_str(),
-            self.path.display(),
-            self.fingerprint.material()
-        )
-    }
-
-    pub fn subagent_reference(
-        &self,
-        name: &signal_aggregator::SubagentName,
-    ) -> FragileSubagentReference {
-        FragileSubagentReference::new(
-            StableReference::new(
-                "subagent",
-                format!("{}|{}", self.session_reference().as_str(), name.as_str()),
-            )
-            .as_string(),
-        )
-    }
-
-    pub fn finish(self) -> ReducedSessionBundle {
-        let session_reference = self.session_reference();
-        let subagents = self
-            .subagents
-            .into_values()
-            .map(SubagentReducer::finish)
-            .collect::<Vec<_>>();
-        ReducedSessionBundle {
-            session: IndexedSession {
-                reference: session_reference,
-                source: self.source,
-                source_identifier: self.source_identifier,
-                path: self.path,
-                fingerprint: self.fingerprint,
-                started_at: self.started_at,
-                last_observed_at: self.last_observed_at,
-                producer_session_identifier: self.session_identifier,
-                subagent_references: subagents
-                    .iter()
-                    .map(|subagent| subagent.reference.clone())
-                    .collect(),
-                output_references: self
-                    .outputs
-                    .iter()
-                    .map(|output| output.reference.clone())
-                    .collect(),
-                size: self.size.finish(),
-            },
-            subagents,
-            outputs: self.outputs,
-            segments: self.segments,
-            transcript_blocks: self.transcript_blocks,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReducedSessionBundle {
-    session: IndexedSession,
-    subagents: Vec<IndexedSubagent>,
-    outputs: Vec<IndexedOutput>,
-    segments: Vec<IndexedOutputSegment>,
-    transcript_blocks: Vec<IndexedTranscriptBlock>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SubagentReducer {
-    session_reference: FragileSessionReference,
-    reference: FragileSubagentReference,
-    name: signal_aggregator::SubagentName,
-    authored_status: AuthoredStatusAccumulator,
-    output_references: Vec<FragileOutputReference>,
-    task: Option<SubagentTaskMetadata>,
-    size: SizeAccumulator,
-    first_observed_at: Option<Timestamp>,
-    last_observed_at: Option<Timestamp>,
-}
-
-impl SubagentReducer {
-    pub fn new(
-        session_reference: FragileSessionReference,
-        reference: FragileSubagentReference,
-        name: signal_aggregator::SubagentName,
-    ) -> Self {
-        Self {
-            session_reference,
-            reference,
-            name,
-            authored_status: AuthoredStatusAccumulator::new(),
-            output_references: Vec::new(),
-            task: None,
-            size: SizeAccumulator::new(),
-            first_observed_at: None,
-            last_observed_at: None,
-        }
-    }
-
-    pub fn observe(&mut self, output: &IndexedOutput) {
-        self.output_references.push(output.reference.clone());
-        if self.task.is_none() {
-            self.task = output.task.clone();
-        }
-        self.size.observe_size(&output.size);
-        self.authored_status
-            .observe(output.provenance.authored_status);
-        if let Some(timestamp) = &output.provenance.produced_at {
-            if TimestampOrdering::new(timestamp).is_before_optional(self.first_observed_at.as_ref())
-            {
-                self.first_observed_at = Some(timestamp.clone());
-            }
-            if TimestampOrdering::new(timestamp).is_after_optional(self.last_observed_at.as_ref()) {
-                self.last_observed_at = Some(timestamp.clone());
-            }
-        }
-    }
-
-    pub fn finish(self) -> IndexedSubagent {
-        IndexedSubagent {
-            reference: self.reference,
-            session_reference: self.session_reference,
-            name: self.name,
-            authored_status: self.authored_status.finish(),
-            output_references: self.output_references,
-            task: self.task,
-            size: self.size.finish(),
-            first_observed_at: self.first_observed_at,
-            last_observed_at: self.last_observed_at,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexedSession {
     reference: FragileSessionReference,
     source: SourceKind,
@@ -2015,53 +1796,6 @@ impl IndexedSession {
     pub fn chronology_timestamp(&self) -> Option<&Timestamp> {
         self.last_observed_at.as_ref().or(self.started_at.as_ref())
     }
-
-    pub fn to_json(&self) -> Value {
-        json!({
-            "reference": self.reference.as_str(),
-            "source": SourceKindName::new(self.source).as_str(),
-            "source_identifier": self.source_identifier.as_str(),
-            "path": self.path.display().to_string(),
-            "fingerprint": self.fingerprint.to_json(),
-            "started_at": self.started_at.as_ref().map(|value| value.as_str()),
-            "last_observed_at": self.last_observed_at.as_ref().map(|value| value.as_str()),
-            "producer_session_identifier": self.producer_session_identifier.as_ref().map(|value| value.as_str()),
-            "subagent_references": self.subagent_references.iter().map(|reference| reference.as_str().to_string()).collect::<Vec<_>>(),
-            "output_references": self.output_references.iter().map(|reference| reference.as_str().to_string()).collect::<Vec<_>>(),
-            "size": SizeMetadataJson::new(&self.size).to_json(),
-        })
-    }
-
-    pub fn from_json(value: &Value) -> Option<Self> {
-        let reader = JsonReader::new(value);
-        Some(Self {
-            reference: FragileSessionReference::new(reader.string("reference")?),
-            source: SourceKindName::parse(&reader.string("source")?)?,
-            source_identifier: signal_aggregator::SourceIdentifier::new(
-                reader.string("source_identifier")?,
-            ),
-            path: PathBuf::from(reader.string("path")?),
-            fingerprint: SourceFingerprint::from_json(reader.value("fingerprint")?)?,
-            started_at: reader.optional_string("started_at").map(Timestamp::new),
-            last_observed_at: reader
-                .optional_string("last_observed_at")
-                .map(Timestamp::new),
-            producer_session_identifier: reader
-                .optional_string("producer_session_identifier")
-                .map(SessionIdentifier::new),
-            subagent_references: reader
-                .strings("subagent_references")
-                .into_iter()
-                .map(FragileSubagentReference::new)
-                .collect(),
-            output_references: reader
-                .strings("output_references")
-                .into_iter()
-                .map(FragileOutputReference::new)
-                .collect(),
-            size: SizeMetadataJson::from_json(reader.value("size")?)?,
-        })
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2096,54 +1830,6 @@ impl IndexedSubagent {
         self.last_observed_at
             .as_ref()
             .or(self.first_observed_at.as_ref())
-    }
-
-    pub fn to_json(&self) -> Value {
-        json!({
-            "reference": self.reference.as_str(),
-            "session_reference": self.session_reference.as_str(),
-            "name": self.name.as_str(),
-            "authored_status": AuthoredStatusName::new(self.authored_status).as_str(),
-            "task_identifier": self.task.as_ref().map(|task| task.task_identifier.as_str()),
-            "output_references": self.output_references.iter().map(|reference| reference.as_str().to_string()).collect::<Vec<_>>(),
-            "size": SizeMetadataJson::new(&self.size).to_json(),
-            "first_observed_at": self.first_observed_at.as_ref().map(|value| value.as_str()),
-            "last_observed_at": self.last_observed_at.as_ref().map(|value| value.as_str()),
-        })
-    }
-
-    pub fn from_json(value: &Value) -> Option<Self> {
-        let reader = JsonReader::new(value);
-        Some(Self {
-            reference: FragileSubagentReference::new(reader.string("reference")?),
-            session_reference: FragileSessionReference::new(reader.string("session_reference")?),
-            name: signal_aggregator::SubagentName::new(reader.string("name")?),
-            authored_status: AuthoredStatusName::parse(&reader.string("authored_status")?)?,
-            task: reader
-                .optional_string("task_identifier")
-                .map(|task_identifier| SubagentTaskMetadata {
-                    task_identifier: TaskIdentifier::new(task_identifier),
-                    title: None,
-                    tool_use_identifier: None,
-                    output_locator: None,
-                    source_status: SourceHealthStatus::ReadableIndexed,
-                    result: None,
-                    usage: None,
-                    duration: None,
-                }),
-            output_references: reader
-                .strings("output_references")
-                .into_iter()
-                .map(FragileOutputReference::new)
-                .collect(),
-            size: SizeMetadataJson::from_json(reader.value("size")?)?,
-            first_observed_at: reader
-                .optional_string("first_observed_at")
-                .map(Timestamp::new),
-            last_observed_at: reader
-                .optional_string("last_observed_at")
-                .map(Timestamp::new),
-        })
     }
 }
 
@@ -2235,69 +1921,6 @@ impl IndexedOutput {
     pub fn chronology_timestamp(&self) -> Option<&Timestamp> {
         self.provenance.produced_at.as_ref()
     }
-
-    pub fn to_json(&self) -> Value {
-        json!({
-            "reference": self.reference.as_str(),
-            "session_reference": self.session_reference.as_str(),
-            "subagent_reference": self.subagent_reference.as_ref().map(|value| value.as_str()),
-            "title": self.title.as_ref().map(|value| value.as_str()),
-            "task_identifier": self.task.as_ref().map(|task| task.task_identifier.as_str()),
-            "source": SourceKindName::new(self.provenance.source).as_str(),
-            "source_identifier": self.provenance.source_identifier.as_str(),
-            "authored_status": AuthoredStatusName::new(self.provenance.authored_status).as_str(),
-            "produced_at": self.provenance.produced_at.as_ref().map(|value| value.as_str()),
-            "path": self.path.display().to_string(),
-            "fingerprint": self.fingerprint.to_json(),
-            "source_line_number": self.source_line_number,
-            "text_hash": self.text_hash,
-            "size": SizeMetadataJson::new(&self.size).to_json(),
-            "preview_text": self.preview_text,
-            "preview_original_bytes": self.preview_original_bytes,
-        })
-    }
-
-    pub fn from_json(value: &Value) -> Option<Self> {
-        let reader = JsonReader::new(value);
-        let source = SourceKindName::parse(&reader.string("source")?)?;
-        Some(Self {
-            reference: FragileOutputReference::new(reader.string("reference")?),
-            session_reference: FragileSessionReference::new(reader.string("session_reference")?),
-            subagent_reference: reader
-                .optional_string("subagent_reference")
-                .map(FragileSubagentReference::new),
-            title: reader
-                .optional_string("title")
-                .map(signal_aggregator::OutputTitle::new),
-            task: reader
-                .optional_string("task_identifier")
-                .map(|task_identifier| SubagentTaskMetadata {
-                    task_identifier: TaskIdentifier::new(task_identifier),
-                    title: None,
-                    tool_use_identifier: None,
-                    output_locator: None,
-                    source_status: SourceHealthStatus::ReadableIndexed,
-                    result: None,
-                    usage: None,
-                    duration: None,
-                }),
-            provenance: OutputProvenance {
-                source,
-                source_identifier: signal_aggregator::SourceIdentifier::new(
-                    reader.string("source_identifier")?,
-                ),
-                authored_status: AuthoredStatusName::parse(&reader.string("authored_status")?)?,
-                produced_at: reader.optional_string("produced_at").map(Timestamp::new),
-            },
-            path: PathBuf::from(reader.string("path")?),
-            fingerprint: SourceFingerprint::from_json(reader.value("fingerprint")?)?,
-            source_line_number: reader.u64("source_line_number")?,
-            text_hash: reader.string("text_hash")?,
-            size: SizeMetadataJson::from_json(reader.value("size")?)?,
-            preview_text: reader.string("preview_text")?,
-            preview_original_bytes: reader.u64("preview_original_bytes")?,
-        })
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2360,49 +1983,6 @@ impl IndexedOutputSegment {
             )
             .project(projection),
         }
-    }
-
-    pub fn to_json(&self) -> Value {
-        json!({
-            "reference": self.reference.as_str(),
-            "output_reference": self.output_reference.as_str(),
-            "segment_index": self.segment_index.into_u64(),
-            "byte_start": self.byte_range.as_ref().map(|range| range.start.into_u64()),
-            "byte_end": self.byte_range.as_ref().map(|range| range.end.into_u64()),
-            "line_start": self.line_range.as_ref().map(|range| range.start.into_u64()),
-            "line_end": self.line_range.as_ref().map(|range| range.end.into_u64()),
-            "size": SizeMetadataJson::new(&self.size).to_json(),
-            "preview_text": self.preview_text,
-            "preview_original_bytes": self.preview_original_bytes,
-            "source": SourceKindName::new(self.source).as_str(),
-            "path": self.path.display().to_string(),
-        })
-    }
-
-    pub fn from_json(value: &Value) -> Option<Self> {
-        let reader = JsonReader::new(value);
-        let byte_start = reader.optional_u64("byte_start");
-        let byte_end = reader.optional_u64("byte_end");
-        let line_start = reader.optional_u64("line_start");
-        let line_end = reader.optional_u64("line_end");
-        Some(Self {
-            reference: FragileOutputSegmentReference::new(reader.string("reference")?),
-            output_reference: FragileOutputReference::new(reader.string("output_reference")?),
-            segment_index: SegmentIndex::new(reader.u64("segment_index")?),
-            byte_range: byte_start.zip(byte_end).map(|(start, end)| ByteRange {
-                start: ByteCount::new(start),
-                end: ByteCount::new(end),
-            }),
-            line_range: line_start.zip(line_end).map(|(start, end)| LineRange {
-                start: LineNumber::new(start),
-                end: LineNumber::new(end),
-            }),
-            size: SizeMetadataJson::from_json(reader.value("size")?)?,
-            preview_text: reader.string("preview_text")?,
-            preview_original_bytes: reader.u64("preview_original_bytes")?,
-            source: SourceKindName::parse(&reader.string("source")?)?,
-            path: PathBuf::from(reader.string("path")?),
-        })
     }
 }
 
@@ -2536,456 +2116,15 @@ impl IndexedTranscriptBlock {
     pub fn size_byte_count(&self) -> u64 {
         self.size.byte_count.map_or(0, ByteCount::into_u64)
     }
-
-    pub fn to_json(&self) -> Value {
-        json!({
-            "reference": self.reference.as_str(),
-            "session_reference": self.session_reference.as_str(),
-            "subagent_reference": self.subagent_reference.as_ref().map(|value| value.as_str()),
-            "task_identifier": self.task.as_ref().map(|task| task.task_identifier.as_str()),
-            "kind": TranscriptBlockKindName::new(self.kind).as_str(),
-            "block_index": self.block_index.into_u64(),
-            "source": SourceKindName::new(self.provenance.source).as_str(),
-            "source_identifier": self.provenance.source_identifier.as_str(),
-            "authored_status": AuthoredStatusName::new(self.provenance.authored_status).as_str(),
-            "observed_at": self.provenance.observed_at.as_ref().map(|value| value.as_str()),
-            "path": self.path.display().to_string(),
-            "fingerprint": self.fingerprint.to_json(),
-            "source_line_number": self.source_line_number,
-            "text_hash": self.text_hash,
-            "size": SizeMetadataJson::new(&self.size).to_json(),
-            "text_availability": TranscriptBlockTextAvailabilityName::new(self.text_availability).as_str(),
-            "preview_text": self.preview_text,
-            "preview_original_bytes": self.preview_original_bytes,
-        })
-    }
-
-    pub fn from_json(value: &Value) -> Option<Self> {
-        let reader = JsonReader::new(value);
-        let source = SourceKindName::parse(&reader.string("source")?)?;
-        Some(Self {
-            reference: FragileTranscriptBlockReference::new(reader.string("reference")?),
-            session_reference: FragileSessionReference::new(reader.string("session_reference")?),
-            subagent_reference: reader
-                .optional_string("subagent_reference")
-                .map(FragileSubagentReference::new),
-            kind: TranscriptBlockKindName::parse(&reader.string("kind")?)?,
-            block_index: signal_aggregator::TranscriptBlockIndex::new(reader.u64("block_index")?),
-            task: reader
-                .optional_string("task_identifier")
-                .map(|task_identifier| SubagentTaskMetadata {
-                    task_identifier: TaskIdentifier::new(task_identifier),
-                    title: None,
-                    tool_use_identifier: None,
-                    output_locator: None,
-                    source_status: SourceHealthStatus::ReadableIndexed,
-                    result: None,
-                    usage: None,
-                    duration: None,
-                }),
-            provenance: TranscriptBlockProvenance {
-                source,
-                source_identifier: signal_aggregator::SourceIdentifier::new(
-                    reader.string("source_identifier")?,
-                ),
-                authored_status: AuthoredStatusName::parse(&reader.string("authored_status")?)?,
-                observed_at: reader.optional_string("observed_at").map(Timestamp::new),
-            },
-            path: PathBuf::from(reader.string("path")?),
-            fingerprint: SourceFingerprint::from_json(reader.value("fingerprint")?)?,
-            source_line_number: reader.u64("source_line_number")?,
-            text_hash: reader.string("text_hash")?,
-            size: SizeMetadataJson::from_json(reader.value("size")?)?,
-            text_availability: TranscriptBlockTextAvailabilityName::parse(
-                &reader.string("text_availability")?,
-            )?,
-            preview_text: reader.string("preview_text")?,
-            preview_original_bytes: reader.u64("preview_original_bytes")?,
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FragileIndexStore {
-    path: PathBuf,
-    limits: limits::IndexStoreLimits,
-}
-
-impl FragileIndexStore {
-    pub fn from_store_path(store_path: &Path) -> Self {
-        Self {
-            path: RuntimeStorePath::new(store_path.to_path_buf()).fragile_index_path(),
-            limits: limits::IndexStoreLimits::default(),
-        }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn read_or_empty(&self) -> Result<DurableFragileIndex> {
-        match self.format()? {
-            FragileIndexFormat::Missing | FragileIndexFormat::ObsoleteV1 => {
-                Ok(DurableFragileIndex::empty())
-            }
-            // A v2 pointer is evidence awaiting a bounded migration, not an empty index.  Making
-            // it look empty used to send reference operations through an incomplete refresh.
-            FragileIndexFormat::MigratableV2 => Err(Error::protocol(
-                "fragile output index migration",
-                "v2 evidence requires a complete bounded replacement",
-            )),
-            FragileIndexFormat::Current => self.read_current(),
-        }
-    }
-
-    pub fn health_status(&self) -> SourceHealthStatus {
-        match self.format() {
-            Ok(FragileIndexFormat::Current) => match self.read_current() {
-                Ok(_) => SourceHealthStatus::ReadableIndexed,
-                Err(_) => SourceHealthStatus::IndexStoreUnreadable,
-            },
-            Ok(FragileIndexFormat::Missing) | Ok(FragileIndexFormat::ObsoleteV1) => {
-                SourceHealthStatus::ReadableEmpty
-            }
-            Ok(FragileIndexFormat::MigratableV2) | Err(_) => {
-                SourceHealthStatus::IndexStoreUnreadable
-            }
-        }
-    }
-
-    /// Publishes the compatibility pointer and immutable typed v3 chunks. The pointer remains at
-    /// its established path; collection bodies are never written as a replacement JSON corpus.
-    pub fn write(&self, index: &DurableFragileIndex) -> Result<()> {
-        use schema::{IndexChunk, IndexFileKind};
-        use store::{IndexLocator, IndexStore};
-
-        let store = IndexStore::new(self.path.clone(), self.limits);
-        // A v2 document is never decoded on the live path. Preserve its immutable migration
-        // evidence, then remove only the compatibility pointer so v3 publication can establish
-        // the normal compare-and-swap root without accepting an oversized JSON pointer.
-        match self.format()? {
-            FragileIndexFormat::MigratableV2 => {
-                // Keep the immutable legacy evidence until a complete replacement is ready.
-                // The pointer changes only after the new generation has been fully staged.
-                store.retain_v2_backup(&self.path)?;
-                fs::remove_file(&self.path)
-                    .map_err(|error| Error::io("retiring migrated v2 index pointer", error))?;
-            }
-            FragileIndexFormat::ObsoleteV1 => {
-                // Version 1 is intentionally discarded without decoding it.
-                fs::remove_file(&self.path)
-                    .map_err(|error| Error::io("retiring obsolete v1 index pointer", error))?;
-            }
-            FragileIndexFormat::Missing | FragileIndexFormat::Current => {}
-        }
-        let identity = *blake3::hash(
-            &serde_json::to_vec(&index.collection_signature()).map_err(|error| {
-                Error::protocol("typed fragile index identity", error.to_string())
-            })?,
-        )
-        .as_bytes();
-        if matches!(self.format(), Ok(FragileIndexFormat::Current))
-            && store
-                .read_current_pointer()?
-                .is_some_and(|pointer| pointer.snapshot_identity == identity)
-        {
-            return Ok(());
-        }
-        let staging = store.create_staging("runtime-index")?;
-        let mut manifest_records = Vec::new();
-        let mut sequence = 0_u64;
-        self.write_collection(
-            &staging,
-            "sessions",
-            index.sessions.iter().map(IndexedSession::to_json),
-            &mut sequence,
-            &mut manifest_records,
-        )?;
-        self.write_collection(
-            &staging,
-            "subagents",
-            index.subagents.iter().map(IndexedSubagent::to_json),
-            &mut sequence,
-            &mut manifest_records,
-        )?;
-        self.write_collection(
-            &staging,
-            "outputs",
-            index.outputs.iter().map(IndexedOutput::to_json),
-            &mut sequence,
-            &mut manifest_records,
-        )?;
-        self.write_collection(
-            &staging,
-            "segments",
-            index.segments.iter().map(IndexedOutputSegment::to_json),
-            &mut sequence,
-            &mut manifest_records,
-        )?;
-        self.write_collection(
-            &staging,
-            "transcript-blocks",
-            index
-                .transcript_blocks
-                .iter()
-                .map(IndexedTranscriptBlock::to_json),
-            &mut sequence,
-            &mut manifest_records,
-        )?;
-        let manifest = IndexLocator::new("manifest");
-        staging.write_chunk(
-            &manifest,
-            IndexFileKind::Manifest,
-            &IndexChunk {
-                schema_version: 1,
-                records: manifest_records,
-                projection: None,
-            },
-        )?;
-        store.publish(&staging, &manifest, identity)?;
-        Ok(())
-    }
-
-    fn write_collection(
-        &self,
-        staging: &store::IndexStaging,
-        collection: &str,
-        values: impl Iterator<Item = Value>,
-        sequence: &mut u64,
-        manifest_records: &mut Vec<schema::IndexRecordDto>,
-    ) -> Result<()> {
-        use schema::{IndexFieldDto, IndexRecordDto};
-
-        let mut records = Vec::new();
-        let mut logical_bytes = 0_u64;
-        for value in values {
-            let payload = serde_json::to_vec(&value).map_err(|error| {
-                Error::protocol("typed fragile index encode", error.to_string())
-            })?;
-            let record_bytes = collection.len() as u64 + payload.len() as u64;
-            if record_bytes > self.limits.maximum_record_bytes {
-                return Err(Error::index_store(
-                    crate::error::IndexStoreError::OversizedRecord,
-                ));
-            }
-            if !records.is_empty()
-                && !self.limits.accepts_chunk(
-                    logical_bytes.saturating_add(record_bytes),
-                    records.len() as u64 + 1,
-                )
-            {
-                self.write_collection_chunk(
-                    staging,
-                    collection,
-                    sequence,
-                    manifest_records,
-                    &mut records,
-                )?;
-                logical_bytes = 0;
-            }
-            logical_bytes = logical_bytes.saturating_add(record_bytes);
-            records.push(IndexRecordDto {
-                schema_version: 1,
-                record_kind: 20,
-                fields: vec![
-                    IndexFieldDto {
-                        name: "collection".to_owned(),
-                        bytes: collection.as_bytes().to_vec(),
-                    },
-                    IndexFieldDto {
-                        name: "json".to_owned(),
-                        bytes: payload,
-                    },
-                ],
-            });
-        }
-        if !records.is_empty() {
-            self.write_collection_chunk(
-                staging,
-                collection,
-                sequence,
-                manifest_records,
-                &mut records,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn write_collection_chunk(
-        &self,
-        staging: &store::IndexStaging,
-        collection: &str,
-        sequence: &mut u64,
-        manifest_records: &mut Vec<schema::IndexRecordDto>,
-        records: &mut Vec<schema::IndexRecordDto>,
-    ) -> Result<()> {
-        use schema::{IndexChunk, IndexFieldDto, IndexFileKind, IndexRecordDto};
-        use store::IndexLocator;
-
-        let locator = IndexLocator::new(format!("records-{}-{:016x}", collection, *sequence));
-        *sequence += 1;
-        staging.write_chunk(
-            &locator,
-            IndexFileKind::Chunk,
-            &IndexChunk {
-                schema_version: 1,
-                records: std::mem::take(records),
-                projection: None,
-            },
-        )?;
-        manifest_records.push(IndexRecordDto {
-            schema_version: 1,
-            record_kind: 21,
-            fields: vec![
-                IndexFieldDto {
-                    name: "collection".to_owned(),
-                    bytes: collection.as_bytes().to_vec(),
-                },
-                IndexFieldDto {
-                    name: "chunk-locator".to_owned(),
-                    bytes: format!(
-                        "generations/{}/{}",
-                        staging.generation().as_str(),
-                        locator.as_str()
-                    )
-                    .into_bytes(),
-                },
-            ],
-        });
-        Ok(())
-    }
-
-    pub fn temporary_path(&self) -> PathBuf {
-        let file_name = self
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("output-index.json");
-        self.path
-            .with_file_name(format!(".{file_name}.{}.tmp", std::process::id()))
-    }
-
-    pub fn format(&self) -> Result<FragileIndexFormat> {
-        if !self.path.exists() {
-            return Ok(FragileIndexFormat::Missing);
-        }
-        let mut file = fs::File::open(&self.path)
-            .map_err(|error| Error::io("opening fragile output index", error))?;
-        let mut prefix = [0_u8; 256];
-        let read = file
-            .read(&mut prefix)
-            .map_err(|error| Error::io("probing fragile output index version", error))?;
-        match migration_v2::IndexFormatProbe::new(&prefix[..read]).format() {
-            migration_v2::IndexFormat::CurrentV3 => Ok(FragileIndexFormat::Current),
-            migration_v2::IndexFormat::Missing => Ok(FragileIndexFormat::Missing),
-            migration_v2::IndexFormat::ObsoleteV1 => Ok(FragileIndexFormat::ObsoleteV1),
-            migration_v2::IndexFormat::MigratableV2 => Ok(FragileIndexFormat::MigratableV2),
-            migration_v2::IndexFormat::Unsupported => Err(Error::protocol(
-                "fragile output index version",
-                "unsupported version header",
-            )),
-        }
-    }
-
-    pub fn read_current(&self) -> Result<DurableFragileIndex> {
-        use schema::IndexFileKind;
-        use store::{IndexLocator, IndexStore};
-
-        let store = IndexStore::new(self.path.clone(), self.limits);
-        let pointer = store.read_current_pointer()?.ok_or_else(|| {
-            Error::protocol("typed fragile output index", "missing v3 current pointer")
-        })?;
-        let manifest = store
-            .open_reader(
-                &IndexLocator::new(pointer.manifest_locator),
-                IndexFileKind::Manifest,
-            )?
-            .read()?;
-        let mut index = DurableFragileIndex::empty();
-        for descriptor in manifest.records {
-            let collection = TypedRecordFields::new(&descriptor).utf8("collection")?;
-            let locator = TypedRecordFields::new(&descriptor).utf8("chunk-locator")?;
-            let chunk = store
-                .open_reader(&IndexLocator::new(locator), IndexFileKind::Chunk)?
-                .read()?;
-            for record in chunk.records {
-                let fields = TypedRecordFields::new(&record);
-                if fields.utf8("collection")? != collection {
-                    return Err(Error::protocol(
-                        "typed fragile output index",
-                        "collection mismatch",
-                    ));
-                }
-                let value =
-                    serde_json::from_slice::<Value>(fields.bytes("json")?).map_err(|error| {
-                        Error::protocol("typed fragile output index decode", error.to_string())
-                    })?;
-                match collection.as_str() {
-                    "sessions" => index.sessions.extend(IndexedSession::from_json(&value)),
-                    "subagents" => index.subagents.extend(IndexedSubagent::from_json(&value)),
-                    "outputs" => index.outputs.extend(IndexedOutput::from_json(&value)),
-                    "segments" => index
-                        .segments
-                        .extend(IndexedOutputSegment::from_json(&value)),
-                    "transcript-blocks" => index
-                        .transcript_blocks
-                        .extend(IndexedTranscriptBlock::from_json(&value)),
-                    _ => {
-                        return Err(Error::protocol(
-                            "typed fragile output index",
-                            "unknown collection",
-                        ));
-                    }
-                }
-            }
-        }
-        Ok(index)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FragileIndexFormat {
-    Missing,
-    /// Version 1 is intentionally discarded without decoding.
-    ObsoleteV1,
-    /// Version 2 remains authoritative until a complete v3 replacement is published.
-    MigratableV2,
-    Current,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TypedRecordFields<'a> {
-    record: &'a schema::IndexRecordDto,
-}
-
-impl<'a> TypedRecordFields<'a> {
-    fn new(record: &'a schema::IndexRecordDto) -> Self {
-        Self { record }
-    }
-
-    fn bytes(self, name: &str) -> Result<&'a [u8]> {
-        self.record
-            .fields
-            .iter()
-            .find(|field| field.name == name)
-            .map(|field| field.bytes.as_slice())
-            .ok_or_else(|| Error::protocol("typed fragile output index", "missing record field"))
-    }
-
-    fn utf8(self, name: &str) -> Result<String> {
-        std::str::from_utf8(self.bytes(name)?)
-            .map(str::to_owned)
-            .map_err(|_| Error::protocol("typed fragile output index", "invalid record field"))
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReferenceResolver<'a> {
-    index: &'a DurableFragileIndex,
+    index: &'a IndexSnapshot,
 }
 
 impl<'a> ReferenceResolver<'a> {
-    pub fn new(index: &'a DurableFragileIndex) -> Self {
+    pub fn new(index: &'a IndexSnapshot) -> Self {
         Self { index }
     }
 
@@ -3368,12 +2507,12 @@ impl TranscriptLineParser {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputRangeEstimator<'a> {
-    index: &'a DurableFragileIndex,
+    index: &'a IndexSnapshot,
     output: &'a IndexedOutput,
 }
 
 impl<'a> OutputRangeEstimator<'a> {
-    pub fn new(index: &'a DurableFragileIndex, output: &'a IndexedOutput) -> Self {
+    pub fn new(index: &'a IndexSnapshot, output: &'a IndexedOutput) -> Self {
         Self { index, output }
     }
 
@@ -3423,13 +2562,13 @@ impl<'a> OutputRangeEstimator<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputRangeReader<'a> {
-    index: &'a DurableFragileIndex,
+    index: &'a IndexSnapshot,
     output: IndexedOutput,
     text: String,
 }
 
 impl<'a> OutputRangeReader<'a> {
-    pub fn new(index: &'a DurableFragileIndex, output: IndexedOutput, text: String) -> Self {
+    pub fn new(index: &'a IndexSnapshot, output: IndexedOutput, text: String) -> Self {
         Self {
             index,
             output,
@@ -3735,23 +2874,6 @@ impl SourceFingerprint {
                 .format(&time::format_description::well_known::Rfc3339)
                 .ok()?,
         ))
-    }
-
-    pub fn to_json(&self) -> Value {
-        json!({
-            "byte_count": self.byte_count,
-            "modified_seconds": self.modified_seconds,
-            "modified_nanoseconds": self.modified_nanoseconds,
-        })
-    }
-
-    pub fn from_json(value: &Value) -> Option<Self> {
-        let reader = JsonReader::new(value);
-        Some(Self {
-            byte_count: reader.u64("byte_count")?,
-            modified_seconds: reader.i64("modified_seconds")?,
-            modified_nanoseconds: reader.u64("modified_nanoseconds")? as u32,
-        })
     }
 }
 
@@ -5287,11 +4409,11 @@ impl<'a> TranscriptBlockFilterMatcher<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptBlockReferenceFilterResolver<'a> {
-    index: &'a DurableFragileIndex,
+    index: &'a IndexSnapshot,
 }
 
 impl<'a> TranscriptBlockReferenceFilterResolver<'a> {
-    pub fn new(index: &'a DurableFragileIndex) -> Self {
+    pub fn new(index: &'a IndexSnapshot) -> Self {
         Self { index }
     }
 
@@ -5422,10 +4544,7 @@ impl OneBackingLineCache {
         if self.path.as_ref() != Some(&block.path) || self.line_number != block.source_line_number {
             // Search has exactly one bounded backing-line buffer.  Do not trust a card's
             // recorded size to widen that buffer after its backing evidence changes.
-            let line_limit = maximum_read_bytes
-                .into_u64()
-                .saturating_add(4096)
-                .max(4096);
+            let line_limit = maximum_read_bytes.into_u64().saturating_add(4096).max(4096);
             let line =
                 BoundedLineReader::new(block.path.clone(), block.source_line_number, line_limit)
                     .read_line()
@@ -5868,88 +4987,6 @@ pub struct SizeMetadataJson<'a> {
 impl<'a> SizeMetadataJson<'a> {
     pub fn new(size: &'a SizeMetadata) -> Self {
         Self { size }
-    }
-
-    pub fn to_json(&self) -> Value {
-        json!({
-            "byte_count": self.size.byte_count.map(ByteCount::into_u64),
-            "line_count": self.size.line_count.map(LineCount::into_u64),
-            "segment_count": self.size.segment_count.map(ItemCount::into_u64),
-            "certainty": SizeCertaintyName::new(self.size.certainty).as_str(),
-        })
-    }
-
-    pub fn from_json(value: &Value) -> Option<SizeMetadata> {
-        let reader = JsonReader::new(value);
-        Some(SizeMetadata {
-            byte_count: reader.optional_u64("byte_count").map(ByteCount::new),
-            line_count: reader.optional_u64("line_count").map(LineCount::new),
-            segment_count: reader.optional_u64("segment_count").map(ItemCount::new),
-            certainty: SizeCertaintyName::parse(&reader.string("certainty")?)?,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct JsonReader<'a> {
-    value: &'a Value,
-}
-
-impl<'a> JsonReader<'a> {
-    pub fn new(value: &'a Value) -> Self {
-        Self { value }
-    }
-
-    pub fn value(&self, name: &str) -> Option<&'a Value> {
-        self.value.get(name)
-    }
-
-    pub fn string(&self, name: &str) -> Option<String> {
-        self.value
-            .get(name)
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-    }
-
-    pub fn optional_string(&self, name: &str) -> Option<String> {
-        self.value
-            .get(name)
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-    }
-
-    pub fn u64(&self, name: &str) -> Option<u64> {
-        self.value.get(name).and_then(Value::as_u64)
-    }
-
-    pub fn optional_u64(&self, name: &str) -> Option<u64> {
-        self.value.get(name).and_then(Value::as_u64)
-    }
-
-    pub fn i64(&self, name: &str) -> Option<i64> {
-        self.value.get(name).and_then(Value::as_i64)
-    }
-
-    pub fn array(&self, name: &str) -> Vec<&'a Value> {
-        self.value
-            .get(name)
-            .and_then(Value::as_array)
-            .map(|values| values.iter().collect())
-            .unwrap_or_default()
-    }
-
-    pub fn strings(&self, name: &str) -> Vec<String> {
-        self.value
-            .get(name)
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(ToOwned::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 }
 

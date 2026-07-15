@@ -39,7 +39,7 @@ pub use derived_paths::{
 pub use error::{Error, IndexStoreError, Result};
 pub use local_default_configuration::LocalDefaultConfigurationRequest;
 pub use nexus::NexusPlane;
+pub use output_index::OutputInterfaceRuntime;
 pub use output_index::store::IndexStore;
-pub use output_index::{FragileIndexStore, OutputInterfaceRuntime};
 pub use sema::SemaPlane;
 pub use signal::SignalPlane;

@@ -106,19 +106,14 @@ collection live in its adjacent `.output-index.json.d/` directory. Each chunk
 has fixed logical, serialized, record, and query-work limits and is validated
 for kind, checksum, and size before decoding.
 
-The v3 disk primitives define the intended snapshot-bound model: complete
-sources advance independently, incomplete sources retain a last-complete view
-with provisional/resumable coverage, and v2 is boundedly imported before its
-pointer is replaced. **They are not yet the live runtime implementation.** The
-current runtime still materializes a legacy in-memory snapshot for build and
-query, and its v2 importer/reconciler are not wired into publication. A v2
-pointer is now explicitly rejected while an incomplete refresh is present, so
-it cannot be misrepresented as an empty index or an ephemeral partial view;
-version-1 data is discarded without decoding. The remaining v3 runtime cutover
-is a deployment blocker, not architecture evidence. Backing evidence remains
-the read source, so references can become stale, missing, or broken when those
-files change; operations reject those cases with typed `OperationRejected`
-replies instead of guessing.
+The live output interface refreshes through the v3 typed generation writer and
+reopens only published rkyv projection chunks. A refresh scans each configured
+source once; an incomplete scan never replaces the last complete published
+truth, so no partial first generation is exposed. Published pointers and chunks
+are typed binary records; JSON remains confined to the bounded v2 migration
+adapter. Backing evidence remains the read source, so references can become
+stale, missing, or broken when those files change; operations reject those
+cases with typed `OperationRejected` replies instead of guessing.
 
 ## Privacy and projection
 

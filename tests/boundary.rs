@@ -13,10 +13,10 @@ use std::{
 };
 
 use aggregator::{
-    AdapterKind, CollectionClock, ConfigurationFixture, ConfigurationStore, Error,
-    FragileIndexStore, NexusPlane, ReferenceTime, RepositoryAdapterConfiguration,
-    RuntimeConfiguration, RuntimeConfigurationValidation, SemaPlane, SignalPlane,
-    TranscriptAdapterConfiguration, TranscriptRootConfiguration,
+    AdapterKind, CollectionClock, ConfigurationFixture, ConfigurationStore, Error, NexusPlane,
+    ReferenceTime, RepositoryAdapterConfiguration, RuntimeConfiguration,
+    RuntimeConfigurationValidation, SemaPlane, SignalPlane, TranscriptAdapterConfiguration,
+    TranscriptRootConfiguration,
     adapter::{
         MaximumDiscoveredFiles, MaximumFileBytes, MaximumLineBytes, MaximumReadFailures,
         MaximumScanEntries, TranscriptReadOutcome, TranscriptReadRequest, TranscriptRecord,
@@ -31,7 +31,9 @@ use aggregator::{
     },
     configuration::LegacyAggregatorConfiguration,
     daemon::{PrototypeDaemon, PrototypeSocket},
-    output_index::{DurableFragileIndex, SourceHealthObserver},
+    output_index::{
+        IndexSnapshot, SourceHealthObserver, limits::IndexStoreLimits, store::IndexStore,
+    },
 };
 use meta_signal_aggregator::{
     ActiveRepository, AggregatorConfiguration, ConfigurationCandidate, ConfigurationChange,
@@ -222,6 +224,13 @@ fn transcript_block_filter(kind_selection: TranscriptBlockKindSelection) -> Tran
         authored_status: AuthoredStatusFilter::AnyAuthoredStatus,
         time_window: None,
     }
+}
+
+fn typed_index_store(store_path: &std::path::Path) -> IndexStore {
+    IndexStore::new(
+        std::path::PathBuf::from(format!("{}.output-index.json", store_path.display())),
+        IndexStoreLimits::default(),
+    )
 }
 
 fn all_transcript_block_filter() -> TranscriptBlockFilter {
@@ -1239,7 +1248,7 @@ fn output_interface_lists_subagents_outputs_segments_and_bounded_reads() {
         .accepted_configuration()
         .expect("accepted configuration")
         .clone();
-    let index_store = FragileIndexStore::from_store_path(runtime.store_path());
+    let index_store = typed_index_store(runtime.store_path());
     let clock = CollectionClock::fixed(
         ReferenceTime::from_timestamp(Timestamp::new("2026-01-02T01:00:00Z"))
             .expect("reference timestamp"),
@@ -1277,7 +1286,7 @@ fn output_interface_lists_subagents_outputs_segments_and_bounded_reads() {
             .map(|timestamp| timestamp.as_str()),
         Some("2026-01-02T00:20:00Z")
     );
-    assert!(index_store.path().exists());
+    assert!(index_store.pointer_path().exists());
 
     let subagents = nexus
         .list_subagents(SubagentListRequest {
@@ -1596,7 +1605,7 @@ fn output_interface_rejects_cursors_when_listing_shape_changes() {
         OperationRejectionReason::FragileReferenceStale
     );
 
-    let all_sessions = nexus
+    let session_listing = nexus
         .list_sessions(SessionListRequest {
             request_identifier: RequestIdentifier::new("all-sessions-for-shape"),
             filter: SessionListFilter {
@@ -1610,7 +1619,7 @@ fn output_interface_rejects_cursors_when_listing_shape_changes() {
             },
         })
         .expect("all sessions");
-    let session_with_subagents = all_sessions
+    let session_with_subagents = session_listing
         .sessions
         .iter()
         .find(|session| {
@@ -3360,8 +3369,8 @@ fn health_reports_unreadable_durable_index_store() {
     let temp = TempDir::new().expect("tempdir");
     let (_, _, empty, _) = materialize_recovery_fixtures(temp.path());
     let store_path = temp.path().join("store");
-    let index_store = FragileIndexStore::from_store_path(&store_path);
-    fs::write(index_store.path(), "not-json").expect("write unreadable index fixture");
+    let index_store = typed_index_store(&store_path);
+    fs::write(index_store.pointer_path(), "not-json").expect("write unreadable index fixture");
     let mut configuration = ConfigurationFixture::minimal();
     configuration.store_path = FilesystemPath::new(store_path.display().to_string());
     configuration.active_repositories = Vec::new();
@@ -3405,7 +3414,7 @@ fn live_index_reconciles_current_evidence_idempotently_and_removes_stale_records
         .accepted_configuration()
         .expect("accepted configuration")
         .clone();
-    let index_store = FragileIndexStore::from_store_path(runtime.store_path());
+    let index_store = typed_index_store(runtime.store_path());
     let nexus = NexusPlane::with_runtime_configuration(
         runtime,
         CollectionClock::fixed(
@@ -3427,13 +3436,13 @@ fn live_index_reconciles_current_evidence_idempotently_and_removes_stale_records
     let first = nexus
         .list_transcript_blocks(request.clone())
         .expect("first refresh");
-    let first_bytes = fs::read(index_store.path()).expect("first index bytes");
+    let first_bytes = fs::read(index_store.pointer_path()).expect("first index bytes");
     let repeated = nexus
         .list_transcript_blocks(request.clone())
         .expect("identical refresh");
     assert_eq!(repeated.blocks, first.blocks);
     assert_eq!(
-        fs::read(index_store.path()).expect("repeated index bytes"),
+        fs::read(index_store.pointer_path()).expect("repeated index bytes"),
         first_bytes
     );
 
@@ -3448,7 +3457,7 @@ fn live_index_reconciles_current_evidence_idempotently_and_removes_stale_records
     assert_eq!(replacement.blocks.len(), 1);
     assert_ne!(replacement.blocks[0].reference, first.blocks[0].reference);
     let replacement_pointer = aggregator::output_index::store::IndexStore::new(
-        index_store.path().to_path_buf(),
+        index_store.pointer_path().to_path_buf(),
         aggregator::output_index::limits::IndexStoreLimits::default(),
     )
     .read_current_pointer()
@@ -3456,10 +3465,9 @@ fn live_index_reconciles_current_evidence_idempotently_and_removes_stale_records
     .expect("published v3 pointer");
     assert_eq!(replacement_pointer.format_version, 3);
     assert_eq!(
-        index_store
-            .read_current()
+        IndexSnapshot::from_typed_store(&index_store)
             .expect("read typed replacement")
-            .all_outputs()
+            .output_records()
             .count(),
         1
     );
@@ -3469,12 +3477,11 @@ fn live_index_reconciles_current_evidence_idempotently_and_removes_stale_records
         .list_transcript_blocks(request)
         .expect("deletion refresh");
     assert!(removed.blocks.is_empty());
-    let removed_bytes = fs::read(index_store.path()).expect("deletion pointer bytes");
+    let removed_bytes = fs::read(index_store.pointer_path()).expect("deletion pointer bytes");
     assert!(
-        index_store
-            .read_current()
+        IndexSnapshot::from_typed_store(&index_store)
             .expect("read typed deletion")
-            .all_outputs()
+            .output_records()
             .next()
             .is_none()
     );
@@ -3501,7 +3508,7 @@ fn truncated_scan_preserves_last_complete_live_index_without_erasing_scope() {
         .accepted_configuration()
         .expect("complete configuration")
         .clone();
-    let index_store = FragileIndexStore::from_store_path(complete_runtime.store_path());
+    let index_store = typed_index_store(complete_runtime.store_path());
     let complete_nexus = NexusPlane::with_runtime_configuration(
         complete_runtime,
         CollectionClock::fixed(
@@ -3529,7 +3536,7 @@ fn truncated_scan_preserves_last_complete_live_index_without_erasing_scope() {
             .len(),
         2
     );
-    let complete_bytes = fs::read(index_store.path()).expect("complete index bytes");
+    let complete_bytes = fs::read(index_store.pointer_path()).expect("complete index bytes");
 
     let mut limited_configuration = configuration;
     limited_configuration
@@ -3552,7 +3559,7 @@ fn truncated_scan_preserves_last_complete_live_index_without_erasing_scope() {
         .expect("truncated scan uses last complete index");
     assert_eq!(preserved.sessions.len(), 2);
     assert_eq!(
-        fs::read(index_store.path()).expect("preserved index bytes"),
+        fs::read(index_store.pointer_path()).expect("preserved index bytes"),
         complete_bytes
     );
     let health = limited_nexus
@@ -3565,40 +3572,6 @@ fn truncated_scan_preserves_last_complete_live_index_without_erasing_scope() {
             .sources
             .iter()
             .any(|source| source.status == SourceHealthStatus::DiscoveryTruncated)
-    );
-}
-
-#[test]
-fn legacy_index_is_discarded_without_decode_and_failed_replacement_keeps_last_index() {
-    let root = TempDir::new().expect("temporary root");
-    let store = FragileIndexStore::from_store_path(&root.path().join("store"));
-    fs::write(
-        store.path(),
-        format!(
-            "{{\"version\": 1,\"legacy\":\"{}\"}}",
-            "x".repeat(1_048_576)
-        ),
-    )
-    .expect("write legacy index");
-    assert!(
-        store
-            .read_or_empty()
-            .expect("probe legacy index")
-            .is_empty()
-    );
-
-    store
-        .write(&DurableFragileIndex::empty())
-        .expect("replace legacy index atomically");
-    let committed = fs::read(store.path()).expect("committed index");
-    assert!(committed.starts_with(b"{\"schema_version\":1,\"format_version\":3,"));
-    fs::create_dir(store.temporary_path()).expect("stale legacy temporary");
-    store
-        .write(&DurableFragileIndex::empty())
-        .expect("unique v3 pointer publication ignores stale temporary");
-    assert_eq!(
-        fs::read(store.path()).expect("unchanged typed pointer"),
-        committed
     );
 }
 
