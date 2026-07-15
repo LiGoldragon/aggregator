@@ -89,9 +89,33 @@ pub struct SourceSlot {
     pub source_kind: u8,
     pub configured_occurrence: u64,
     pub configuration_signature: [u8; 32],
+    /// The only generation authorized to represent a fully scanned source.
     pub last_complete: Option<String>,
+    /// A refresh may expose a resumable partial generation without claiming completion.
     pub visible_generation: Option<String>,
+    /// The resumable cursor belonging to `visible_generation`, if it is provisional.
+    pub provisional_checkpoint: Option<String>,
+    /// `SourceCoverageStatus::{Complete, Incomplete, Failed}` encoded as a stable byte.
     pub coverage_status: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SourceCoverageStatus {
+    Complete = 1,
+    Incomplete = 2,
+    Failed = 3,
+}
+
+impl SourceCoverageStatus {
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Complete),
+            2 => Some(Self::Incomplete),
+            3 => Some(Self::Failed),
+            _ => None,
+        }
+    }
 }
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq, Eq)]

@@ -1,6 +1,8 @@
 pub mod build;
 pub mod instrumentation;
 pub mod limits;
+pub mod migration_v2;
+pub mod reconciliation;
 pub mod schema;
 pub mod store;
 

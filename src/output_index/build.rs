@@ -45,6 +45,14 @@ impl SourceKey {
         self.configured_occurrence
     }
 
+    pub fn source_kind(&self) -> &str {
+        &self.source_kind
+    }
+
+    pub fn source_identifier(&self) -> &str {
+        &self.source_identifier
+    }
+
     pub fn signature(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(self.source_kind.as_bytes());

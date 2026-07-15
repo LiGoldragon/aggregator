@@ -49,6 +49,64 @@ impl IndexStore {
         &self.data_root
     }
 
+    /// The immutable copy of the v2 JSON evidence retained solely for migration rollback.
+    pub fn migration_backup_path(&self) -> PathBuf {
+        self.data_root.join("migration").join("v2-backup.json")
+    }
+
+    /// Streams v2 evidence into its one immutable rollback copy before the v3 pointer replaces it.
+    /// A prior backup is deliberately retained rather than turned into an unbounded archive.
+    pub fn retain_v2_backup(&self, source: &Path) -> Result<PathBuf> {
+        self.ensure_root()?;
+        let source_metadata = fs::symlink_metadata(source).map_err(|error| {
+            Error::index_store(IndexStoreError::io("inspecting v2 migration source", error))
+        })?;
+        if source_metadata.file_type().is_symlink() || !source_metadata.file_type().is_file() {
+            return Err(Error::index_store(IndexStoreError::UnsafePath));
+        }
+        let backup = self.migration_backup_path();
+        match fs::symlink_metadata(&backup) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                    return Err(Error::index_store(IndexStoreError::UnsafePath));
+                }
+                return Ok(backup);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Error::index_store(IndexStoreError::io(
+                    "inspecting v2 migration backup",
+                    error,
+                )));
+            }
+        }
+        let temporary =
+            backup.with_extension(format!("{}.tmp", UniqueGeneration::new("backup").as_str()));
+        let copy = File::open(source)
+            .and_then(|mut input| {
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temporary)
+                    .and_then(|mut output| {
+                        std::io::copy(&mut input, &mut output)?;
+                        output.sync_all()
+                    })
+            })
+            .map_err(|error| {
+                Error::index_store(IndexStoreError::io("streaming v2 migration backup", error))
+            });
+        if let Err(error) = copy {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        fs::rename(&temporary, &backup).map_err(|error| {
+            Error::index_store(IndexStoreError::io("committing v2 migration backup", error))
+        })?;
+        self.sync_directory(backup.parent())?;
+        Ok(backup)
+    }
+
     /// Creates a unique, unlinked generation. The base pointer hash is retained for CAS publication.
     pub fn create_staging(&self, nonce: &str) -> Result<IndexStaging> {
         let prefix = IndexLocator::new(nonce);
