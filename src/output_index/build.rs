@@ -237,6 +237,7 @@ impl BoundedIndexRefresher {
     ) -> Result<()> {
         let chunk = IndexChunk {
             schema_version: 1,
+            projection: None,
             records: vec![IndexRecordDto {
                 schema_version: 1,
                 record_kind: 2,
@@ -377,6 +378,7 @@ impl BoundedGenerationBuilder {
         let chunk = IndexChunk {
             schema_version: 1,
             records: std::mem::take(&mut self.records),
+            projection: None,
         };
         self.staging
             .write_chunk(&locator, IndexFileKind::Chunk, &chunk)?;
@@ -545,6 +547,7 @@ impl IndexManifestRecord {
         IndexChunk {
             schema_version: 1,
             records: self.records,
+            projection: None,
         }
     }
 }

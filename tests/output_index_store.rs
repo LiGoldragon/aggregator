@@ -21,6 +21,7 @@ fn test_chunk() -> IndexChunk {
                 bytes: b"opaque-reference".to_vec(),
             }],
         }],
+        projection: None,
     }
 }
 

@@ -429,6 +429,7 @@ impl MigrationRunWriter {
         let chunk = IndexChunk {
             schema_version: 1,
             records: std::mem::take(&mut self.records),
+            projection: None,
         };
         staging.write_chunk(
             &super::store::IndexLocator::new(locator.clone()),

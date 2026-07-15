@@ -2739,6 +2739,7 @@ impl FragileIndexStore {
             &IndexChunk {
                 schema_version: 1,
                 records: manifest_records,
+                projection: None,
             },
         )?;
         store.publish(&staging, &manifest, identity)?;
@@ -2829,6 +2830,7 @@ impl FragileIndexStore {
             &IndexChunk {
                 schema_version: 1,
                 records: std::mem::take(records),
+                projection: None,
             },
         )?;
         manifest_records.push(IndexRecordDto {
