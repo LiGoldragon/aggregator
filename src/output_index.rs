@@ -4619,7 +4619,7 @@ impl PageCursor {
 
     pub fn to_reference(&self) -> FragilePageCursor {
         FragilePageCursor::new(format!(
-            "cursor:v2:{}:{}:{}:{}",
+            "cursor:v3:{}:{}:{}:{}",
             self.collection.as_str(),
             ListingOrderName::new(self.order).as_str(),
             self.offset,
@@ -4629,7 +4629,7 @@ impl PageCursor {
 
     pub fn parse(reference: &FragilePageCursor) -> Option<Self> {
         let parts = reference.as_str().split(':').collect::<Vec<_>>();
-        if parts.len() != 6 || parts[0] != "cursor" || parts[1] != "v2" {
+        if parts.len() != 6 || parts[0] != "cursor" || parts[1] != "v3" {
             return None;
         }
         Some(Self {
