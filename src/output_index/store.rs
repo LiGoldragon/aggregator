@@ -51,6 +51,10 @@ impl IndexStore {
         &self.data_root
     }
 
+    pub fn limits(&self) -> IndexStoreLimits {
+        self.limits
+    }
+
     /// The immutable copy of the v2 JSON evidence retained solely for migration rollback.
     pub fn migration_backup_path(&self) -> PathBuf {
         self.data_root.join("migration").join("v2-backup.json")

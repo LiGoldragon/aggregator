@@ -827,6 +827,122 @@ impl RefreshedPersistentIndex {
     }
 }
 
+/// Canonical persisted sort material. Its tuple order is deliberately identical to the existing
+/// listing comparators: descending affects only the primary chronology/index component, while
+/// every contract tie-breaker remains ascending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProjectionTreeOrdering {
+    order: ListingOrder,
+}
+impl ProjectionTreeOrdering {
+    pub(crate) fn new(order: ListingOrder) -> Self {
+        Self { order }
+    }
+
+    pub(crate) fn key(&self, projection: &ProjectionRecordDto) -> Option<String> {
+        if self.order == ListingOrder::ReferenceAscending {
+            let reference = match projection {
+                ProjectionRecordDto::Session(value) => &value.reference,
+                ProjectionRecordDto::Subagent(value) => &value.reference,
+                ProjectionRecordDto::Output(value) => &value.reference,
+                ProjectionRecordDto::Segment(value) => &value.reference,
+                ProjectionRecordDto::TranscriptBlock(value) => &value.reference,
+            };
+            return Some(Self::component(reference));
+        }
+        let (reference, timestamp) = match projection {
+            ProjectionRecordDto::Session(value) => (
+                &value.reference,
+                if matches!(
+                    self.order,
+                    ListingOrder::OldestModifiedFirst | ListingOrder::NewestModifiedFirst
+                ) {
+                    value.last_observed_at.as_deref()
+                } else {
+                    value.started_at.as_deref()
+                },
+            ),
+            ProjectionRecordDto::Subagent(value) => {
+                (&value.reference, value.first_observed_at.as_deref())
+            }
+            ProjectionRecordDto::Output(value) => (&value.reference, value.produced_at.as_deref()),
+            ProjectionRecordDto::Segment(value) => {
+                return Some(self.segment_key(value, &value.reference));
+            }
+            ProjectionRecordDto::TranscriptBlock(value) => {
+                return self.transcript_block_key(value);
+            }
+        };
+        Some(format!(
+            "{}{}",
+            self.timestamp_key(timestamp),
+            Self::component(reference)
+        ))
+    }
+
+    fn segment_key(&self, value: &schema::ProjectionSegmentDto, reference: &str) -> String {
+        format!(
+            "{}\u{1f}{}",
+            Self::segment_index_material(self.order, value.segment_index),
+            Self::component(reference)
+        )
+    }
+
+    fn transcript_block_key(&self, value: &schema::ProjectionTranscriptBlockDto) -> Option<String> {
+        let source = TypedProjectionValue::source(value.source).ok()?;
+        let chronology = self.timestamp_key(value.observed_at.as_deref());
+        Some(format!(
+            "{chronology}{}{}{}{:020}\u{1f}{:020}\u{1f}{}",
+            Self::component(SourceKindName::new(source).as_str()),
+            Self::component(&value.source_identifier),
+            Self::component(&value.path.display),
+            value.source_line_number,
+            value.block_index,
+            Self::component(&value.reference),
+        ))
+    }
+
+    fn segment_index_material(order: ListingOrder, index: u64) -> String {
+        let descending = matches!(
+            order,
+            ListingOrder::NewestFirst | ListingOrder::NewestModifiedFirst
+        );
+        format!("{:020}", if descending { u64::MAX - index } else { index })
+    }
+
+    fn timestamp_key(&self, timestamp: Option<&str>) -> String {
+        let descending = matches!(
+            self.order,
+            ListingOrder::NewestFirst | ListingOrder::NewestModifiedFirst
+        );
+        match timestamp {
+            Some(timestamp) if descending => format!("0\u{1f}{}", Self::inverted(timestamp)),
+            Some(timestamp) => format!("0\u{1f}{}", Self::component(timestamp)),
+            None => "1\u{1f}".to_owned(),
+        }
+    }
+
+    fn component(value: &str) -> String {
+        let mut material = String::with_capacity(value.len() * 2 + 1);
+        for byte in value.as_bytes() {
+            use std::fmt::Write as _;
+            let _ = write!(material, "{byte:02x}");
+        }
+        material.push('!');
+        material
+    }
+
+    fn inverted(value: &str) -> String {
+        let mut material = String::with_capacity(value.len() * 2 + 1);
+        for byte in value.as_bytes() {
+            use std::fmt::Write as _;
+            let _ = write!(material, "{:02x}", u8::MAX - byte);
+        }
+        material.push('!');
+        material
+    }
+}
+
 /// Query handle for one immutable v3 publication. It owns scalar roots only: decoding a
 /// collection is a bounded tree walk, never a directory enumeration or corpus reconstruction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1037,6 +1153,26 @@ impl PersistentProjectionTree {
             .filter(|record| record.record_kind == 61)
             .map(PersistentTreeRoot::from_record)
             .collect::<Result<Vec<_>>>()?;
+        let expected = build::TreeSpecification::all()
+            .into_iter()
+            .map(build::TreeSpecification::name)
+            .collect::<BTreeSet<_>>();
+        let actual = roots
+            .iter()
+            .map(|root| root.name.clone())
+            .collect::<BTreeSet<_>>();
+        if actual.len() != roots.len() {
+            return Err(Error::protocol(
+                "persistent tree",
+                "duplicate manifest root",
+            ));
+        }
+        if actual != expected {
+            return Err(Error::protocol(
+                "persistent tree",
+                "missing or unknown manifest root",
+            ));
+        }
         Ok(Self {
             store,
             pointer,
@@ -1065,7 +1201,12 @@ impl PersistentProjectionTree {
         let Some(locator) = &root.locator else {
             return Ok(0);
         };
-        PersistentTreeEntryWalk::new(self, budget, visitor).visit(locator)
+        PersistentTreeEntryWalk::new(
+            self,
+            TreeTraversalLimits::new(root.count, self.store.limits(), budget),
+            visitor,
+        )
+        .visit(locator)
     }
     fn locator(&self, leaf: &str) -> String {
         if leaf.contains('/') {
@@ -1234,6 +1375,9 @@ struct PersistentTreeNode {
 }
 impl PersistentTreeNode {
     fn from_chunk(chunk: schema::IndexChunk) -> Result<Self> {
+        if chunk.records.len() > 16 {
+            return Err(Error::protocol("persistent tree", "fixed fanout exceeded"));
+        }
         let children = chunk
             .records
             .first()
@@ -1341,32 +1485,87 @@ impl<'a> PersistentTreeWalk<'a> {
     }
 }
 
+/// Independent traversal budgets derived from manifest cardinality and fixed tree limits.
+#[derive(Debug, Clone, Copy)]
+struct TreeTraversalLimits {
+    candidate_budget: u64,
+    node_read_budget: u64,
+    depth_budget: u64,
+    repeated_locator_budget: u64,
+}
+impl TreeTraversalLimits {
+    fn new(root_count: u64, limits: limits::IndexStoreLimits, requested_candidates: u64) -> Self {
+        let fanout = limits.maximum_records_per_chunk.clamp(2, 16);
+        let mut depth_budget = 1_u64;
+        let mut covered = fanout;
+        while covered < root_count {
+            depth_budget = depth_budget.saturating_add(1);
+            covered = covered.saturating_mul(fanout);
+        }
+        let candidate_budget = requested_candidates.min(limits.maximum_query_candidates);
+        Self {
+            candidate_budget,
+            node_read_budget: candidate_budget
+                .saturating_add(1)
+                .saturating_mul(depth_budget),
+            depth_budget,
+            repeated_locator_budget: 1,
+        }
+    }
+}
+
 /// A bounded leaf-entry visitor used by order and relationship readers. It retains only one
-/// decoded node per recursion frame and stops at the caller's fixed budget.
+/// decoded node per recursion frame and rejects cyclic or repeated locators before repeated IO.
 struct PersistentTreeEntryWalk<'a, 'visitor, F> {
     tree: &'a PersistentProjectionTree,
-    budget: u64,
+    limits: TreeTraversalLimits,
     visited: u64,
+    node_reads: u64,
+    locators: BTreeMap<String, u64>,
     visitor: &'visitor mut F,
 }
 impl<'a, 'visitor, F: FnMut(&str, &str) -> bool> PersistentTreeEntryWalk<'a, 'visitor, F> {
-    fn new(tree: &'a PersistentProjectionTree, budget: u64, visitor: &'visitor mut F) -> Self {
+    fn new(
+        tree: &'a PersistentProjectionTree,
+        limits: TreeTraversalLimits,
+        visitor: &'visitor mut F,
+    ) -> Self {
         Self {
             tree,
-            budget,
+            limits,
             visited: 0,
+            node_reads: 0,
+            locators: BTreeMap::new(),
             visitor,
         }
     }
 
     fn visit(mut self, locator: &str) -> Result<u64> {
-        self.visit_node(locator)?;
+        self.visit_node(locator, 1)?;
         Ok(self.visited)
     }
 
-    fn visit_node(&mut self, locator: &str) -> Result<bool> {
-        if self.visited >= self.budget {
+    fn visit_node(&mut self, locator: &str, depth: u64) -> Result<bool> {
+        if self.visited >= self.limits.candidate_budget {
             return Ok(false);
+        }
+        if depth > self.limits.depth_budget {
+            return Err(Error::protocol(
+                "persistent tree",
+                "tree depth exceeds manifest budget",
+            ));
+        }
+        let repeated = self.locators.entry(locator.to_owned()).or_default();
+        *repeated = repeated.saturating_add(1);
+        if *repeated > self.limits.repeated_locator_budget {
+            return Err(Error::protocol("persistent tree", "repeated tree locator"));
+        }
+        self.node_reads = self.node_reads.saturating_add(1);
+        if self.node_reads > self.limits.node_read_budget {
+            return Err(Error::protocol(
+                "persistent tree",
+                "tree node-read budget exceeded",
+            ));
         }
         let node = PersistentTreeNode::from_chunk(
             self.tree
@@ -1378,11 +1577,11 @@ impl<'a, 'visitor, F: FnMut(&str, &str) -> bool> PersistentTreeEntryWalk<'a, 'vi
                 .read()?,
         )?;
         for entry in node.entries {
-            if self.visited >= self.budget {
+            if self.visited >= self.limits.candidate_budget {
                 return Ok(false);
             }
             if node.children {
-                if !self.visit_node(&entry.locator)? {
+                if !self.visit_node(&entry.locator, depth.saturating_add(1))? {
                     return Ok(false);
                 }
             } else {
@@ -2469,17 +2668,12 @@ impl IndexedTranscriptBlock {
     }
 
     pub fn source_sort_material(&self) -> String {
-        StableSignatureMaterial::new("transcript-block-source-sort")
-            .field(
-                "source",
-                SourceKindName::new(self.provenance.source).as_str(),
-            )
-            .field(
-                "source_identifier",
-                self.provenance.source_identifier.as_str(),
-            )
-            .field("path", self.path.display().to_string())
-            .finish()
+        format!(
+            "{}{}{}",
+            ProjectionTreeOrdering::component(SourceKindName::new(self.provenance.source).as_str()),
+            ProjectionTreeOrdering::component(self.provenance.source_identifier.as_str()),
+            ProjectionTreeOrdering::component(&self.path.display().to_string()),
+        )
     }
 
     pub fn size_byte_count(&self) -> u64 {
@@ -4490,16 +4684,15 @@ impl IndexedSegmentSorter {
             ListingOrder::ReferenceAscending => {
                 left.reference.as_str().cmp(right.reference.as_str())
             }
-            ListingOrder::OldestFirst | ListingOrder::OldestModifiedFirst => left
-                .segment_index
-                .into_u64()
-                .cmp(&right.segment_index.into_u64())
-                .then_with(|| left.reference.as_str().cmp(right.reference.as_str())),
-            ListingOrder::NewestFirst | ListingOrder::NewestModifiedFirst => right
-                .segment_index
-                .into_u64()
-                .cmp(&left.segment_index.into_u64())
-                .then_with(|| left.reference.as_str().cmp(right.reference.as_str())),
+            _ => ProjectionTreeOrdering::segment_index_material(
+                self.order,
+                left.segment_index.into_u64(),
+            )
+            .cmp(&ProjectionTreeOrdering::segment_index_material(
+                self.order,
+                right.segment_index.into_u64(),
+            ))
+            .then_with(|| left.reference.as_str().cmp(right.reference.as_str())),
         });
     }
 }
@@ -4595,31 +4788,32 @@ impl ChronologyOrdering {
     ) -> Ordering {
         match self.order {
             ListingOrder::ReferenceAscending => left_reference.cmp(right_reference),
-            ListingOrder::OldestFirst | ListingOrder::OldestModifiedFirst => self
-                .compare_oldest(left_timestamp, right_timestamp)
-                .then_with(|| left_reference.cmp(right_reference)),
-            ListingOrder::NewestFirst | ListingOrder::NewestModifiedFirst => self
-                .compare_newest(left_timestamp, right_timestamp)
+            _ => ProjectionTreeOrdering::new(self.order)
+                .timestamp_key(left_timestamp.map(Timestamp::as_str))
+                .cmp(
+                    &ProjectionTreeOrdering::new(self.order)
+                        .timestamp_key(right_timestamp.map(Timestamp::as_str)),
+                )
                 .then_with(|| left_reference.cmp(right_reference)),
         }
     }
 
     pub fn compare_oldest(&self, left: Option<&Timestamp>, right: Option<&Timestamp>) -> Ordering {
-        match (left, right) {
-            (Some(left), Some(right)) => left.as_str().cmp(right.as_str()),
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => Ordering::Equal,
-        }
+        ProjectionTreeOrdering::new(ListingOrder::OldestFirst)
+            .timestamp_key(left.map(Timestamp::as_str))
+            .cmp(
+                &ProjectionTreeOrdering::new(ListingOrder::OldestFirst)
+                    .timestamp_key(right.map(Timestamp::as_str)),
+            )
     }
 
     pub fn compare_newest(&self, left: Option<&Timestamp>, right: Option<&Timestamp>) -> Ordering {
-        match (left, right) {
-            (Some(left), Some(right)) => right.as_str().cmp(left.as_str()),
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => Ordering::Equal,
-        }
+        ProjectionTreeOrdering::new(ListingOrder::NewestFirst)
+            .timestamp_key(left.map(Timestamp::as_str))
+            .cmp(
+                &ProjectionTreeOrdering::new(ListingOrder::NewestFirst)
+                    .timestamp_key(right.map(Timestamp::as_str)),
+            )
     }
 }
 
@@ -5401,5 +5595,370 @@ impl StableHash {
             hash = hash.wrapping_mul(0x100000001b3);
         }
         format!("{hash:016x}")
+    }
+}
+
+#[cfg(test)]
+mod persistent_tree_audit_tests {
+    use std::path::PathBuf;
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn size() -> ProjectionSizeDto {
+        ProjectionSizeDto {
+            byte_count: Some(1),
+            line_count: Some(1),
+            segment_count: Some(1),
+            certainty: 1,
+        }
+    }
+
+    fn session(reference: &str, started: &str, modified: &str) -> ProjectionRecordDto {
+        ProjectionRecordDto::Session(schema::ProjectionSessionDto {
+            reference: reference.to_owned(),
+            source: 1,
+            source_identifier: "source".to_owned(),
+            path: schema::DiskPath::new(Vec::new(), "/synthetic/session".to_owned()),
+            fingerprint_bytes: 1,
+            fingerprint_seconds: 0,
+            fingerprint_nanoseconds: 0,
+            started_at: Some(started.to_owned()),
+            last_observed_at: Some(modified.to_owned()),
+            producer_session_identifier: None,
+            subagent_count: 0,
+            output_count: 0,
+            size: size(),
+        })
+    }
+
+    fn output(reference: &str, timestamp: &str) -> ProjectionRecordDto {
+        ProjectionRecordDto::Output(schema::ProjectionOutputDto {
+            reference: reference.to_owned(),
+            session_reference: "session".to_owned(),
+            subagent_reference: Some("subagent".to_owned()),
+            title: None,
+            task: None,
+            source: 1,
+            source_identifier: "source".to_owned(),
+            authored_status: 1,
+            produced_at: Some(timestamp.to_owned()),
+            path: schema::DiskPath::new(Vec::new(), "/synthetic/output".to_owned()),
+            fingerprint_bytes: 1,
+            fingerprint_seconds: 0,
+            fingerprint_nanoseconds: 0,
+            source_line_number: 1,
+            text_hash: "hash".to_owned(),
+            size: size(),
+            preview_text: String::new(),
+            preview_original_bytes: 0,
+        })
+    }
+
+    fn segment(reference: &str, index: u64) -> ProjectionRecordDto {
+        ProjectionRecordDto::Segment(schema::ProjectionSegmentDto {
+            reference: reference.to_owned(),
+            output_reference: "output".to_owned(),
+            segment_index: index,
+            byte_range: None,
+            line_range: None,
+            size: size(),
+            preview_text: String::new(),
+            preview_original_bytes: 0,
+            source: 1,
+            path: schema::DiskPath::new(Vec::new(), "/synthetic/segment".to_owned()),
+        })
+    }
+
+    fn block(
+        reference: &str,
+        source: u8,
+        source_identifier: &str,
+        path: &str,
+        line: u64,
+        block_index: u64,
+    ) -> ProjectionRecordDto {
+        ProjectionRecordDto::TranscriptBlock(schema::ProjectionTranscriptBlockDto {
+            reference: reference.to_owned(),
+            session_reference: "session".to_owned(),
+            subagent_reference: Some("subagent".to_owned()),
+            kind: 2,
+            block_index,
+            task: None,
+            source,
+            source_identifier: source_identifier.to_owned(),
+            authored_status: 1,
+            observed_at: Some("2026-01-01T00:00:00Z".to_owned()),
+            path: schema::DiskPath::new(Vec::new(), path.to_owned()),
+            fingerprint_bytes: 1,
+            fingerprint_seconds: 0,
+            fingerprint_nanoseconds: 0,
+            source_line_number: line,
+            text_hash: "hash".to_owned(),
+            size: size(),
+            text_availability: 1,
+            preview_text: String::new(),
+            preview_original_bytes: 0,
+        })
+    }
+
+    #[test]
+    fn canonical_tree_ordering_matches_old_new_modified_and_segment_contracts() {
+        let older = output("output-a", "2026-01-01T00:00:00Z");
+        let newer = output("output-b", "2026-01-02T00:00:00Z");
+        let oldest = ProjectionTreeOrdering::new(ListingOrder::OldestFirst);
+        let newest = ProjectionTreeOrdering::new(ListingOrder::NewestFirst);
+        assert!(oldest.key(&older) < oldest.key(&newer));
+        assert!(newest.key(&newer) < newest.key(&older));
+
+        let modified_older = session("session-a", "2026-01-03T00:00:00Z", "2026-01-01T00:00:00Z");
+        let modified_newer = session("session-b", "2026-01-01T00:00:00Z", "2026-01-03T00:00:00Z");
+        let modified_oldest = ProjectionTreeOrdering::new(ListingOrder::OldestModifiedFirst);
+        let modified_newest = ProjectionTreeOrdering::new(ListingOrder::NewestModifiedFirst);
+        assert!(modified_oldest.key(&modified_older) < modified_oldest.key(&modified_newer));
+        assert!(modified_newest.key(&modified_newer) < modified_newest.key(&modified_older));
+
+        let first_segment = segment("segment-a", 1);
+        let last_segment = segment("segment-b", 2);
+        assert!(oldest.key(&first_segment) < oldest.key(&last_segment));
+        assert!(newest.key(&last_segment) < newest.key(&first_segment));
+    }
+
+    #[test]
+    fn transcript_block_key_carries_source_path_line_index_and_reference_ties() {
+        let first = block("block-a", 1, "alpha", "/a", 1, 0);
+        let source_tie = block("block-b", 2, "alpha", "/a", 1, 0);
+        let path_tie = block("block-c", 2, "alpha", "/b", 1, 0);
+        let line_tie = block("block-d", 2, "alpha", "/b", 2, 0);
+        let index_tie = block("block-e", 2, "alpha", "/b", 2, 1);
+        let order = ProjectionTreeOrdering::new(ListingOrder::OldestFirst);
+        let keys = [first, source_tie, path_tie, line_tie, index_tie]
+            .iter()
+            .map(|block| order.key(block).expect("block key"))
+            .collect::<Vec<_>>();
+        assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
+        let newest = ProjectionTreeOrdering::new(ListingOrder::NewestFirst);
+        assert!(
+            newest.key(&block("block-z", 1, "alpha", "/a", 1, 0))
+                < newest.key(&block("block-y", 1, "alpha", "/a", 1, 1))
+        );
+        let older = block("block-old", 1, "alpha", "/a", 1, 0);
+        let mut newer = block("block-new", 1, "alpha", "/a", 1, 0);
+        if let ProjectionRecordDto::TranscriptBlock(value) = &mut newer {
+            value.observed_at = Some("2026-01-02T00:00:00Z".to_owned());
+        }
+        assert!(newest.key(&newer) < newest.key(&older));
+    }
+
+    fn root_record(name: String, locator: &str, count: u64) -> schema::IndexRecordDto {
+        schema::IndexRecordDto {
+            schema_version: 1,
+            record_kind: 61,
+            fields: vec![
+                schema::IndexFieldDto {
+                    name: "tree-collection".to_owned(),
+                    bytes: name.into_bytes(),
+                },
+                schema::IndexFieldDto {
+                    name: "tree-root".to_owned(),
+                    bytes: locator.as_bytes().to_vec(),
+                },
+                schema::IndexFieldDto {
+                    name: "tree-count".to_owned(),
+                    bytes: count.to_le_bytes().to_vec(),
+                },
+            ],
+        }
+    }
+
+    fn expected_root_records(
+        target_locator: &str,
+        target_count: u64,
+    ) -> Vec<schema::IndexRecordDto> {
+        build::TreeSpecification::all()
+            .into_iter()
+            .map(|specification| {
+                let name = specification.name();
+                let selected = name == "outputs";
+                root_record(
+                    name,
+                    if selected { target_locator } else { "" },
+                    if selected { target_count } else { 0 },
+                )
+            })
+            .collect()
+    }
+
+    fn pointer() -> schema::CurrentPointer {
+        schema::CurrentPointer {
+            schema_version: 1,
+            format_version: 3,
+            manifest_locator: "generations/test/manifest".to_owned(),
+            snapshot_identity: [0; 32],
+        }
+    }
+
+    #[test]
+    fn manifest_reopen_rejects_missing_duplicate_and_unknown_roots() {
+        let store = IndexStore::new(
+            PathBuf::from("/tmp/aggregator-tree-audit"),
+            limits::IndexStoreLimits::default(),
+        );
+        let mut missing = expected_root_records("", 0);
+        missing.pop();
+        assert!(
+            PersistentProjectionTree::from_manifest(
+                store.clone(),
+                pointer(),
+                schema::IndexChunk {
+                    schema_version: 1,
+                    records: missing,
+                    projection: None
+                },
+            )
+            .is_err()
+        );
+
+        let mut duplicate = expected_root_records("", 0);
+        duplicate.push(duplicate[0].clone());
+        assert!(
+            PersistentProjectionTree::from_manifest(
+                store.clone(),
+                pointer(),
+                schema::IndexChunk {
+                    schema_version: 1,
+                    records: duplicate,
+                    projection: None
+                },
+            )
+            .is_err()
+        );
+
+        let mut unknown = expected_root_records("", 0);
+        unknown.push(root_record("order:unknown:oldest".to_owned(), "", 0));
+        assert!(
+            PersistentProjectionTree::from_manifest(
+                store,
+                pointer(),
+                schema::IndexChunk {
+                    schema_version: 1,
+                    records: unknown,
+                    projection: None
+                },
+            )
+            .is_err()
+        );
+    }
+
+    fn node(child_locators: &[String]) -> schema::IndexChunk {
+        schema::IndexChunk {
+            schema_version: 1,
+            projection: None,
+            records: child_locators
+                .iter()
+                .enumerate()
+                .map(|(index, child)| {
+                    let key = format!("{index:020}");
+                    schema::IndexRecordDto {
+                        schema_version: 1,
+                        record_kind: 63,
+                        fields: vec![
+                            schema::IndexFieldDto {
+                                name: "tree-key".to_owned(),
+                                bytes: key.as_bytes().to_vec(),
+                            },
+                            schema::IndexFieldDto {
+                                name: "tree-key-hash".to_owned(),
+                                bytes: blake3::hash(key.as_bytes()).as_bytes().to_vec(),
+                            },
+                            schema::IndexFieldDto {
+                                name: "tree-reference".to_owned(),
+                                bytes: Vec::new(),
+                            },
+                            schema::IndexFieldDto {
+                                name: "tree-child".to_owned(),
+                                bytes: child.as_bytes().to_vec(),
+                            },
+                        ],
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    fn published_adversarial_tree(nodes: Vec<(String, schema::IndexChunk)>) -> PersistentIndex {
+        let temporary = TempDir::new().expect("tree audit store");
+        let root = temporary.keep();
+        let store = IndexStore::new(root.join("index"), limits::IndexStoreLimits::default());
+        let staging = store.create_staging("adversarial").expect("staging");
+        for (name, chunk) in nodes {
+            staging
+                .write_chunk(
+                    &store::IndexLocator::new(name),
+                    schema::IndexFileKind::IndexNode,
+                    &chunk,
+                )
+                .expect("node");
+        }
+        let manifest = schema::IndexChunk {
+            schema_version: 1,
+            records: expected_root_records("node-0", u64::MAX),
+            projection: None,
+        };
+        let manifest_locator = store::IndexLocator::new("manifest");
+        staging
+            .write_chunk(
+                &manifest_locator,
+                schema::IndexFileKind::Manifest,
+                &manifest,
+            )
+            .expect("manifest");
+        store
+            .publish(&staging, &manifest_locator, [7; 32])
+            .expect("publish");
+        PersistentIndex::from_typed_store(&store).expect("index")
+    }
+
+    #[test]
+    fn traversal_rejects_cycles_depth_excess_and_node_read_excess() {
+        let cycle =
+            published_adversarial_tree(vec![("node-0".to_owned(), node(&["node-0".to_owned()]))]);
+        assert!(
+            cycle
+                .visit_persistent_tree("outputs", 1, |_, _| true)
+                .is_err()
+        );
+
+        let mut depth_nodes = Vec::new();
+        for index in 0..18 {
+            let next = format!("node-{}", index + 1);
+            depth_nodes.push((format!("node-{index}"), node(&[next])));
+        }
+        depth_nodes.push(("node-18".to_owned(), node(&[])));
+        let depth = published_adversarial_tree(depth_nodes);
+        assert!(
+            depth
+                .visit_persistent_tree("outputs", 1, |_, _| true)
+                .is_err()
+        );
+
+        let children = (1..=16)
+            .map(|index| format!("node-{index}"))
+            .collect::<Vec<_>>();
+        let mut broad_nodes = vec![("node-0".to_owned(), node(&children))];
+        for parent in children {
+            let leaves = (1..=16)
+                .map(|index| format!("{parent}-child-{index}"))
+                .collect::<Vec<_>>();
+            broad_nodes.push((parent, node(&leaves)));
+            broad_nodes.extend(leaves.into_iter().map(|name| (name, node(&[]))));
+        }
+        let broad = published_adversarial_tree(broad_nodes);
+        assert!(
+            broad
+                .visit_persistent_tree("outputs", 1, |_, _| true)
+                .is_err()
+        );
     }
 }

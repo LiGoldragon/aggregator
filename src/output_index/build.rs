@@ -4,7 +4,7 @@
 //! never owns a session's children: downstream reducers join by `SourceKey` and scalar keys.
 
 use signal_aggregator::{
-    AuthoredStatus, ByteLimit, SourceIdentifier, SourceKind, TranscriptBlockKind,
+    AuthoredStatus, ByteLimit, ListingOrder, SourceIdentifier, SourceKind, TranscriptBlockKind,
     TranscriptBlockTextAvailability,
 };
 
@@ -18,7 +18,8 @@ use crate::{
 
 use super::{
     FragileSessionReference, FragileSubagentReference, IndexedOutput, IndexedOutputSegment,
-    IndexedTranscriptBlock, SourceFingerprint, SourceKindName, StableReference,
+    IndexedTranscriptBlock, ProjectionTreeOrdering, SourceFingerprint, SourceKindName,
+    StableReference,
     instrumentation::{IndexReservation, IndexResourceMeter, IndexWorkCategory},
     limits::IndexStoreLimits,
     migration_v2::{IndexFormat, MigrationSource, V2Migration},
@@ -1110,48 +1111,6 @@ impl FixedTreeCollection {
             _ => None,
         }
     }
-
-    fn ordering_material(self, projection: &ProjectionRecordDto) -> Option<String> {
-        let reference = self.reference(projection)?;
-        let timestamp = match projection {
-            ProjectionRecordDto::Session(value) => value.started_at.as_deref(),
-            ProjectionRecordDto::Subagent(value) => value.first_observed_at.as_deref(),
-            ProjectionRecordDto::Output(value) => value.produced_at.as_deref(),
-            ProjectionRecordDto::TranscriptBlock(value) => value.observed_at.as_deref(),
-            ProjectionRecordDto::Segment(_) => None,
-        };
-        let material = match projection {
-            ProjectionRecordDto::Segment(value) => format!("{:020}", value.segment_index),
-            ProjectionRecordDto::TranscriptBlock(value) => format!(
-                "{}\u{1f}{}\u{1f}{:020}\u{1f}{:020}",
-                Self::timestamp_material(timestamp),
-                value.source_identifier,
-                value.source_line_number,
-                value.block_index,
-            ),
-            _ => Self::timestamp_material(timestamp),
-        };
-        Some(format!("{material}\u{1f}{reference}"))
-    }
-
-    fn modified_ordering_material(self, projection: &ProjectionRecordDto) -> Option<String> {
-        let reference = self.reference(projection)?;
-        let timestamp = match projection {
-            ProjectionRecordDto::Session(value) => value.last_observed_at.as_deref(),
-            _ => return self.ordering_material(projection),
-        };
-        Some(format!(
-            "{}\u{1f}{reference}",
-            Self::timestamp_material(timestamp)
-        ))
-    }
-
-    fn timestamp_material(timestamp: Option<&str>) -> String {
-        match timestamp {
-            Some(timestamp) => format!("0\u{1f}{timestamp}"),
-            None => "1\u{1f}".to_owned(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1172,6 +1131,16 @@ impl TreeOrder {
             Self::NewestModified,
         ]
     }
+    fn listing_order(self) -> ListingOrder {
+        match self {
+            Self::Reference => ListingOrder::ReferenceAscending,
+            Self::Oldest => ListingOrder::OldestFirst,
+            Self::Newest => ListingOrder::NewestFirst,
+            Self::OldestModified => ListingOrder::OldestModifiedFirst,
+            Self::NewestModified => ListingOrder::NewestModifiedFirst,
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::Reference => "reference",
@@ -1254,13 +1223,13 @@ impl TreeRelationship {
 /// evaluated from the leaf projection later; relationship roots make the cardinality boundary
 /// explicit before those predicates run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TreeSpecification {
+pub(crate) struct TreeSpecification {
     collection: FixedTreeCollection,
     relationship: Option<TreeRelationship>,
     order: TreeOrder,
 }
 impl TreeSpecification {
-    fn all() -> Vec<Self> {
+    pub(crate) fn all() -> Vec<Self> {
         let collections = FixedTreeCollection::all()
             .into_iter()
             .flat_map(|collection| {
@@ -1282,7 +1251,7 @@ impl TreeSpecification {
         collections.chain(relationships).collect()
     }
 
-    fn name(self) -> String {
+    pub(crate) fn name(self) -> String {
         match self.relationship {
             Some(relationship) => {
                 format!("relationship:{}:{}", relationship.name(), self.order.name())
@@ -1295,14 +1264,11 @@ impl TreeSpecification {
 
     fn entry(self, projection: &ProjectionRecordDto, locator: String) -> Option<TreeLeafEntry> {
         let reference = self.collection.reference(projection)?.to_owned();
-        let ordering = match self.order {
-            TreeOrder::Reference => reference.clone(),
-            TreeOrder::Oldest | TreeOrder::Newest => {
-                self.collection.ordering_material(projection)?
-            }
-            TreeOrder::OldestModified | TreeOrder::NewestModified => {
-                self.collection.modified_ordering_material(projection)?
-            }
+        let ordering = if self.order == TreeOrder::Reference {
+            // Point-lookup roots retain the exact fragile reference as their B-tree key.
+            reference.clone()
+        } else {
+            ProjectionTreeOrdering::new(self.order.listing_order()).key(projection)?
         };
         let key = match self.relationship {
             Some(relationship) => {
@@ -2135,11 +2101,89 @@ mod persistent_tree_tests {
             })
             .expect("multi-level traversal");
         assert_eq!(
-            count, 32,
-            "the visitor stops at its bounded candidate budget"
+            count,
+            limits().maximum_query_candidates,
+            "the visitor caps requested candidates at the persistent query limit"
         );
-        assert_eq!(references.len(), 32);
+        assert_eq!(references.len(), limits().maximum_query_candidates as usize);
+        let larger_meter = published(257).3;
+        assert_eq!(
+            meter.snapshot().high_water_bytes,
+            larger_meter.snapshot().high_water_bytes,
+            "published-tree high water follows the fixed run/fan-in formula, not corpus size"
+        );
         assert!(meter.snapshot().high_water_bytes <= 2 * limits().maximum_logical_chunk_bytes);
+    }
+
+    fn relationship_output(session_reference: String, reference: &str) -> ProjectionRecordDto {
+        ProjectionRecordDto::Output(ProjectionOutputDto {
+            reference: reference.to_owned(),
+            session_reference,
+            subagent_reference: Some("subagent".to_owned()),
+            title: None,
+            task: None,
+            source: 1,
+            source_identifier: "source".to_owned(),
+            authored_status: 1,
+            produced_at: Some("2026-01-01T00:00:00Z".to_owned()),
+            path: DiskPath::new(Vec::new(), "/synthetic/output".to_owned()),
+            fingerprint_bytes: 1,
+            fingerprint_seconds: 0,
+            fingerprint_nanoseconds: 0,
+            source_line_number: 1,
+            text_hash: "hash".to_owned(),
+            size: ProjectionSizeDto {
+                byte_count: Some(1),
+                line_count: Some(1),
+                segment_count: Some(1),
+                certainty: 1,
+            },
+            preview_text: String::new(),
+            preview_original_bytes: 0,
+        })
+    }
+
+    #[test]
+    fn relationship_keys_group_parents_and_preserve_configured_source_isolation() {
+        let first_source = SourceKey::new(
+            SourceKind::Claude,
+            SourceIdentifier::new("claude:shared"),
+            0,
+        );
+        let second_source = SourceKey::new(
+            SourceKind::Claude,
+            SourceIdentifier::new("claude:shared"),
+            1,
+        );
+        let first_session = StableReference::new(
+            "session",
+            first_source.scoped_reference_material("producer-session", "same"),
+        )
+        .as_string();
+        let second_session = StableReference::new(
+            "session",
+            second_source.scoped_reference_material("producer-session", "same"),
+        )
+        .as_string();
+        assert_ne!(first_session, second_session);
+        let specification = TreeSpecification::all()
+            .into_iter()
+            .find(|specification| specification.name() == "relationship:session-output:oldest")
+            .expect("session output relationship specification");
+        let first = specification.entry(
+            &relationship_output(first_session.clone(), "output-a"),
+            "first".to_owned(),
+        );
+        let second = specification.entry(
+            &relationship_output(second_session.clone(), "output-b"),
+            "second".to_owned(),
+        );
+        let (Some(first), Some(second)) = (first, second) else {
+            panic!("relationship output entries");
+        };
+        assert!(first.key.starts_with(&first_session));
+        assert!(second.key.starts_with(&second_session));
+        assert_ne!(first.key, second.key);
     }
 
     #[test]
