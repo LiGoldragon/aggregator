@@ -3310,15 +3310,20 @@ fn health_and_subagent_output_recovery_use_configured_fixture_roots() {
         .expect("sessions");
     assert_eq!(
         sessions.sessions.len(),
-        1,
-        "parent task and .output should merge"
+        2,
+        "equal producer identifiers from configured sources must remain source-scoped"
     );
+    let subagent_session = sessions
+        .sessions
+        .iter()
+        .find(|session| session.source == SourceKind::ClaudeSubagentOutput)
+        .expect("subagent-output source retains its own session card");
 
     let subagents = nexus
         .list_subagents(SubagentListRequest {
             request_identifier: RequestIdentifier::new("subagents-fixture"),
             filter: SubagentListFilter {
-                session_reference: sessions.sessions[0].reference.clone(),
+                session_reference: subagent_session.reference.clone(),
                 authored_status: AuthoredStatusFilter::AnyAuthoredStatus,
                 task_identifier: None,
             },

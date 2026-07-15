@@ -222,6 +222,31 @@ fn stale_concurrent_builder_cannot_replace_newer_pointer() {
 }
 
 #[test]
+fn persisted_checkpoint_survives_unpublished_staging_and_replaces_atomically() {
+    let directory = TempDir::new().expect("temporary directory");
+    let store = test_store(&directory);
+    let checkpoint = IndexLocator::new("checkpoint-0");
+    store
+        .replace_persisted_checkpoint(&checkpoint, &test_chunk())
+        .expect("write first checkpoint");
+    assert_eq!(
+        store
+            .read_persisted_checkpoint(&checkpoint)
+            .expect("read checkpoint"),
+        Some(test_chunk())
+    );
+    store
+        .remove_persisted_checkpoint(&checkpoint)
+        .expect("remove complete checkpoint");
+    assert_eq!(
+        store
+            .read_persisted_checkpoint(&checkpoint)
+            .expect("checkpoint absence"),
+        None
+    );
+}
+
+#[test]
 fn stale_pointer_temporary_does_not_block_unique_publication() {
     let directory = TempDir::new().expect("temporary directory");
     let store = test_store(&directory);

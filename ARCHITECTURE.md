@@ -83,8 +83,8 @@ The ordinary contract exposes metadata-first output operations:
 - `ReadOutput` reads only an explicit range bounded by the configured read cap.
 
 UIs and agents should consume cards first, then request bounded reads only for
-selected references. V3 page cursors are size-capped keyset continuations bound
-to the snapshot identity, collection, filters, order, and page limit. They hold
+selected references. V3 page cursors are size-capped continuations bound to
+the snapshot identity, collection, filters, order, and page limit. They hold
 the last emitted candidate and a sort-tuple digest, never an offset or a
 corpus-sized reference signature. Changing evidence, configuration, coverage,
 or listing shape makes a cursor stale; a legacy v2 cursor is rejected as stale.
@@ -97,7 +97,10 @@ response kind; current Codex caveats are represented as data by falling back to
 current developer-role messages.
 
 Fragile references are daemon-local opaque identifiers into backing runtime
-evidence. The durable sidecar index stores references, metadata, fingerprints,
+evidence. References rooted in producer sessions include configured source kind,
+source identifier, and configured occurrence, so equal producer identifiers
+cannot cross source/privacy boundaries. The durable sidecar index stores
+references, metadata, fingerprints,
 segment spans, and bounded card material needed for navigation. It is not
 canonical content storage and must not become a report archive. The established
 `.output-index.json` path is a small v3 compatibility pointer; immutable typed
@@ -108,8 +111,8 @@ for kind, checksum, and size before decoding.
 
 The live output interface refreshes through the v3 typed generation writer and
 reopens only published rkyv projection chunks. A refresh scans each configured
-source once; an incomplete scan never replaces the last complete published
-truth, so no partial first generation is exposed. Published pointers and chunks
+source once; incomplete scans retain the last complete publication. Published
+pointers and chunks
 are typed binary records; JSON remains confined to the bounded v2 migration
 adapter. Backing evidence remains the read source, so references can become
 stale, missing, or broken when those files change; operations reject those

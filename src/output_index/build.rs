@@ -72,6 +72,15 @@ impl SourceKey {
         *hasher.finalize().as_bytes()
     }
 
+    /// Stable identity material for every reference rooted in this configured source.
+    /// Producer identifiers are only unique within their configured source occurrence.
+    pub fn scoped_reference_material(&self, kind: &str, producer_identifier: &str) -> String {
+        format!(
+            "{kind}|{}|{}|{}|{producer_identifier}",
+            self.source_kind, self.source_identifier, self.configured_occurrence
+        )
+    }
+
     fn fields(&self) -> [IndexFieldDto; 3] {
         [
             IndexFieldDto {
@@ -153,11 +162,21 @@ impl BoundedIndexRefresher {
                 self.limits,
                 self.meter.clone(),
             );
-            let request =
-                TranscriptScanRequest::new(occurrence as u64, self.configuration_signature(source));
+            let configuration_signature = self.configuration_signature(source);
+            let request = TranscriptScanRequest::new(occurrence as u64, configuration_signature)
+                .with_resume_cursor(self.resume_cursor(
+                    source,
+                    occurrence as u64,
+                    configuration_signature,
+                )?);
             let resumable = self.scan_source(source, &request, &mut builder);
             let run = builder.finish()?;
-            self.write_checkpoint(&staging, occurrence as u64, &resumable.cursor, &run)?;
+            let checkpoint = IndexLocator::new(format!("checkpoint-{occurrence}"));
+            if resumable.outcome.is_complete() {
+                self.store.remove_persisted_checkpoint(&checkpoint)?;
+            } else {
+                self.write_checkpoint(&staging, occurrence as u64, &resumable.cursor, &run)?;
+            }
             scan_outcomes.push(resumable.outcome);
             source_runs.push(run);
         }
@@ -262,6 +281,49 @@ impl BoundedIndexRefresher {
         *hasher.finalize().as_bytes()
     }
 
+    fn resume_cursor(
+        &self,
+        source: &TranscriptAdapterConfiguration,
+        occurrence: u64,
+        configuration_signature: [u8; 32],
+    ) -> Result<Option<crate::adapter::TranscriptScanCursor>> {
+        let locator = IndexLocator::new(format!("checkpoint-{occurrence}"));
+        let Some(chunk) = self.store.read_persisted_checkpoint(&locator)? else {
+            return Ok(None);
+        };
+        let Some(record) = chunk.records.first() else {
+            return Ok(None);
+        };
+        let field = |name: &str| {
+            record
+                .fields
+                .iter()
+                .find(|field| field.name == name)
+                .map(|field| field.bytes.as_slice())
+        };
+        let next = field("cursor-next")
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u64::from_le_bytes);
+        let prefix = field("cursor-prefix").and_then(|bytes| bytes.try_into().ok());
+        let checkpoint_signature: Option<[u8; 32]> =
+            field("configuration-signature").and_then(|bytes| bytes.try_into().ok());
+        match (next, prefix, checkpoint_signature) {
+            (Some(next_discovery_ordinal), Some(completed_prefix_digest), Some(signature))
+                if signature == configuration_signature =>
+            {
+                Ok(Some(crate::adapter::TranscriptScanCursor::new(
+                    source.kind(),
+                    self.source_identifier(source),
+                    occurrence,
+                    configuration_signature,
+                    next_discovery_ordinal,
+                    completed_prefix_digest,
+                )))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn write_checkpoint(
         &self,
         staging: &IndexStaging,
@@ -281,6 +343,10 @@ impl BoundedIndexRefresher {
                         bytes: occurrence.to_le_bytes().to_vec(),
                     },
                     IndexFieldDto {
+                        name: "configuration-signature".to_owned(),
+                        bytes: cursor.configuration_signature.to_vec(),
+                    },
+                    IndexFieldDto {
                         name: "cursor-next".to_owned(),
                         bytes: cursor.next_discovery_ordinal.to_le_bytes().to_vec(),
                     },
@@ -295,10 +361,9 @@ impl BoundedIndexRefresher {
                 ],
             }],
         };
-        staging.replace_checkpoint(
-            &IndexLocator::new(format!("checkpoint-{occurrence}")),
-            &chunk,
-        )
+        let locator = IndexLocator::new(format!("checkpoint-{occurrence}"));
+        staging.replace_checkpoint(&locator, &chunk)?;
+        self.store.replace_persisted_checkpoint(&locator, &chunk)
     }
 }
 
@@ -421,7 +486,10 @@ impl BoundedGenerationBuilder {
                     fingerprint.material(),
                 )
             },
-            |identifier| format!("producer-session|{}", identifier.as_str()),
+            |identifier| {
+                self.source_key
+                    .scoped_reference_material("producer-session", identifier.as_str())
+            },
         );
         let session_reference = FragileSessionReference::new(
             StableReference::new("session", session_material).as_string(),

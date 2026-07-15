@@ -38,6 +38,16 @@ fn source_occurrence_prevents_cross_root_or_duplicate_configuration_merges() {
     assert_ne!(first, second);
     assert_ne!(first.signature(), second.signature());
     assert_ne!(first, other_root);
+    assert_ne!(
+        first.scoped_reference_material("producer-session", "shared-session"),
+        second.scoped_reference_material("producer-session", "shared-session"),
+        "an equal producer session identifier must not merge two configured sources"
+    );
+    assert_ne!(
+        first.scoped_reference_material("producer-session", "shared-session"),
+        other_root.scoped_reference_material("producer-session", "shared-session"),
+        "source-root identity is part of descendant reference material"
+    );
 }
 
 #[test]
