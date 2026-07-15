@@ -1,3 +1,8 @@
+pub mod instrumentation;
+pub mod limits;
+pub mod schema;
+pub mod store;
+
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},

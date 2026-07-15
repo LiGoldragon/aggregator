@@ -36,9 +36,10 @@ pub use derived_paths::{
     HomeDirectory, PiTintinwebCwdComponent, PiTintinwebSubagentOutputRoot, TemporaryDirectory,
     UserIdentifier, WorkspacePath,
 };
-pub use error::{Error, Result};
+pub use error::{Error, IndexStoreError, Result};
 pub use local_default_configuration::LocalDefaultConfigurationRequest;
 pub use nexus::NexusPlane;
+pub use output_index::store::IndexStore;
 pub use output_index::{FragileIndexStore, OutputInterfaceRuntime};
 pub use sema::SemaPlane;
 pub use signal::SignalPlane;

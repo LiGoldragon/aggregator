@@ -3,6 +3,50 @@ use crate::adapter::AdapterKind;
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, thiserror::Error)]
+pub enum IndexStoreError {
+    #[error("unsupported index-store version {version}")]
+    UnsupportedVersion { version: u32 },
+    #[error("oversized index-store {kind}: {bytes} bytes exceeds {limit}")]
+    OversizedEnvelope {
+        kind: &'static str,
+        bytes: u64,
+        limit: u64,
+    },
+    #[error("oversized index-store record")]
+    OversizedRecord,
+    #[error("oversized index-store string")]
+    OversizedString,
+    #[error("invalid index-store checksum")]
+    InvalidChecksum,
+    #[error("corrupt index-store archive")]
+    CorruptArchive,
+    #[error("fragile-reference collision")]
+    ReferenceCollision,
+    #[error("unsafe index-store path")]
+    UnsafePath,
+    #[error("index-store publication was interrupted")]
+    InterruptedPublication,
+    #[error("index-store writer conflict")]
+    WriterConflict,
+    #[error("index-store migration failed: {detail}")]
+    MigrationFailure { detail: String },
+    #[error("index-store serialization failed: {detail}")]
+    Serialization { detail: String },
+    #[error("index-store I/O {context} failed: {source}")]
+    Io {
+        context: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+impl IndexStoreError {
+    pub fn io(context: &'static str, source: std::io::Error) -> Self {
+        Self::Io { context, source }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("{binary} transport is not implemented in the scaffold")]
     TransportNotImplemented { binary: &'static str },
@@ -53,6 +97,12 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+
+    #[error("index store failed: {source}")]
+    IndexStore {
+        #[source]
+        source: IndexStoreError,
+    },
 }
 
 impl Error {
@@ -88,5 +138,9 @@ impl Error {
 
     pub fn io(context: &'static str, source: std::io::Error) -> Self {
         Self::Io { context, source }
+    }
+
+    pub fn index_store(source: IndexStoreError) -> Self {
+        Self::IndexStore { source }
     }
 }

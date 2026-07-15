@@ -537,22 +537,25 @@ impl<'a> RuntimeConfigurationValidator<'a> {
         let index_path =
             RuntimeStorePath::new(PathBuf::from(self.configuration.store_path.as_str()))
                 .fragile_index_path();
-        for repository in repositories {
-            if RuntimePathBoundary::new(repository.path().to_path_buf()).contains(&index_path) {
-                self.issues
-                    .push(ConfigurationIssue::invalid_fragile_index_configuration(
-                        self.configuration.store_path.clone(),
-                        "fragile index storage must not live under an active repository",
-                    ));
+        let typed_data_path = PathBuf::from(format!("{}.d", index_path.display()));
+        for candidate in [&index_path, &typed_data_path] {
+            for repository in repositories {
+                if RuntimePathBoundary::new(repository.path().to_path_buf()).contains(candidate) {
+                    self.issues
+                        .push(ConfigurationIssue::invalid_fragile_index_configuration(
+                            self.configuration.store_path.clone(),
+                            "fragile index storage must not live under an active repository",
+                        ));
+                }
             }
-        }
-        for root in legacy_recovery_roots {
-            if RuntimePathBoundary::new(root.path().to_path_buf()).contains(&index_path) {
-                self.issues
-                    .push(ConfigurationIssue::invalid_fragile_index_configuration(
-                        self.configuration.store_path.clone(),
-                        "fragile index storage must not live under a legacy recovery root",
-                    ));
+            for root in legacy_recovery_roots {
+                if RuntimePathBoundary::new(root.path().to_path_buf()).contains(candidate) {
+                    self.issues
+                        .push(ConfigurationIssue::invalid_fragile_index_configuration(
+                            self.configuration.store_path.clone(),
+                            "fragile index storage must not live under a legacy recovery root",
+                        ));
+                }
             }
         }
     }

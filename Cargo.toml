@@ -29,6 +29,8 @@ name = "aggregator-write-configuration"
 path = "src/bin/aggregator-write-configuration.rs"
 
 [dependencies]
+blake3 = "1"
+fs2 = "0.4"
 meta-signal-aggregator = { git = "https://github.com/LiGoldragon/meta-signal-aggregator", branch = "main", features = ["nota-text"] }
 nota                   = { package = "nota", git = "https://github.com/LiGoldragon/nota-next.git", branch = "main" }
 nota-text-query        = { git = "https://github.com/LiGoldragon/nota-text-query.git", branch = "main", default-features = false }
