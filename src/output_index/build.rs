@@ -3,6 +3,8 @@
 //! This module intentionally writes normalized observations before reducing them. A source run
 //! never owns a session's children: downstream reducers join by `SourceKey` and scalar keys.
 
+use std::fs;
+
 use signal_aggregator::{
     AuthoredStatus, ByteLimit, SourceIdentifier, SourceKind, TranscriptBlockKind,
     TranscriptBlockTextAvailability,
@@ -194,7 +196,8 @@ impl BoundedIndexRefresher {
                 resource_high_water_bytes: self.meter.snapshot().high_water_bytes,
             });
         }
-        let manifest = IndexManifestRecord::new(&source_runs).chunk();
+        let tree_roots = FixedFanoutTreePublisher::new(staging.clone(), self.limits).publish()?;
+        let manifest = IndexManifestRecord::new(&source_runs, &tree_roots).chunk();
         let manifest_locator = IndexLocator::new("manifest");
         staging.write_chunk(&manifest_locator, IndexFileKind::Manifest, &manifest)?;
         let pointer = self
@@ -978,14 +981,411 @@ impl SnapshotIdentity {
     }
 }
 
+/// An immutable collection root written only after a bounded external sort. The root is a
+/// scalar manifest fact; every branch and leaf has the same fixed fanout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FixedTreeRoot {
+    collection: FixedTreeCollection,
+    locator: Option<String>,
+    item_count: u64,
+}
+
+impl FixedTreeRoot {
+    fn manifest_record(&self) -> IndexRecordDto {
+        IndexRecordDto {
+            schema_version: 1,
+            record_kind: 61,
+            fields: vec![
+                IndexFieldDto {
+                    name: "tree-collection".to_owned(),
+                    bytes: self.collection.name().as_bytes().to_vec(),
+                },
+                IndexFieldDto {
+                    name: "tree-root".to_owned(),
+                    bytes: self.locator.clone().unwrap_or_default().into_bytes(),
+                },
+                IndexFieldDto {
+                    name: "tree-count".to_owned(),
+                    bytes: self.item_count.to_le_bytes().to_vec(),
+                },
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixedTreeCollection {
+    Sessions,
+    Subagents,
+    Outputs,
+    Segments,
+    TranscriptBlocks,
+}
+
+impl FixedTreeCollection {
+    fn all() -> [Self; 5] {
+        [
+            Self::Sessions,
+            Self::Subagents,
+            Self::Outputs,
+            Self::Segments,
+            Self::TranscriptBlocks,
+        ]
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Sessions => "sessions",
+            Self::Subagents => "subagents",
+            Self::Outputs => "outputs",
+            Self::Segments => "segments",
+            Self::TranscriptBlocks => "transcript-blocks",
+        }
+    }
+
+    fn projection_reference(self, projection: &ProjectionRecordDto) -> Option<&str> {
+        match (self, projection) {
+            (Self::Sessions, ProjectionRecordDto::Session(value)) => Some(&value.reference),
+            (Self::Subagents, ProjectionRecordDto::Subagent(value)) => Some(&value.reference),
+            (Self::Outputs, ProjectionRecordDto::Output(value)) => Some(&value.reference),
+            (Self::Segments, ProjectionRecordDto::Segment(value)) => Some(&value.reference),
+            (Self::TranscriptBlocks, ProjectionRecordDto::TranscriptBlock(value)) => {
+                Some(&value.reference)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// External-sort publication. Directory order is explicitly treated as hostile input: only
+/// bounded sorted run chunks participate in the deterministic fixed-fanout tree.
+#[derive(Debug, Clone)]
+struct FixedFanoutTreePublisher {
+    staging: IndexStaging,
+    limits: IndexStoreLimits,
+}
+
+impl FixedFanoutTreePublisher {
+    const FANOUT: usize = 16;
+
+    fn new(staging: IndexStaging, limits: IndexStoreLimits) -> Self {
+        Self { staging, limits }
+    }
+
+    fn publish(&self) -> Result<Vec<FixedTreeRoot>> {
+        FixedTreeCollection::all()
+            .into_iter()
+            .map(|collection| self.publish_collection(collection))
+            .collect()
+    }
+
+    fn publish_collection(&self, collection: FixedTreeCollection) -> Result<FixedTreeRoot> {
+        let run_count = self.write_sorted_runs(collection)?;
+        if run_count == 0 {
+            return Ok(FixedTreeRoot {
+                collection,
+                locator: None,
+                item_count: 0,
+            });
+        }
+        if run_count > Self::FANOUT as u64 {
+            return Err(Error::index_store(
+                crate::error::IndexStoreError::OversizedRecord,
+            ));
+        }
+        let (leaf_count, item_count) = self.write_leaves(collection, run_count)?;
+        let locator = self.write_branches(collection, leaf_count)?;
+        Ok(FixedTreeRoot {
+            collection,
+            locator: Some(locator),
+            item_count,
+        })
+    }
+
+    fn write_sorted_runs(&self, collection: FixedTreeCollection) -> Result<u64> {
+        let mut entries = Vec::new();
+        let mut run = 0_u64;
+        let directory = fs::read_dir(self.staging.path()).map_err(|error| {
+            Error::index_store(crate::error::IndexStoreError::io(
+                "reading projection staging",
+                error,
+            ))
+        })?;
+        for directory_entry in directory {
+            let directory_entry = directory_entry.map_err(|error| {
+                Error::index_store(crate::error::IndexStoreError::io(
+                    "reading projection staging entry",
+                    error,
+                ))
+            })?;
+            let name = directory_entry.file_name().to_string_lossy().into_owned();
+            if !name.contains("-projection-") {
+                continue;
+            }
+            let chunk = self
+                .staging
+                .read_chunk(&IndexLocator::new(name.clone()), IndexFileKind::Projection)?;
+            let Some(projection) = chunk.projection else {
+                continue;
+            };
+            let Some(reference) = collection.projection_reference(&projection) else {
+                continue;
+            };
+            entries.push(TreeLeafEntry {
+                key: reference.to_owned(),
+                locator: name,
+            });
+            if entries.len() as u64 == self.limits.maximum_records_per_chunk {
+                self.write_run(collection, run, &mut entries)?;
+                run += 1;
+            }
+        }
+        if !entries.is_empty() {
+            self.write_run(collection, run, &mut entries)?;
+            run += 1;
+        }
+        Ok(run)
+    }
+
+    fn write_run(
+        &self,
+        collection: FixedTreeCollection,
+        ordinal: u64,
+        entries: &mut Vec<TreeLeafEntry>,
+    ) -> Result<()> {
+        entries.sort_by(|left, right| {
+            left.key
+                .cmp(&right.key)
+                .then(left.locator.cmp(&right.locator))
+        });
+        let locator = IndexLocator::new(format!("tree-run-{}-{ordinal:016x}", collection.name()));
+        self.staging.write_chunk(
+            &locator,
+            IndexFileKind::OrderIndex,
+            &TreeChunk::entries(std::mem::take(entries)).chunk(),
+        )
+    }
+
+    fn write_leaves(&self, collection: FixedTreeCollection, run_count: u64) -> Result<(u64, u64)> {
+        let mut runs = Vec::new();
+        for ordinal in 0..run_count {
+            let locator =
+                IndexLocator::new(format!("tree-run-{}-{ordinal:016x}", collection.name()));
+            runs.push(
+                TreeChunk::from_chunk(
+                    self.staging
+                        .read_chunk(&locator, IndexFileKind::OrderIndex)?,
+                )?
+                .entries,
+            );
+        }
+        let mut positions = vec![0_usize; runs.len()];
+        let mut leaf_entries = Vec::new();
+        let mut leaf_count = 0_u64;
+        let mut item_count = 0_u64;
+        let mut previous = None::<String>;
+        while let Some(index) = TreeMergeHead::new(&runs, &positions).smallest() {
+            let entry = runs[index][positions[index]].clone();
+            positions[index] += 1;
+            if previous.as_deref() == Some(entry.key.as_str()) {
+                continue;
+            }
+            previous = Some(entry.key.clone());
+            item_count += 1;
+            leaf_entries.push(entry);
+            if leaf_entries.len() == Self::FANOUT {
+                self.write_leaf(collection, leaf_count, &mut leaf_entries)?;
+                leaf_count += 1;
+            }
+        }
+        if !leaf_entries.is_empty() {
+            self.write_leaf(collection, leaf_count, &mut leaf_entries)?;
+            leaf_count += 1;
+        }
+        Ok((leaf_count, item_count))
+    }
+
+    fn write_leaf(
+        &self,
+        collection: FixedTreeCollection,
+        ordinal: u64,
+        entries: &mut Vec<TreeLeafEntry>,
+    ) -> Result<()> {
+        let locator = IndexLocator::new(format!("tree-leaf-{}-{ordinal:016x}", collection.name()));
+        self.staging.write_chunk(
+            &locator,
+            IndexFileKind::IndexNode,
+            &TreeChunk::entries(std::mem::take(entries)).chunk(),
+        )
+    }
+
+    fn write_branches(&self, collection: FixedTreeCollection, mut children: u64) -> Result<String> {
+        let mut level = 0_u64;
+        let mut prefix = "tree-leaf".to_owned();
+        while children > 1 {
+            let parent_count = children.div_ceil(Self::FANOUT as u64);
+            for parent in 0..parent_count {
+                let start = parent * Self::FANOUT as u64;
+                let end = (start + Self::FANOUT as u64).min(children);
+                let mut entries = Vec::new();
+                for child in start..end {
+                    let child_name = format!("{prefix}-{}-{child:016x}", collection.name());
+                    let child_chunk = self.staging.read_chunk(
+                        &IndexLocator::new(child_name.clone()),
+                        IndexFileKind::IndexNode,
+                    )?;
+                    let key = TreeChunk::from_chunk(child_chunk)?.first_key()?;
+                    entries.push(TreeLeafEntry {
+                        key,
+                        locator: child_name,
+                    });
+                }
+                let locator = IndexLocator::new(format!(
+                    "tree-branch-{level}-{}-{parent:016x}",
+                    collection.name()
+                ));
+                self.staging.write_chunk(
+                    &locator,
+                    IndexFileKind::IndexNode,
+                    &TreeChunk::children(entries).chunk(),
+                )?;
+            }
+            children = parent_count;
+            prefix = format!("tree-branch-{level}");
+            level += 1;
+        }
+        Ok(format!("{prefix}-{}-{:016x}", collection.name(), 0))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TreeLeafEntry {
+    key: String,
+    locator: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TreeChunk {
+    entries: Vec<TreeLeafEntry>,
+    children: bool,
+}
+
+impl TreeChunk {
+    fn entries(entries: Vec<TreeLeafEntry>) -> Self {
+        Self {
+            entries,
+            children: false,
+        }
+    }
+    fn children(entries: Vec<TreeLeafEntry>) -> Self {
+        Self {
+            entries,
+            children: true,
+        }
+    }
+    fn chunk(self) -> IndexChunk {
+        IndexChunk {
+            schema_version: 1,
+            projection: None,
+            records: self
+                .entries
+                .into_iter()
+                .map(|entry| IndexRecordDto {
+                    schema_version: 1,
+                    record_kind: if self.children { 63 } else { 62 },
+                    fields: vec![
+                        IndexFieldDto {
+                            name: "tree-key".to_owned(),
+                            bytes: entry.key.into_bytes(),
+                        },
+                        IndexFieldDto {
+                            name: if self.children {
+                                "tree-child".to_owned()
+                            } else {
+                                "tree-projection".to_owned()
+                            },
+                            bytes: entry.locator.into_bytes(),
+                        },
+                    ],
+                })
+                .collect(),
+        }
+    }
+    fn from_chunk(chunk: IndexChunk) -> Result<Self> {
+        let children = chunk
+            .records
+            .first()
+            .is_some_and(|record| record.record_kind == 63);
+        let mut entries = Vec::with_capacity(chunk.records.len());
+        for record in chunk.records {
+            let key = record
+                .fields
+                .iter()
+                .find(|field| field.name == "tree-key")
+                .ok_or_else(|| Error::protocol("typed tree", "missing key"))?;
+            let locator = record
+                .fields
+                .iter()
+                .find(|field| {
+                    field.name
+                        == if children {
+                            "tree-child"
+                        } else {
+                            "tree-projection"
+                        }
+                })
+                .ok_or_else(|| Error::protocol("typed tree", "missing locator"))?;
+            entries.push(TreeLeafEntry {
+                key: String::from_utf8(key.bytes.clone())
+                    .map_err(|_| Error::protocol("typed tree", "invalid key"))?,
+                locator: String::from_utf8(locator.bytes.clone())
+                    .map_err(|_| Error::protocol("typed tree", "invalid locator"))?,
+            });
+        }
+        Ok(Self { entries, children })
+    }
+    fn first_key(&self) -> Result<String> {
+        self.entries
+            .first()
+            .map(|entry| entry.key.clone())
+            .ok_or_else(|| Error::protocol("typed tree", "empty node"))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TreeMergeHead<'a> {
+    runs: &'a [Vec<TreeLeafEntry>],
+    positions: &'a [usize],
+}
+impl<'a> TreeMergeHead<'a> {
+    fn new(runs: &'a [Vec<TreeLeafEntry>], positions: &'a [usize]) -> Self {
+        Self { runs, positions }
+    }
+    fn smallest(self) -> Option<usize> {
+        self.runs
+            .iter()
+            .enumerate()
+            .filter(|(index, run)| self.positions[*index] < run.len())
+            .min_by(|(left, left_run), (right, right_run)| {
+                let left_entry = &left_run[self.positions[*left]];
+                let right_entry = &right_run[self.positions[*right]];
+                left_entry
+                    .key
+                    .cmp(&right_entry.key)
+                    .then(left_entry.locator.cmp(&right_entry.locator))
+            })
+            .map(|(index, _)| index)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IndexManifestRecord {
     records: Vec<IndexRecordDto>,
 }
 
 impl IndexManifestRecord {
-    fn new(runs: &[SourceGenerationRun]) -> Self {
-        let records = runs
+    fn new(runs: &[SourceGenerationRun], roots: &[FixedTreeRoot]) -> Self {
+        let mut records = runs
             .iter()
             .map(|run| IndexRecordDto {
                 schema_version: 1,
@@ -1009,7 +1409,8 @@ impl IndexManifestRecord {
                     },
                 ],
             })
-            .collect();
+            .collect::<Vec<_>>();
+        records.extend(roots.iter().map(FixedTreeRoot::manifest_record));
         Self { records }
     }
 

@@ -32,7 +32,7 @@ use aggregator::{
     configuration::LegacyAggregatorConfiguration,
     daemon::{PrototypeDaemon, PrototypeSocket},
     output_index::{
-        IndexSnapshot, SourceHealthObserver, limits::IndexStoreLimits, store::IndexStore,
+        PersistentIndex, SourceHealthObserver, limits::IndexStoreLimits, store::IndexStore,
     },
 };
 use meta_signal_aggregator::{
@@ -3470,7 +3470,7 @@ fn live_index_reconciles_current_evidence_idempotently_and_removes_stale_records
     .expect("published v3 pointer");
     assert_eq!(replacement_pointer.format_version, 3);
     assert_eq!(
-        IndexSnapshot::from_typed_store(&index_store)
+        PersistentIndex::from_typed_store(&index_store)
             .expect("read typed replacement")
             .output_records()
             .count(),
@@ -3484,7 +3484,7 @@ fn live_index_reconciles_current_evidence_idempotently_and_removes_stale_records
     assert!(removed.blocks.is_empty());
     let removed_bytes = fs::read(index_store.pointer_path()).expect("deletion pointer bytes");
     assert!(
-        IndexSnapshot::from_typed_store(&index_store)
+        PersistentIndex::from_typed_store(&index_store)
             .expect("read typed deletion")
             .output_records()
             .next()

@@ -146,69 +146,6 @@ impl IndexStore {
         Ok(ChunkReader::new(path, kind, self.limits))
     }
 
-    /// Visits projection leaves in the published generation in deterministic locator order.
-    /// The visitor owns only the current validated chunk; it never receives a corpus-sized
-    /// locator collection.
-    pub fn visit_projection_chunks<F>(
-        &self,
-        pointer: &CurrentPointer,
-        visitor: &mut F,
-    ) -> Result<()>
-    where
-        F: FnMut(IndexChunk) -> Result<()>,
-    {
-        let manifest = IndexLocator::new(pointer.manifest_locator.clone());
-        manifest.validate()?;
-        let manifest_path = self.chunk_path(&manifest)?;
-        self.verify_regular_file(&manifest_path)?;
-        let generation = manifest_path
-            .parent()
-            .ok_or_else(|| Error::index_store(IndexStoreError::UnsafePath))?;
-        self.verify_directory(generation)?;
-        let relative_generation = generation
-            .strip_prefix(&self.data_root)
-            .map_err(|_| Error::index_store(IndexStoreError::UnsafePath))?;
-        // Directory traversal intentionally owns only one entry at a time. Projection leaves
-        // are immutable and self-identifying, so decoder correctness cannot depend on a
-        // corpus-sized directory-entry collection or filesystem ordering.
-        let entries = fs::read_dir(generation).map_err(|error| {
-            Error::index_store(IndexStoreError::io("reading published generation", error))
-        })?;
-        for entry in entries {
-            let entry = entry.map_err(|error| {
-                Error::index_store(IndexStoreError::io(
-                    "reading published generation entry",
-                    error,
-                ))
-            })?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let kind = entry.file_type().map_err(|error| {
-                Error::index_store(IndexStoreError::io(
-                    "reading published generation entry type",
-                    error,
-                ))
-            })?;
-            if kind.is_symlink() || !kind.is_file() {
-                return Err(Error::index_store(IndexStoreError::UnsafePath));
-            }
-            if !name.contains("-projection-") {
-                continue;
-            }
-            let locator = IndexLocator::new(
-                relative_generation
-                    .join(entry.file_name())
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-            locator.validate()?;
-            visitor(
-                self.open_reader(&locator, IndexFileKind::Projection)?
-                    .read()?,
-            )?;
-        }
-        Ok(())
-    }
-
     /// Reads the typed compatibility pointer without decoding any referenced manifest.
     pub fn read_current_pointer(&self) -> Result<Option<CurrentPointer>> {
         let Some(bytes) = self.read_pointer_bytes()? else {
@@ -235,6 +172,13 @@ impl IndexStore {
         }
         IndexLocator::new(pointer.manifest_locator.clone()).validate()?;
         Ok(Some(pointer))
+    }
+
+    /// Opens the manifest selected by a validated current pointer. Runtime readers navigate only
+    /// the manifest roots; generation directories are never a query surface.
+    pub fn read_manifest_chunk(&self, pointer: &CurrentPointer) -> Result<IndexChunk> {
+        let locator = IndexLocator::new(pointer.manifest_locator.clone());
+        self.open_reader(&locator, IndexFileKind::Manifest)?.read()
     }
 
     /// Publishes a fully synced staging generation if its captured base pointer is still current.
@@ -732,6 +676,15 @@ impl IndexStaging {
 
     pub fn generation(&self) -> &IndexLocator {
         &self.generation
+    }
+
+    /// Reopens one immutable staging chunk while an external sorter constructs its fixed-fanout
+    /// publication tree. Callers retain only the decoded chunk they are presently merging.
+    pub fn read_chunk(&self, locator: &IndexLocator, kind: IndexFileKind) -> Result<IndexChunk> {
+        locator.validate_component()?;
+        let path = self.path.join(locator.as_str());
+        self.verify_regular_file(&path)?;
+        ChunkReader::new(path, kind, self.store.limits).read()
     }
 
     pub fn write_chunk(

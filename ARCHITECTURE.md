@@ -110,7 +110,7 @@ has fixed logical, serialized, record, and query-work limits and is validated
 for kind, checksum, and size before decoding.
 
 The live output interface refreshes through the v3 typed generation writer and
-reopens only published rkyv projection chunks. A refresh scans each configured
+navigates only published fixed-fanout reference roots and decodes selected rkyv projection leaves. A refresh scans each configured
 source once; incomplete scans retain the last complete publication. Published
 pointers and chunks
 are typed binary records; JSON remains confined to the bounded v2 migration
