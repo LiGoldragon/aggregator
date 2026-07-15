@@ -951,14 +951,49 @@ pub struct PersistentProjectionPage {
     reservations: Vec<instrumentation::IndexReservation>,
 }
 impl PersistentProjectionPage {
+    fn empty() -> Self {
+        Self {
+            projections: Vec::new(),
+            reservations: Vec::new(),
+        }
+    }
+
     pub fn projections(&self) -> &[ProjectionRecordDto] {
         &self.projections
     }
     pub fn reservation_count(&self) -> usize {
         self.reservations.len()
     }
-    pub fn into_projections(self) -> Vec<ProjectionRecordDto> {
-        self.projections
+    fn into_parts(
+        self,
+    ) -> (
+        Vec<ProjectionRecordDto>,
+        Vec<instrumentation::IndexReservation>,
+    ) {
+        (self.projections, self.reservations)
+    }
+}
+
+/// An iterator that keeps transferred projection allocations metered while callers convert
+/// records into cards, replies, or serialized output.
+#[derive(Debug)]
+pub struct MeteredRecordIterator<T> {
+    records: std::vec::IntoIter<T>,
+    _reservations: Vec<instrumentation::IndexReservation>,
+}
+impl<T> MeteredRecordIterator<T> {
+    fn new(records: Vec<T>, reservations: Vec<instrumentation::IndexReservation>) -> Self {
+        Self {
+            records: records.into_iter(),
+            _reservations: reservations,
+        }
+    }
+}
+impl<T> Iterator for MeteredRecordIterator<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.records.next()
     }
 }
 
@@ -972,8 +1007,33 @@ impl PersistentProjection {
     pub fn projection(&self) -> &ProjectionRecordDto {
         &self.projection
     }
-    fn into_projection(self) -> ProjectionRecordDto {
-        self.projection
+    fn into_value<T>(
+        self,
+        convert: impl FnOnce(ProjectionRecordDto) -> Option<T>,
+    ) -> Option<MeteredProjectionValue<T>> {
+        convert(self.projection).map(|value| MeteredProjectionValue {
+            value,
+            _reservation: self._reservation,
+        })
+    }
+}
+
+/// Owns a converted production result and its matching projection reservation.
+#[derive(Debug)]
+pub struct MeteredProjectionValue<T> {
+    value: T,
+    _reservation: instrumentation::IndexReservation,
+}
+impl<T> MeteredProjectionValue<T> {
+    fn into_inner(self) -> T {
+        self.value
+    }
+}
+impl<T> std::ops::Deref for MeteredProjectionValue<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
     }
 }
 
@@ -1015,8 +1075,11 @@ impl PersistentIndex {
         })
     }
 
-    pub fn session_records(&self) -> std::vec::IntoIter<IndexedSession> {
-        self.projections(PersistentCollection::Sessions)
+    pub fn session_records(&self) -> MeteredRecordIterator<IndexedSession> {
+        let (projections, reservations) = self
+            .projections(PersistentCollection::Sessions)
+            .into_parts();
+        let records = projections
             .into_iter()
             .filter_map(IndexedSession::from_projection)
             .map(|mut session| {
@@ -1043,11 +1106,14 @@ impl PersistentIndex {
                     .count() as u64;
                 session
             })
-            .collect::<Vec<_>>()
-            .into_iter()
+            .collect::<Vec<_>>();
+        MeteredRecordIterator::new(records, reservations)
     }
-    pub fn subagent_records(&self) -> std::vec::IntoIter<IndexedSubagent> {
-        self.projections(PersistentCollection::Subagents)
+    pub fn subagent_records(&self) -> MeteredRecordIterator<IndexedSubagent> {
+        let (projections, reservations) = self
+            .projections(PersistentCollection::Subagents)
+            .into_parts();
+        let records = projections
             .into_iter()
             .filter_map(IndexedSubagent::from_projection)
             .map(|mut subagent| {
@@ -1070,55 +1136,61 @@ impl PersistentIndex {
                 }
                 subagent
             })
-            .collect::<Vec<_>>()
-            .into_iter()
+            .collect::<Vec<_>>();
+        MeteredRecordIterator::new(records, reservations)
     }
-    pub fn output_records(&self) -> std::vec::IntoIter<IndexedOutput> {
-        self.projections(PersistentCollection::Outputs)
-            .into_iter()
-            .filter_map(IndexedOutput::from_projection)
-            .collect::<Vec<_>>()
-            .into_iter()
+    pub fn output_records(&self) -> MeteredRecordIterator<IndexedOutput> {
+        self.records(
+            PersistentCollection::Outputs,
+            IndexedOutput::from_projection,
+        )
     }
-    pub fn segment_records(&self) -> std::vec::IntoIter<IndexedOutputSegment> {
-        self.projections(PersistentCollection::Segments)
-            .into_iter()
-            .filter_map(IndexedOutputSegment::from_projection)
-            .collect::<Vec<_>>()
-            .into_iter()
+    pub fn segment_records(&self) -> MeteredRecordIterator<IndexedOutputSegment> {
+        self.records(
+            PersistentCollection::Segments,
+            IndexedOutputSegment::from_projection,
+        )
     }
-    pub fn transcript_block_records(&self) -> std::vec::IntoIter<IndexedTranscriptBlock> {
-        self.projections(PersistentCollection::TranscriptBlocks)
-            .into_iter()
-            .filter_map(IndexedTranscriptBlock::from_projection)
-            .collect::<Vec<_>>()
-            .into_iter()
+    pub fn transcript_block_records(&self) -> MeteredRecordIterator<IndexedTranscriptBlock> {
+        self.records(
+            PersistentCollection::TranscriptBlocks,
+            IndexedTranscriptBlock::from_projection,
+        )
     }
-    pub fn session(&self, reference: &FragileSessionReference) -> Option<IndexedSession> {
+    pub fn session(
+        &self,
+        reference: &FragileSessionReference,
+    ) -> Option<MeteredProjectionValue<IndexedSession>> {
         self.lookup(PersistentCollection::Sessions, reference.as_str())
-            .and_then(IndexedSession::from_projection)
+            .and_then(|projection| projection.into_value(IndexedSession::from_projection))
     }
-    pub fn subagent(&self, reference: &FragileSubagentReference) -> Option<IndexedSubagent> {
+    pub fn subagent(
+        &self,
+        reference: &FragileSubagentReference,
+    ) -> Option<MeteredProjectionValue<IndexedSubagent>> {
         self.lookup(PersistentCollection::Subagents, reference.as_str())
-            .and_then(IndexedSubagent::from_projection)
+            .and_then(|projection| projection.into_value(IndexedSubagent::from_projection))
     }
-    pub fn output(&self, reference: &FragileOutputReference) -> Option<IndexedOutput> {
+    pub fn output(
+        &self,
+        reference: &FragileOutputReference,
+    ) -> Option<MeteredProjectionValue<IndexedOutput>> {
         self.lookup(PersistentCollection::Outputs, reference.as_str())
-            .and_then(IndexedOutput::from_projection)
+            .and_then(|projection| projection.into_value(IndexedOutput::from_projection))
     }
     pub fn segment(
         &self,
         reference: &FragileOutputSegmentReference,
-    ) -> Option<IndexedOutputSegment> {
+    ) -> Option<MeteredProjectionValue<IndexedOutputSegment>> {
         self.lookup(PersistentCollection::Segments, reference.as_str())
-            .and_then(IndexedOutputSegment::from_projection)
+            .and_then(|projection| projection.into_value(IndexedOutputSegment::from_projection))
     }
     pub fn transcript_block(
         &self,
         reference: &FragileTranscriptBlockReference,
-    ) -> Option<IndexedTranscriptBlock> {
+    ) -> Option<MeteredProjectionValue<IndexedTranscriptBlock>> {
         self.lookup(PersistentCollection::TranscriptBlocks, reference.as_str())
-            .and_then(IndexedTranscriptBlock::from_projection)
+            .and_then(|projection| projection.into_value(IndexedTranscriptBlock::from_projection))
     }
     pub fn collection_signature(&self) -> String {
         self.tree
@@ -1185,23 +1257,33 @@ impl PersistentIndex {
             .map_or(0, |root| root.count)
     }
 
-    fn projections(&self, collection: PersistentCollection) -> Vec<ProjectionRecordDto> {
+    fn records<T>(
+        &self,
+        collection: PersistentCollection,
+        convert: impl FnMut(ProjectionRecordDto) -> Option<T>,
+    ) -> MeteredRecordIterator<T> {
+        let (projections, reservations) = self.projections(collection).into_parts();
+        MeteredRecordIterator::new(
+            projections.into_iter().filter_map(convert).collect(),
+            reservations,
+        )
+    }
+
+    fn projections(&self, collection: PersistentCollection) -> PersistentProjectionPage {
         self.tree
             .as_ref()
             .and_then(|tree| tree.projections(collection).ok())
-            .map(PersistentProjectionPage::into_projections)
-            .unwrap_or_default()
+            .unwrap_or_else(PersistentProjectionPage::empty)
     }
     fn lookup(
         &self,
         collection: PersistentCollection,
         reference: &str,
-    ) -> Option<ProjectionRecordDto> {
+    ) -> Option<PersistentProjection> {
         self.tree
             .as_ref()
             .and_then(|tree| tree.lookup(collection, reference).ok())
             .flatten()
-            .map(PersistentProjection::into_projection)
     }
 }
 
@@ -1281,6 +1363,7 @@ impl PersistentProjectionTree {
         let Some(locator) = &root.locator else {
             return Ok(0);
         };
+        self.validate_root(root)?;
         GuardedTreeWalker::new(
             self,
             TreeTraversalLimits::new(root.count, self.store.limits(), budget),
@@ -1318,6 +1401,7 @@ impl PersistentProjectionTree {
                 reservations: Vec::new(),
             });
         };
+        self.validate_root(root)?;
         GuardedTreeWalker::new(
             self,
             TreeTraversalLimits::new(root.count, self.store.limits(), budget),
@@ -1338,6 +1422,7 @@ impl PersistentProjectionTree {
                 reservations: Vec::new(),
             });
         };
+        self.validate_root(root)?;
         GuardedTreeWalker::new(
             self,
             TreeTraversalLimits::new(
@@ -1355,6 +1440,7 @@ impl PersistentProjectionTree {
         let Some(locator) = root.locator.clone() else {
             return Ok(None);
         };
+        self.validate_root(root)?;
         GuardedTreeWalker::new(
             self,
             TreeTraversalLimits::new(root.count, self.store.limits(), 1),
@@ -1373,11 +1459,19 @@ impl PersistentProjectionTree {
         let Some(locator) = root.locator.clone() else {
             return Ok(None);
         };
+        self.validate_root(root)?;
         GuardedTreeWalker::new(
             self,
             TreeTraversalLimits::new(root.count, self.store.limits(), 1),
         )
         .lookup(&locator, reference)
+    }
+
+    fn validate_root(&self, root: &PersistentTreeRoot) -> Result<()> {
+        let Some(locator) = &root.locator else {
+            return Ok(());
+        };
+        StructuralTreeValidator::new(self, root.count).validate(locator)
     }
 }
 
@@ -1591,6 +1685,19 @@ impl PersistentTreeNode {
                 "unsorted or duplicate node keys",
             ));
         }
+        if kind == PersistentTreeNodeKind::Branch
+            && entries.windows(2).any(|pair| {
+                pair[0]
+                    .range_max
+                    .as_deref()
+                    .is_none_or(|maximum| maximum >= pair[1].key.as_str())
+            })
+        {
+            return Err(Error::protocol(
+                "persistent tree",
+                "overlapping parent child ranges",
+            ));
+        }
         Ok(Self {
             entries,
             kind,
@@ -1671,6 +1778,73 @@ impl BranchRange {
                 "persistent tree",
                 "overlapping child range",
             ));
+        }
+        Ok(())
+    }
+}
+
+/// Bounded preflight authentication for all child intervals of a selected root. This carries no
+/// corpus-sized corruption ledger: the manifest cardinality supplies both depth and node bounds.
+struct StructuralTreeValidator<'a> {
+    tree: &'a PersistentProjectionTree,
+    limits: TreeTraversalLimits,
+    node_reads: u64,
+}
+impl<'a> StructuralTreeValidator<'a> {
+    fn new(tree: &'a PersistentProjectionTree, root_count: u64) -> Self {
+        let mut limits = TreeTraversalLimits::new(root_count, tree.store.limits(), root_count);
+        limits.node_read_budget = root_count.saturating_mul(2).saturating_add(1);
+        Self {
+            tree,
+            limits,
+            node_reads: 0,
+        }
+    }
+
+    fn validate(mut self, locator: &str) -> Result<()> {
+        self.validate_node(locator, 1, None)
+    }
+
+    fn validate_node(
+        &mut self,
+        locator: &str,
+        depth: u64,
+        expected: Option<&BranchRange>,
+    ) -> Result<()> {
+        if depth > self.limits.depth_budget {
+            return Err(Error::protocol(
+                "persistent tree",
+                "tree depth exceeds manifest budget",
+            ));
+        }
+        self.node_reads = self.node_reads.saturating_add(1);
+        if self.node_reads > self.limits.node_read_budget {
+            return Err(Error::protocol(
+                "persistent tree",
+                "tree node-read budget exceeded",
+            ));
+        }
+        let node = PersistentTreeNode::from_chunk(
+            self.tree
+                .store
+                .open_reader(
+                    &store::IndexLocator::new(self.tree.locator(locator)),
+                    schema::IndexFileKind::IndexNode,
+                )?
+                .read()?,
+        )?;
+        let _node_reservation = self.tree.meter.reserve(
+            instrumentation::IndexWorkCategory::DecodedChunk,
+            node.logical_bytes,
+        );
+        if let Some(expected) = expected {
+            expected.authenticate(&node)?;
+        }
+        if node.kind == PersistentTreeNodeKind::Branch {
+            for (index, entry) in node.entries.iter().enumerate() {
+                let range = BranchRange::from_parent(&node.entries, index)?;
+                self.validate_node(&entry.locator, depth.saturating_add(1), Some(&range))?;
+            }
         }
         Ok(())
     }
@@ -3119,7 +3293,7 @@ impl<'a> ReferenceResolver<'a> {
             &factory,
             Some(RejectedFragileReference::Session(reference.clone())),
         )?;
-        Ok(session)
+        Ok(session.into_inner())
     }
 
     pub fn resolve_subagent(
@@ -3135,7 +3309,7 @@ impl<'a> ReferenceResolver<'a> {
             );
         };
         self.resolve_session(&subagent.session_reference, request_identifier, operation)?;
-        Ok(subagent)
+        Ok(subagent.into_inner())
     }
 
     pub fn resolve_output(
@@ -3152,7 +3326,7 @@ impl<'a> ReferenceResolver<'a> {
             &factory,
             Some(RejectedFragileReference::Output(reference.clone())),
         )?;
-        Ok(output)
+        Ok(output.into_inner())
     }
 
     pub fn resolve_segment(
@@ -3170,7 +3344,7 @@ impl<'a> ReferenceResolver<'a> {
             );
         };
         self.resolve_output(&segment.output_reference, request_identifier, operation)?;
-        Ok(segment)
+        Ok(segment.into_inner())
     }
 
     pub fn resolve_transcript_block(
@@ -3191,7 +3365,7 @@ impl<'a> ReferenceResolver<'a> {
             &factory,
             Some(RejectedFragileReference::TranscriptBlock(reference.clone())),
         )?;
-        Ok(block)
+        Ok(block.into_inner())
     }
 }
 
@@ -6453,6 +6627,16 @@ mod persistent_tree_audit_tests {
             overlapping
                 .visit_persistent_tree("outputs", 2, |_, _| true)
                 .is_err()
+        );
+        assert!(
+            overlapping
+                .persistent_tree_projection_page("outputs", 1)
+                .is_err(),
+            "a one-item page validates its unvisited sibling"
+        );
+        assert!(
+            overlapping.persistent_tree_lookup("outputs", "a").is_err(),
+            "a point lookup validates its unvisited sibling"
         );
 
         let (erroring, error_meter) = published_adversarial_tree(vec![

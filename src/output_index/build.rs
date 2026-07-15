@@ -2146,13 +2146,32 @@ mod persistent_tree_tests {
             "the visitor caps requested candidates at the persistent query limit"
         );
         assert_eq!(references.len(), limits().maximum_query_candidates as usize);
-        let output = index
-            .output_records()
+        let mut production_records = index.output_records();
+        assert!(
+            meter.snapshot().live_bytes > 0,
+            "production list keeps projection reservations through card conversion"
+        );
+        let output = production_records
             .next()
             .expect("live collection projection");
+        drop(production_records);
+        assert_eq!(
+            meter.snapshot().live_bytes,
+            0,
+            "production list drop releases bytes"
+        );
+        let production_lookup = index
+            .output(&output.reference)
+            .expect("guarded point lookup");
         assert!(
-            index.output(&output.reference).is_some(),
-            "guarded point lookup"
+            meter.snapshot().live_bytes > 0,
+            "production lookup keeps its projection reservation"
+        );
+        drop(production_lookup);
+        assert_eq!(
+            meter.snapshot().live_bytes,
+            0,
+            "production lookup drop releases bytes"
         );
         let page = index
             .persistent_tree_projection_page("outputs", 2)

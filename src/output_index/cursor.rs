@@ -67,20 +67,21 @@ impl V3PageCursor {
         if reference.as_str().len() as u64 > maximum_bytes {
             return None;
         }
-        let parts = reference.as_str().split(':').collect::<Vec<_>>();
-        if parts.len() != 10 || parts[0] != "cursor" || parts[1] != "v3" {
+        let mut fields = reference.as_str().split(':');
+        if fields.next()? != "cursor" || fields.next()? != "v3" {
             return None;
         }
-        Some(Self {
-            collection: PageCollectionKind::parse(parts[2])?,
-            order: ListingOrderName::parse(parts[3])?,
-            limit: PageLimit::new(parts[4].parse().ok()?),
-            snapshot_identity: DigestText::parse(parts[5])?,
-            query_digest: DigestText::parse(parts[6])?,
-            last_reference: HexText::decode(parts[7])?,
-            sort_tuple_digest: DigestText::parse(parts[8])?,
-            last_candidate_reference: HexText::decode(parts[9])?,
-        })
+        let cursor = Self {
+            collection: PageCollectionKind::parse(fields.next()?)?,
+            order: ListingOrderName::parse(fields.next()?)?,
+            limit: PageLimit::new(fields.next()?.parse().ok()?),
+            snapshot_identity: DigestText::parse(fields.next()?)?,
+            query_digest: DigestText::parse(fields.next()?)?,
+            last_reference: HexText::decode(fields.next()?)?,
+            sort_tuple_digest: DigestText::parse(fields.next()?)?,
+            last_candidate_reference: HexText::decode(fields.next()?)?,
+        };
+        fields.next().is_none().then_some(cursor)
     }
 }
 
