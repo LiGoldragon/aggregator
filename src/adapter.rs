@@ -6,6 +6,7 @@ pub mod repository;
 use std::{
     collections::BTreeSet,
     ffi::OsStr,
+    fs::{self, File},
     io::{BufReader, Read},
     path::{Path, PathBuf},
 };
@@ -149,9 +150,253 @@ pub struct TranscriptReadOutcome {
     pub read_failures: Vec<signal_aggregator::ReadFailure>,
 }
 
+/// A deterministic, bounded scanner request. The occurrence distinguishes equal roots
+/// configured more than once without leaking the root into checkpoint metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptScanRequest {
+    pub configured_occurrence: u64,
+    pub configuration_signature: [u8; 32],
+    pub resume_cursor: Option<TranscriptScanCursor>,
+}
+
+impl TranscriptScanRequest {
+    pub fn new(configured_occurrence: u64, configuration_signature: [u8; 32]) -> Self {
+        Self {
+            configured_occurrence,
+            configuration_signature,
+            resume_cursor: None,
+        }
+    }
+
+    pub fn with_resume_cursor(mut self, resume_cursor: Option<TranscriptScanCursor>) -> Self {
+        self.resume_cursor = resume_cursor;
+        self
+    }
+
+    pub fn accepts(&self, source: SourceKind, source_identifier: &SourceIdentifier) -> bool {
+        self.resume_cursor.as_ref().is_some_and(|cursor| {
+            cursor.configured_occurrence == self.configured_occurrence
+                && cursor.configuration_signature == self.configuration_signature
+                && cursor.source == source
+                && cursor.source_identifier == *source_identifier
+                && cursor.adapter_version == TranscriptScanCursor::ADAPTER_VERSION
+        })
+    }
+}
+
+/// Opaque scalar progress that is safe to place in a checkpoint. File coverage itself belongs in
+/// capped coverage chunks; the cursor intentionally carries no paths or transcript material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptScanCursor {
+    pub source: SourceKind,
+    pub source_identifier: SourceIdentifier,
+    pub configured_occurrence: u64,
+    pub configuration_signature: [u8; 32],
+    pub adapter_version: u32,
+    pub next_discovery_ordinal: u64,
+    pub completed_prefix_digest: [u8; 32],
+}
+
+impl TranscriptScanCursor {
+    pub const ADAPTER_VERSION: u32 = 1;
+
+    pub fn new(
+        source: SourceKind,
+        source_identifier: SourceIdentifier,
+        configured_occurrence: u64,
+        configuration_signature: [u8; 32],
+        next_discovery_ordinal: u64,
+        completed_prefix_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            source,
+            source_identifier,
+            configured_occurrence,
+            configuration_signature,
+            adapter_version: Self::ADAPTER_VERSION,
+            next_discovery_ordinal,
+            completed_prefix_digest,
+        }
+    }
+}
+
+/// A deterministic file identity. The digest covers the resolved path, metadata and a bounded
+/// content prefix, so a resume never trusts a changed completed prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptFileDescriptor {
+    pub discovery_ordinal: u64,
+    pub fingerprint: [u8; 32],
+    pub byte_count: u64,
+}
+
+impl TranscriptFileDescriptor {
+    pub fn from_path(path: &Path, discovery_ordinal: u64) -> std::io::Result<Self> {
+        let metadata = fs::metadata(path)?;
+        let mut prefix = vec![0_u8; 4096];
+        let mut file = File::open(path)?;
+        let prefix_bytes = file.read(&mut prefix)?;
+        prefix.truncate(prefix_bytes);
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0_u128, |value| value.as_nanos());
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(path.as_os_str().as_encoded_bytes());
+        hasher.update(&metadata.len().to_le_bytes());
+        hasher.update(&modified.to_le_bytes());
+        hasher.update(&prefix);
+        Ok(Self {
+            discovery_ordinal,
+            fingerprint: *hasher.finalize().as_bytes(),
+            byte_count: metadata.len(),
+        })
+    }
+
+    pub fn prefix_digest(descriptors: &[Self]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        for descriptor in descriptors {
+            hasher.update(&descriptor.discovery_ordinal.to_le_bytes());
+            hasher.update(&descriptor.fingerprint);
+            hasher.update(&descriptor.byte_count.to_le_bytes());
+        }
+        *hasher.finalize().as_bytes()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptFileAction {
+    Read,
+    ReuseSynced,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptFileSync {
+    Synced,
+    Deferred,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptFileCoverage {
+    pub descriptor: TranscriptFileDescriptor,
+    pub completed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptResumableScanOutcome {
+    pub outcome: TranscriptRawReadOutcome,
+    pub cursor: TranscriptScanCursor,
+    /// Coverage records are emitted to the sink and persisted immediately by the builder.
+    pub completed_files: u64,
+    pub resumed: bool,
+}
+
 /// Receives one parsed transcript record while its source line is still bounded.
+///
+/// The lifecycle callbacks make the durability boundary explicit: a scanner only advances a
+/// cursor after `complete_file` reports that the emitted run/chunk was synced.
 pub trait TranscriptRecordSink {
     fn observe_record(&mut self, record: TranscriptRecord);
+
+    fn begin_source(&mut self, _source: SourceKind, _configured_occurrence: u64) {}
+
+    fn begin_file(&mut self, _descriptor: &TranscriptFileDescriptor) -> TranscriptFileAction {
+        TranscriptFileAction::Read
+    }
+
+    fn complete_file(&mut self, _coverage: &TranscriptFileCoverage) -> TranscriptFileSync {
+        TranscriptFileSync::Synced
+    }
+}
+
+/// Marker for callers that want the resumable lifecycle without a second record callback API.
+pub trait TranscriptScanSink: TranscriptRecordSink {}
+
+impl<T: TranscriptRecordSink + ?Sized> TranscriptScanSink for T {}
+
+/// Adapts the compatibility line callback to the resumable lifecycle. Readers whose discovery
+/// phase exposes empty files use their explicit lifecycle path; this adapter covers record-bearing
+/// files without retaining records or paths after a file completes.
+#[derive(Debug)]
+pub struct TranscriptRecordLifecycle<'a, S> {
+    sink: &'a mut S,
+    next_ordinal: u64,
+    current: Option<TranscriptFileCoverage>,
+    prefix: blake3::Hasher,
+    completed_files: u64,
+}
+
+impl<'a, S: TranscriptRecordSink> TranscriptRecordLifecycle<'a, S> {
+    pub fn new(sink: &'a mut S) -> Self {
+        Self {
+            sink,
+            next_ordinal: 0,
+            current: None,
+            prefix: blake3::Hasher::new(),
+            completed_files: 0,
+        }
+    }
+
+    pub fn finish(mut self) -> TranscriptRecordLifecycleProgress {
+        self.complete_current();
+        TranscriptRecordLifecycleProgress {
+            next_discovery_ordinal: self.next_ordinal,
+            completed_prefix_digest: *self.prefix.finalize().as_bytes(),
+            completed_files: self.completed_files,
+        }
+    }
+
+    fn observe(&mut self, record: TranscriptRecord) {
+        let same_file = self.current.as_ref().is_some_and(|coverage| {
+            TranscriptFileDescriptor::from_path(&record.path, coverage.descriptor.discovery_ordinal)
+                .is_ok_and(|descriptor| descriptor.fingerprint == coverage.descriptor.fingerprint)
+        });
+        if !same_file {
+            self.complete_current();
+            let descriptor =
+                match TranscriptFileDescriptor::from_path(&record.path, self.next_ordinal) {
+                    Ok(descriptor) => descriptor,
+                    Err(_) => {
+                        self.sink.observe_record(record);
+                        return;
+                    }
+                };
+            self.next_ordinal += 1;
+            let _ = self.sink.begin_file(&descriptor);
+            self.current = Some(TranscriptFileCoverage {
+                descriptor,
+                completed: true,
+            });
+        }
+        self.sink.observe_record(record);
+    }
+
+    fn complete_current(&mut self) {
+        let Some(coverage) = self.current.take() else {
+            return;
+        };
+        if self.sink.complete_file(&coverage) == TranscriptFileSync::Synced {
+            self.prefix
+                .update(&coverage.descriptor.discovery_ordinal.to_le_bytes());
+            self.prefix.update(&coverage.descriptor.fingerprint);
+            self.prefix
+                .update(&coverage.descriptor.byte_count.to_le_bytes());
+            self.completed_files += 1;
+        }
+    }
+}
+
+impl<S: TranscriptRecordSink> TranscriptRecordSink for TranscriptRecordLifecycle<'_, S> {
+    fn observe_record(&mut self, record: TranscriptRecord) {
+        self.observe(record);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptRecordLifecycleProgress {
+    pub next_discovery_ordinal: u64,
+    pub completed_prefix_digest: [u8; 32],
+    pub completed_files: u64,
 }
 
 impl TranscriptRecordSink for Vec<TranscriptRecord> {
@@ -1860,6 +2105,14 @@ impl TranscriptFailureAccumulator {
             limit_path,
             truncated: false,
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.failures.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.failures.is_empty()
     }
 
     pub fn push(&mut self, failure: ReadFailure) {

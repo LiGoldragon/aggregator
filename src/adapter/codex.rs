@@ -11,10 +11,12 @@ use crate::{
     adapter::{
         TranscriptBlockCollector, TranscriptBlockSourceContext, TranscriptBlockTextJoiner,
         TranscriptBoundedFile, TranscriptBoundedFileRead, TranscriptBoundedLine,
-        TranscriptDiscoveryState, TranscriptFailureAccumulator, TranscriptFileDiscovery,
-        TranscriptJsonMetadata, TranscriptLineLocator, TranscriptRawReadOutcome,
-        TranscriptReadOutcome, TranscriptReadRequest, TranscriptRecord, TranscriptRecordSink,
-        TranscriptScanLimits,
+        TranscriptDiscoveryState, TranscriptFailureAccumulator, TranscriptFileAction,
+        TranscriptFileCoverage, TranscriptFileDescriptor, TranscriptFileDiscovery,
+        TranscriptFileSync, TranscriptJsonMetadata, TranscriptLineLocator,
+        TranscriptRawReadOutcome, TranscriptReadOutcome, TranscriptReadRequest, TranscriptRecord,
+        TranscriptRecordLifecycle, TranscriptRecordSink, TranscriptResumableScanOutcome,
+        TranscriptScanCursor, TranscriptScanLimits, TranscriptScanRequest,
     },
     configuration::TranscriptRootConfiguration,
     time_model::CanonicalTimestamp,
@@ -36,6 +38,14 @@ impl<S: TranscriptRecordSink> TranscriptRecordSink for CountingTranscriptRecordS
     fn observe_record(&mut self, record: TranscriptRecord) {
         *self.count += 1;
         self.sink.observe_record(record);
+    }
+
+    fn begin_file(&mut self, descriptor: &TranscriptFileDescriptor) -> TranscriptFileAction {
+        self.sink.begin_file(descriptor)
+    }
+
+    fn complete_file(&mut self, coverage: &TranscriptFileCoverage) -> TranscriptFileSync {
+        self.sink.complete_file(coverage)
     }
 }
 
@@ -95,6 +105,33 @@ impl CodexSessionRootReader {
     }
 
     /// Streams records to the caller; parsed JSON and record text are dropped after each callback.
+    /// Compatibility-source lifecycle scan. Each record-bearing file emits begin/sync events;
+    /// the v3 builder persists its coverage before accepting the returned cursor.
+    pub fn scan_records_resumable<S: TranscriptRecordSink>(
+        &self,
+        request: &TranscriptScanRequest,
+        sink: &mut S,
+    ) -> TranscriptResumableScanOutcome {
+        let source_identifier = self.source_identifier();
+        sink.begin_source(SourceKind::Codex, request.configured_occurrence);
+        let mut lifecycle = TranscriptRecordLifecycle::new(sink);
+        let outcome = self.scan_records(&mut lifecycle);
+        let progress = lifecycle.finish();
+        TranscriptResumableScanOutcome {
+            cursor: TranscriptScanCursor::new(
+                SourceKind::Codex,
+                source_identifier,
+                request.configured_occurrence,
+                request.configuration_signature,
+                progress.next_discovery_ordinal,
+                progress.completed_prefix_digest,
+            ),
+            completed_files: progress.completed_files,
+            resumed: request.accepts(SourceKind::Codex, &self.source_identifier()),
+            outcome,
+        }
+    }
+
     pub fn scan_records<S: TranscriptRecordSink>(&self, sink: &mut S) -> TranscriptRawReadOutcome {
         let mut record_count = 0_u64;
         let mut counted = CountingTranscriptRecordSink::new(sink, &mut record_count);

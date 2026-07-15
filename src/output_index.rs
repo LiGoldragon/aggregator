@@ -1,3 +1,4 @@
+pub mod build;
 pub mod instrumentation;
 pub mod limits;
 pub mod schema;

@@ -12,10 +12,12 @@ use crate::{
     adapter::{
         TranscriptBlockCollector, TranscriptBlockSourceContext, TranscriptBlockTextJoiner,
         TranscriptBoundedFile, TranscriptBoundedFileRead, TranscriptBoundedLine,
-        TranscriptFailureAccumulator, TranscriptFileDiscovery, TranscriptFileShape,
+        TranscriptFailureAccumulator, TranscriptFileAction, TranscriptFileCoverage,
+        TranscriptFileDescriptor, TranscriptFileDiscovery, TranscriptFileShape, TranscriptFileSync,
         TranscriptJsonMetadata, TranscriptLineLocator, TranscriptRawReadOutcome,
         TranscriptReadOutcome, TranscriptReadRequest, TranscriptRecord, TranscriptRecordSink,
-        TranscriptScanLimits, TranscriptSymbolicLinkPolicy,
+        TranscriptResumableScanOutcome, TranscriptScanCursor, TranscriptScanLimits,
+        TranscriptScanRequest, TranscriptSymbolicLinkPolicy,
     },
     configuration::TranscriptRootConfiguration,
     time_model::CanonicalTimestamp,
@@ -37,6 +39,18 @@ impl<S: TranscriptRecordSink> TranscriptRecordSink for CountingTranscriptRecordS
     fn observe_record(&mut self, record: TranscriptRecord) {
         *self.count += 1;
         self.sink.observe_record(record);
+    }
+
+    fn begin_source(&mut self, source: SourceKind, configured_occurrence: u64) {
+        self.sink.begin_source(source, configured_occurrence);
+    }
+
+    fn begin_file(&mut self, descriptor: &TranscriptFileDescriptor) -> TranscriptFileAction {
+        self.sink.begin_file(descriptor)
+    }
+
+    fn complete_file(&mut self, coverage: &TranscriptFileCoverage) -> TranscriptFileSync {
+        self.sink.complete_file(coverage)
     }
 }
 
@@ -153,6 +167,154 @@ impl ClaudeJsonlRootReader {
     }
 
     /// Streams records to the caller; parsed JSON and record text are dropped after each callback.
+    /// Scans in discovery order and advances the returned cursor only after the sink has made
+    /// the corresponding file output durable. A valid cursor reuses only an unchanged prefix.
+    pub fn scan_records_resumable<S: TranscriptRecordSink>(
+        &self,
+        request: &TranscriptScanRequest,
+        sink: &mut S,
+    ) -> TranscriptResumableScanOutcome {
+        let source_identifier = self.source_identifier();
+        sink.begin_source(self.source, request.configured_occurrence);
+        let discovery = TranscriptFileDiscovery::with_limits_and_file_shape(
+            self.root.clone(),
+            self.limits.clone(),
+            self.file_shape.discovery_file_shape(),
+        )
+        .with_symbolic_link_policy(self.symbolic_link_policy())
+        .discover_files();
+        let Ok(discovery) = discovery else {
+            let outcome = self.scan_records(sink);
+            return TranscriptResumableScanOutcome {
+                cursor: TranscriptScanCursor::new(
+                    self.source,
+                    source_identifier,
+                    request.configured_occurrence,
+                    request.configuration_signature,
+                    0,
+                    [0; 32],
+                ),
+                completed_files: 0,
+                resumed: false,
+                outcome,
+            };
+        };
+        let descriptors = discovery
+            .files
+            .iter()
+            .enumerate()
+            .map(|(ordinal, path)| TranscriptFileDescriptor::from_path(path, ordinal as u64))
+            .collect::<std::io::Result<Vec<_>>>();
+        let Ok(descriptors) = descriptors else {
+            let outcome = self.scan_records(sink);
+            return TranscriptResumableScanOutcome {
+                cursor: TranscriptScanCursor::new(
+                    self.source,
+                    source_identifier,
+                    request.configured_occurrence,
+                    request.configuration_signature,
+                    0,
+                    [0; 32],
+                ),
+                completed_files: 0,
+                resumed: false,
+                outcome,
+            };
+        };
+        let resume_files = request
+            .resume_cursor
+            .as_ref()
+            .map_or(0, |cursor| cursor.next_discovery_ordinal);
+        let resumed = request.accepts(self.source, &source_identifier)
+            && resume_files <= descriptors.len() as u64
+            && request.resume_cursor.as_ref().is_some_and(|cursor| {
+                TranscriptFileDescriptor::prefix_digest(&descriptors[..resume_files as usize])
+                    == cursor.completed_prefix_digest
+            });
+        let mut record_count = 0_u64;
+        let mut counted = CountingTranscriptRecordSink::new(sink, &mut record_count);
+        let mut failures = TranscriptFailureAccumulator::new(
+            self.source,
+            Some(self.root.clone()),
+            self.limits.maximum_failures(),
+        );
+        for failure in discovery.failures {
+            failures.push(self.failure(failure.reason, Some(failure.path)));
+        }
+        let mut scan_limits = discovery.scan_limits;
+        let mut truncations = discovery
+            .truncations
+            .into_iter()
+            .map(|truncation| truncation.into_truncation(self.source))
+            .collect::<Vec<_>>();
+        let mut completed_files = 0_u64;
+        let mut next_ordinal = 0_u64;
+        for (ordinal, (file, descriptor)) in discovery.files.iter().zip(&descriptors).enumerate() {
+            let ordinal = ordinal as u64;
+            let action = if resumed && ordinal < resume_files {
+                TranscriptFileAction::ReuseSynced
+            } else {
+                counted.begin_file(descriptor)
+            };
+            if action == TranscriptFileAction::ReuseSynced {
+                completed_files += 1;
+                next_ordinal = ordinal + 1;
+                continue;
+            }
+            let failure_count = failures.len();
+            let truncation_count = truncations.len();
+            self.read_file_lines(
+                file,
+                &mut counted,
+                &mut failures,
+                &mut truncations,
+                &mut scan_limits,
+            );
+            let unchanged = TranscriptFileDescriptor::from_path(file, ordinal)
+                .is_ok_and(|after| after.fingerprint == descriptor.fingerprint);
+            let coverage = TranscriptFileCoverage {
+                descriptor: descriptor.clone(),
+                completed: unchanged
+                    && failures.len() == failure_count
+                    && truncations.len() == truncation_count,
+            };
+            if coverage.completed && counted.complete_file(&coverage) == TranscriptFileSync::Synced
+            {
+                completed_files += 1;
+                next_ordinal = ordinal + 1;
+            } else {
+                break;
+            }
+        }
+        let failure_outcome = failures.finish();
+        truncations.extend(failure_outcome.truncations);
+        scan_limits.extend(failure_outcome.scan_limits);
+        let outcome = TranscriptRawReadOutcome::with_discovered_file_count(
+            self.source,
+            source_identifier.clone(),
+            Vec::new(),
+            truncations,
+            failure_outcome.failures,
+            descriptors.len() as u64,
+        )
+        .with_record_count(record_count)
+        .with_scan_limits(scan_limits);
+        let prefix = TranscriptFileDescriptor::prefix_digest(&descriptors[..next_ordinal as usize]);
+        TranscriptResumableScanOutcome {
+            outcome,
+            cursor: TranscriptScanCursor::new(
+                self.source,
+                source_identifier,
+                request.configured_occurrence,
+                request.configuration_signature,
+                next_ordinal,
+                prefix,
+            ),
+            completed_files,
+            resumed,
+        }
+    }
+
     pub fn scan_records<S: TranscriptRecordSink>(&self, sink: &mut S) -> TranscriptRawReadOutcome {
         let mut record_count = 0_u64;
         let mut counted = CountingTranscriptRecordSink::new(sink, &mut record_count);
