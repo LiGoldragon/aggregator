@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
 
 use aggregator::{
     adapter::{TranscriptRecord, TranscriptRecordSink},
@@ -6,7 +6,8 @@ use aggregator::{
         build::{BoundedGenerationBuilder, SourceKey},
         instrumentation::IndexResourceMeter,
         limits::IndexStoreLimits,
-        store::IndexStore,
+        schema::{IndexFileKind, ProjectionRecordDto},
+        store::{ChunkReader, IndexStore},
     },
 };
 use signal_aggregator::{SourceIdentifier, SourceKind};
@@ -77,6 +78,96 @@ fn build_corpus(records: u64) -> aggregator::output_index::instrumentation::Inde
         "corpus spills through immutable chunks"
     );
     meter.snapshot()
+}
+
+#[test]
+fn builder_emits_every_projection_kind_and_scalar_reference_edges() {
+    let root = TempDir::new().expect("temporary index root");
+    let store = IndexStore::new(root.path().join("store.output-index.json"), tiny_limits());
+    let staging = store.create_staging("typed-projection").expect("staging");
+    let source_key = SourceKey::new(
+        SourceKind::Claude,
+        SourceIdentifier::new("claude:fixture"),
+        0,
+    );
+    let mut builder = BoundedGenerationBuilder::new(
+        staging.clone(),
+        source_key,
+        tiny_limits(),
+        IndexResourceMeter::default(),
+    );
+    for line_number in 1..=4 {
+        let record = record(line_number)
+            .with_subagent_name(Some(signal_aggregator::SubagentName::new("worker")))
+            .with_blocks(vec![
+                aggregator::adapter::TranscriptBlockSourceContext::new(
+                    SourceKind::Claude,
+                    SourceIdentifier::new("claude:fixture"),
+                    PathBuf::from("/private/fixture/session.jsonl"),
+                    line_number,
+                    None,
+                )
+                .readable_block(
+                    0,
+                    signal_aggregator::TranscriptBlockKind::AgentResponse,
+                    "block text".to_owned(),
+                ),
+            ]);
+        builder.observe_record(record);
+    }
+    let run = builder.finish().expect("typed source run");
+    assert!(run.chunk_count > 5, "projection leaves spill independently");
+
+    let mut kinds = std::collections::BTreeSet::new();
+    let mut reference_edges = 0_u64;
+    for entry in fs::read_dir(staging.path()).expect("staging entries") {
+        let path = entry.expect("entry").path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if name.contains("projection") {
+            let chunk = ChunkReader::new(path, IndexFileKind::Projection, tiny_limits())
+                .read()
+                .expect("typed projection chunk");
+            match chunk.projection.expect("projection payload") {
+                ProjectionRecordDto::Session(_) => {
+                    kinds.insert("session");
+                }
+                ProjectionRecordDto::Subagent(_) => {
+                    kinds.insert("subagent");
+                }
+                ProjectionRecordDto::Output(_) => {
+                    kinds.insert("output");
+                }
+                ProjectionRecordDto::Segment(_) => {
+                    kinds.insert("segment");
+                }
+                ProjectionRecordDto::TranscriptBlock(_) => {
+                    kinds.insert("block");
+                }
+            }
+        } else if name.contains("index") {
+            let chunk = ChunkReader::new(path, IndexFileKind::ReferenceIndex, tiny_limits())
+                .read()
+                .expect("reference edge chunk");
+            reference_edges += chunk.records.len() as u64;
+            assert!(
+                chunk
+                    .records
+                    .iter()
+                    .all(|record| { record.fields.iter().all(|field| field.name != "children") })
+            );
+        }
+    }
+    assert_eq!(
+        kinds,
+        std::collections::BTreeSet::from(["session", "subagent", "output", "segment", "block"])
+    );
+    assert!(
+        reference_edges >= 12,
+        "each projection is discoverable without parent child arrays"
+    );
 }
 
 fn tiny_limits() -> IndexStoreLimits {

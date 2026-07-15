@@ -3,7 +3,10 @@
 //! This module intentionally writes normalized observations before reducing them. A source run
 //! never owns a session's children: downstream reducers join by `SourceKey` and scalar keys.
 
-use signal_aggregator::{SourceIdentifier, SourceKind};
+use signal_aggregator::{
+    AuthoredStatus, ByteLimit, SourceIdentifier, SourceKind, TranscriptBlockKind,
+    TranscriptBlockTextAvailability,
+};
 
 use crate::{
     Error, Result, RuntimeConfiguration, TranscriptAdapterConfiguration,
@@ -14,9 +17,16 @@ use crate::{
 };
 
 use super::{
+    FragileSessionReference, FragileSubagentReference, IndexedOutput, IndexedOutputSegment,
+    IndexedTranscriptBlock, SourceFingerprint, SourceKindName, StableReference,
     instrumentation::{IndexReservation, IndexResourceMeter, IndexWorkCategory},
     limits::IndexStoreLimits,
-    schema::{CurrentPointer, IndexChunk, IndexFieldDto, IndexFileKind, IndexRecordDto},
+    schema::{
+        CurrentPointer, DiskPath, IndexChunk, IndexFieldDto, IndexFileKind, IndexRecordDto,
+        ProjectionOutputDto, ProjectionRecordDto, ProjectionSegmentDto, ProjectionSessionDto,
+        ProjectionSizeDto, ProjectionSubagentDto, ProjectionTaskDto, ProjectionTranscriptBlockDto,
+        TYPED_PROJECTION_DTO_VERSION,
+    },
     store::{IndexLocator, IndexStaging, IndexStore},
 };
 
@@ -283,6 +293,7 @@ pub struct BoundedGenerationBuilder {
     logical_bytes_written: u64,
     record_count: u64,
     next_chunk: u64,
+    next_projection_chunk: u64,
     content_hasher: blake3::Hasher,
     failure: Option<Error>,
 }
@@ -306,6 +317,7 @@ impl BoundedGenerationBuilder {
             logical_bytes_written: 0,
             record_count: 0,
             next_chunk: 0,
+            next_projection_chunk: 0,
             content_hasher: blake3::Hasher::new(),
             failure: None,
         }
@@ -327,6 +339,10 @@ impl BoundedGenerationBuilder {
 
     fn observe_normalized(&mut self, record: TranscriptRecord) {
         if self.failure.is_some() {
+            return;
+        }
+        if let Err(error) = self.emit_typed_projection(&record) {
+            self.failure = Some(error);
             return;
         }
         let dto = NormalizedObservation::new(&self.source_key, &record).dto();
@@ -365,6 +381,344 @@ impl BoundedGenerationBuilder {
         self.record_count += 1;
     }
 
+    /// Emits each leaf as its own immutable typed chunk.  The only in-memory state is the
+    /// current adapter record and its capped preview; parent cardinalities are deliberately not
+    /// represented as child vectors.
+    fn emit_typed_projection(&mut self, record: &TranscriptRecord) -> Result<()> {
+        let fingerprint = SourceFingerprint::from_path(&record.path)
+            .unwrap_or_else(|_| SourceFingerprint::missing());
+        let session_reference = FragileSessionReference::new(
+            StableReference::new(
+                "session",
+                format!(
+                    "{}|{}|{}|{}",
+                    SourceKindName::new(record.source).as_str(),
+                    record.source_identifier.as_str(),
+                    record.path.display(),
+                    fingerprint.material(),
+                ),
+            )
+            .as_string(),
+        );
+        let subagent_reference = record.subagent_name.as_ref().map(|name| {
+            FragileSubagentReference::new(
+                StableReference::new(
+                    "subagent",
+                    format!("{}|{}", session_reference.as_str(), name.as_str()),
+                )
+                .as_string(),
+            )
+        });
+        let preview_limit = ByteLimit::new(self.limits.maximum_string_bytes);
+        let output = IndexedOutput::from_record(
+            record.clone(),
+            session_reference.clone(),
+            subagent_reference.clone(),
+            fingerprint.clone(),
+            preview_limit,
+        );
+        self.write_projection(ProjectionRecordDto::Output(self.output_dto(&output)))?;
+        self.write_projection(ProjectionRecordDto::Segment(
+            self.segment_dto(&IndexedOutputSegment::from_output(&output)),
+        ))?;
+        for block in record.transcript_blocks() {
+            let block_subagent = block.subagent_name.as_ref().map(|name| {
+                FragileSubagentReference::new(
+                    StableReference::new(
+                        "subagent",
+                        format!("{}|{}", session_reference.as_str(), name.as_str()),
+                    )
+                    .as_string(),
+                )
+            });
+            let indexed = IndexedTranscriptBlock::from_record(
+                block,
+                session_reference.clone(),
+                block_subagent,
+                fingerprint.clone(),
+                preview_limit,
+            );
+            self.write_projection(ProjectionRecordDto::TranscriptBlock(
+                self.block_dto(&indexed),
+            ))?;
+        }
+        self.write_projection(ProjectionRecordDto::Session(ProjectionSessionDto {
+            reference: session_reference.as_str().to_owned(),
+            source: SourceKindCode::new(record.source).code(),
+            source_identifier: record.source_identifier.as_str().to_owned(),
+            path: DiskPath::new(
+                record.path.as_os_str().as_encoded_bytes().to_vec(),
+                record.path.display().to_string(),
+            ),
+            fingerprint_bytes: fingerprint.byte_count,
+            fingerprint_seconds: fingerprint.modified_seconds,
+            fingerprint_nanoseconds: fingerprint.modified_nanoseconds,
+            started_at: record
+                .timestamp
+                .as_ref()
+                .map(|timestamp| timestamp.as_str().to_owned()),
+            last_observed_at: record
+                .timestamp
+                .as_ref()
+                .map(|timestamp| timestamp.as_str().to_owned()),
+            producer_session_identifier: record
+                .session_identifier
+                .as_ref()
+                .map(|identifier| identifier.as_str().to_owned()),
+            subagent_count: u64::from(record.subagent_name.is_some()),
+            output_count: 1,
+            size: self.size_dto(record.byte_count(), record.line_count(), 1, 1),
+        }))?;
+        if let Some(name) = &record.subagent_name {
+            self.write_projection(ProjectionRecordDto::Subagent(ProjectionSubagentDto {
+                reference: subagent_reference
+                    .as_ref()
+                    .expect("subagent reference follows subagent name")
+                    .as_str()
+                    .to_owned(),
+                session_reference: session_reference.as_str().to_owned(),
+                name: name.as_str().to_owned(),
+                authored_status: AuthoredStatusCode::new(record.authored_status).code(),
+                task: record.task_metadata.as_ref().map(|task| ProjectionTaskDto {
+                    task_identifier: task.task_identifier.as_str().to_owned(),
+                }),
+                output_count: 1,
+                size: self.size_dto(record.byte_count(), record.line_count(), 1, 1),
+                first_observed_at: record
+                    .timestamp
+                    .as_ref()
+                    .map(|timestamp| timestamp.as_str().to_owned()),
+                last_observed_at: record
+                    .timestamp
+                    .as_ref()
+                    .map(|timestamp| timestamp.as_str().to_owned()),
+            }))?;
+        }
+        self.write_indexes(&session_reference, subagent_reference.as_ref(), &output)?;
+        Ok(())
+    }
+
+    fn write_projection(&mut self, projection: ProjectionRecordDto) -> Result<()> {
+        let locator = IndexLocator::new(format!(
+            "run-{}-projection-{:016x}",
+            self.source_key.configured_occurrence(),
+            self.next_projection_chunk
+        ));
+        self.staging.write_chunk(
+            &locator,
+            IndexFileKind::Projection,
+            &IndexChunk {
+                schema_version: TYPED_PROJECTION_DTO_VERSION,
+                records: Vec::new(),
+                projection: Some(projection),
+            },
+        )?;
+        self.next_projection_chunk += 1;
+        self.chunk_count += 1;
+        Ok(())
+    }
+
+    /// Index entries are scalar records: references and relationship edges never carry an
+    /// unbounded child array.  Fixed fan-out readers group these immutable leaves by hash.
+    fn write_indexes(
+        &mut self,
+        session: &FragileSessionReference,
+        subagent: Option<&FragileSubagentReference>,
+        output: &IndexedOutput,
+    ) -> Result<()> {
+        let session_entry = self.index_entry("reference", session.as_str(), "session");
+        let output_entry = self.index_entry("reference", output.reference.as_str(), "output");
+        let output_parent =
+            self.index_entry("relationship", output.reference.as_str(), session.as_str());
+        self.write_index_chunk(vec![session_entry])?;
+        self.write_index_chunk(vec![output_entry])?;
+        self.write_index_chunk(vec![output_parent])?;
+        if let Some(subagent) = subagent {
+            let subagent_entry = self.index_entry("reference", subagent.as_str(), "subagent");
+            let subagent_parent =
+                self.index_entry("relationship", subagent.as_str(), session.as_str());
+            self.write_index_chunk(vec![subagent_entry])?;
+            self.write_index_chunk(vec![subagent_parent])?;
+        }
+        Ok(())
+    }
+
+    fn write_index_chunk(&mut self, entries: Vec<IndexRecordDto>) -> Result<()> {
+        let locator = IndexLocator::new(format!(
+            "run-{}-index-{:016x}",
+            self.source_key.configured_occurrence(),
+            self.next_projection_chunk
+        ));
+        self.staging.write_chunk(
+            &locator,
+            IndexFileKind::ReferenceIndex,
+            &IndexChunk {
+                schema_version: TYPED_PROJECTION_DTO_VERSION,
+                records: entries,
+                projection: None,
+            },
+        )?;
+        self.next_projection_chunk += 1;
+        self.chunk_count += 1;
+        Ok(())
+    }
+
+    fn index_entry(&self, kind: &str, key: &str, value: &str) -> IndexRecordDto {
+        IndexRecordDto {
+            schema_version: TYPED_PROJECTION_DTO_VERSION,
+            record_kind: 40,
+            fields: vec![
+                IndexFieldDto {
+                    name: "index-kind".to_owned(),
+                    bytes: kind.as_bytes().to_vec(),
+                },
+                IndexFieldDto {
+                    name: "key-hash".to_owned(),
+                    bytes: blake3::hash(key.as_bytes()).as_bytes().to_vec(),
+                },
+                IndexFieldDto {
+                    name: "exact-key".to_owned(),
+                    bytes: key.as_bytes().to_vec(),
+                },
+                IndexFieldDto {
+                    name: "exact-value".to_owned(),
+                    bytes: value.as_bytes().to_vec(),
+                },
+            ],
+        }
+    }
+
+    fn size_dto(
+        &self,
+        byte_count: u64,
+        line_count: u64,
+        segment_count: u64,
+        certainty: u8,
+    ) -> ProjectionSizeDto {
+        ProjectionSizeDto {
+            byte_count: Some(byte_count),
+            line_count: Some(line_count),
+            segment_count: Some(segment_count),
+            certainty,
+        }
+    }
+
+    fn disk_path(&self, path: &std::path::Path) -> DiskPath {
+        DiskPath::new(
+            path.as_os_str().as_encoded_bytes().to_vec(),
+            path.display().to_string(),
+        )
+    }
+
+    fn output_dto(&self, output: &IndexedOutput) -> ProjectionOutputDto {
+        ProjectionOutputDto {
+            reference: output.reference.as_str().to_owned(),
+            session_reference: output.session_reference.as_str().to_owned(),
+            subagent_reference: output
+                .subagent_reference
+                .as_ref()
+                .map(|reference| reference.as_str().to_owned()),
+            title: output.title.as_ref().map(|title| title.as_str().to_owned()),
+            task: output.task.as_ref().map(|task| ProjectionTaskDto {
+                task_identifier: task.task_identifier.as_str().to_owned(),
+            }),
+            source: SourceKindCode::new(output.provenance.source).code(),
+            source_identifier: output.provenance.source_identifier.as_str().to_owned(),
+            authored_status: AuthoredStatusCode::new(output.provenance.authored_status).code(),
+            produced_at: output
+                .provenance
+                .produced_at
+                .as_ref()
+                .map(|timestamp| timestamp.as_str().to_owned()),
+            path: self.disk_path(&output.path),
+            fingerprint_bytes: output.fingerprint.byte_count,
+            fingerprint_seconds: output.fingerprint.modified_seconds,
+            fingerprint_nanoseconds: output.fingerprint.modified_nanoseconds,
+            source_line_number: output.source_line_number,
+            text_hash: output.text_hash.clone(),
+            size: self.size_dto(
+                output.size.byte_count.map_or(0, |count| count.into_u64()),
+                output.size.line_count.map_or(0, |count| count.into_u64()),
+                output
+                    .size
+                    .segment_count
+                    .map_or(0, |count| count.into_u64()),
+                1,
+            ),
+            preview_text: output.preview_text.clone(),
+            preview_original_bytes: output.preview_original_bytes,
+        }
+    }
+
+    fn segment_dto(&self, segment: &IndexedOutputSegment) -> ProjectionSegmentDto {
+        ProjectionSegmentDto {
+            reference: segment.reference.as_str().to_owned(),
+            output_reference: segment.output_reference.as_str().to_owned(),
+            segment_index: segment.segment_index.into_u64(),
+            byte_range: segment
+                .byte_range
+                .as_ref()
+                .map(|range| (range.start.into_u64(), range.end.into_u64())),
+            line_range: segment
+                .line_range
+                .as_ref()
+                .map(|range| (range.start.into_u64(), range.end.into_u64())),
+            size: self.size_dto(
+                segment.size.byte_count.map_or(0, |count| count.into_u64()),
+                segment.size.line_count.map_or(0, |count| count.into_u64()),
+                segment
+                    .size
+                    .segment_count
+                    .map_or(0, |count| count.into_u64()),
+                1,
+            ),
+            preview_text: segment.preview_text.clone(),
+            preview_original_bytes: segment.preview_original_bytes,
+            source: SourceKindCode::new(segment.source).code(),
+            path: self.disk_path(&segment.path),
+        }
+    }
+
+    fn block_dto(&self, block: &IndexedTranscriptBlock) -> ProjectionTranscriptBlockDto {
+        ProjectionTranscriptBlockDto {
+            reference: block.reference.as_str().to_owned(),
+            session_reference: block.session_reference.as_str().to_owned(),
+            subagent_reference: block
+                .subagent_reference
+                .as_ref()
+                .map(|reference| reference.as_str().to_owned()),
+            kind: TranscriptBlockKindCode::new(block.kind).code(),
+            block_index: block.block_index.into_u64(),
+            task: block.task.as_ref().map(|task| ProjectionTaskDto {
+                task_identifier: task.task_identifier.as_str().to_owned(),
+            }),
+            source: SourceKindCode::new(block.provenance.source).code(),
+            source_identifier: block.provenance.source_identifier.as_str().to_owned(),
+            authored_status: AuthoredStatusCode::new(block.provenance.authored_status).code(),
+            observed_at: block
+                .provenance
+                .observed_at
+                .as_ref()
+                .map(|timestamp| timestamp.as_str().to_owned()),
+            path: self.disk_path(&block.path),
+            fingerprint_bytes: block.fingerprint.byte_count,
+            fingerprint_seconds: block.fingerprint.modified_seconds,
+            fingerprint_nanoseconds: block.fingerprint.modified_nanoseconds,
+            source_line_number: block.source_line_number,
+            text_hash: block.text_hash.clone(),
+            size: self.size_dto(
+                block.size.byte_count.map_or(0, |count| count.into_u64()),
+                block.size.line_count.map_or(0, |count| count.into_u64()),
+                block.size.segment_count.map_or(0, |count| count.into_u64()),
+                1,
+            ),
+            text_availability: TranscriptBlockTextAvailabilityCode::new(block.text_availability)
+                .code(),
+            preview_text: block.preview_text.clone(),
+            preview_original_bytes: block.preview_original_bytes,
+        }
+    }
+
     fn flush(&mut self) -> Result<()> {
         if self.records.is_empty() {
             return Ok(());
@@ -399,6 +753,84 @@ impl BoundedGenerationBuilder {
 impl TranscriptRecordSink for BoundedGenerationBuilder {
     fn observe_record(&mut self, record: TranscriptRecord) {
         self.observe_normalized(record);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SourceKindCode {
+    source: SourceKind,
+}
+impl SourceKindCode {
+    fn new(source: SourceKind) -> Self {
+        Self { source }
+    }
+    fn code(self) -> u8 {
+        match self.source {
+            SourceKind::Claude => 1,
+            SourceKind::ClaudeSubagentOutput => 2,
+            SourceKind::Codex => 3,
+            SourceKind::Pi => 4,
+            SourceKind::PiSubagentOutput => 5,
+            SourceKind::Repository => 6,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AuthoredStatusCode {
+    status: AuthoredStatus,
+}
+impl AuthoredStatusCode {
+    fn new(status: AuthoredStatus) -> Self {
+        Self { status }
+    }
+    fn code(self) -> u8 {
+        match self.status {
+            AuthoredStatus::AgentAuthored => 1,
+            AuthoredStatus::HumanAuthored => 2,
+            AuthoredStatus::MixedAuthorship => 3,
+            AuthoredStatus::UnknownAuthorship => 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TranscriptBlockKindCode {
+    kind: TranscriptBlockKind,
+}
+impl TranscriptBlockKindCode {
+    fn new(kind: TranscriptBlockKind) -> Self {
+        Self { kind }
+    }
+    fn code(self) -> u8 {
+        match self.kind {
+            TranscriptBlockKind::UserPrompt => 1,
+            TranscriptBlockKind::AgentResponse => 2,
+            TranscriptBlockKind::ToolCall => 3,
+            TranscriptBlockKind::ToolResult => 4,
+            TranscriptBlockKind::Inference => 5,
+            TranscriptBlockKind::SystemInstruction => 6,
+            TranscriptBlockKind::Attachment => 7,
+            TranscriptBlockKind::SessionEvent => 8,
+            TranscriptBlockKind::Unclassified => 9,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TranscriptBlockTextAvailabilityCode {
+    availability: TranscriptBlockTextAvailability,
+}
+impl TranscriptBlockTextAvailabilityCode {
+    fn new(availability: TranscriptBlockTextAvailability) -> Self {
+        Self { availability }
+    }
+    fn code(self) -> u8 {
+        match self.availability {
+            TranscriptBlockTextAvailability::ReadableText => 1,
+            TranscriptBlockTextAvailability::UnavailableText => 2,
+            TranscriptBlockTextAvailability::EncryptedText => 3,
+        }
     }
 }
 
