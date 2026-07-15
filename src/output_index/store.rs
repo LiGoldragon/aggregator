@@ -146,66 +146,6 @@ impl IndexStore {
         Ok(ChunkReader::new(path, kind, self.limits))
     }
 
-    /// Reads one source-slot checkpoint from its durable location. Checkpoints are deliberately
-    /// outside staging: an interrupted refresh must resume without first publishing incomplete
-    /// query truth.
-    pub fn read_persisted_checkpoint(&self, locator: &IndexLocator) -> Result<Option<IndexChunk>> {
-        locator.validate_component()?;
-        let path = self.data_root.join("checkpoints").join(locator.as_str());
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-                    return Err(Error::index_store(IndexStoreError::UnsafePath));
-                }
-                ChunkReader::new(path, IndexFileKind::Checkpoint, self.limits)
-                    .read()
-                    .map(Some)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(Error::index_store(IndexStoreError::io(
-                "reading persisted checkpoint metadata",
-                error,
-            ))),
-        }
-    }
-
-    /// Atomically replaces the bounded checkpoint for one configured source occurrence.
-    pub fn replace_persisted_checkpoint(
-        &self,
-        locator: &IndexLocator,
-        chunk: &IndexChunk,
-    ) -> Result<()> {
-        locator.validate_component()?;
-        self.ensure_root()?;
-        let directory = self.data_root.join("checkpoints");
-        let temporary = directory.join(format!(
-            ".{}.{}.tmp",
-            locator.as_str(),
-            UniqueGeneration::new("checkpoint").as_str()
-        ));
-        ChunkWriter::new(temporary.clone(), IndexFileKind::Checkpoint, self.limits).write(chunk)?;
-        fs::rename(&temporary, directory.join(locator.as_str())).map_err(|error| {
-            Error::index_store(IndexStoreError::io(
-                "publishing persisted checkpoint",
-                error,
-            ))
-        })?;
-        self.sync_directory(Some(&directory))
-    }
-
-    pub fn remove_persisted_checkpoint(&self, locator: &IndexLocator) -> Result<()> {
-        locator.validate_component()?;
-        let path = self.data_root.join("checkpoints").join(locator.as_str());
-        match fs::remove_file(&path) {
-            Ok(()) => self.sync_directory(path.parent()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(Error::index_store(IndexStoreError::io(
-                "removing persisted checkpoint",
-                error,
-            ))),
-        }
-    }
-
     /// Visits projection leaves in the published generation in deterministic locator order.
     /// The visitor owns only the current validated chunk; it never receives a corpus-sized
     /// locator collection.
@@ -572,7 +512,6 @@ impl IndexStore {
             "snapshots",
             "staging",
             "migration",
-            "checkpoints",
         ] {
             self.ensure_directory(&self.data_root.join(name))?;
         }
