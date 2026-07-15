@@ -3447,15 +3447,21 @@ fn live_index_reconciles_current_evidence_idempotently_and_removes_stale_records
         .expect("replacement refresh");
     assert_eq!(replacement.blocks.len(), 1);
     assert_ne!(replacement.blocks[0].reference, first.blocks[0].reference);
-    let replacement_index = serde_json::from_slice::<serde_json::Value>(
-        &fs::read(index_store.path()).expect("replacement index bytes"),
+    let replacement_pointer = aggregator::output_index::store::IndexStore::new(
+        index_store.path().to_path_buf(),
+        aggregator::output_index::limits::IndexStoreLimits::default(),
     )
-    .expect("version two index json");
-    assert_eq!(replacement_index["version"], 2);
-    assert!(replacement_index.get("active_outputs").is_none());
+    .read_current_pointer()
+    .expect("read v3 pointer")
+    .expect("published v3 pointer");
+    assert_eq!(replacement_pointer.format_version, 3);
     assert_eq!(
-        replacement_index["outputs"].as_array().map(Vec::len),
-        Some(1)
+        index_store
+            .read_current()
+            .expect("read typed replacement")
+            .all_outputs()
+            .count(),
+        1
     );
 
     fs::remove_file(&transcript).expect("remove evidence");
@@ -3463,11 +3469,16 @@ fn live_index_reconciles_current_evidence_idempotently_and_removes_stale_records
         .list_transcript_blocks(request)
         .expect("deletion refresh");
     assert!(removed.blocks.is_empty());
-    let removed_bytes = fs::read(index_store.path()).expect("deletion index bytes");
-    let removed_index =
-        serde_json::from_slice::<serde_json::Value>(&removed_bytes).expect("deletion index json");
-    assert_eq!(removed_index["outputs"].as_array().map(Vec::len), Some(0));
-    assert!(removed_bytes.len() < first_bytes.len());
+    let removed_bytes = fs::read(index_store.path()).expect("deletion pointer bytes");
+    assert!(
+        index_store
+            .read_current()
+            .expect("read typed deletion")
+            .all_outputs()
+            .next()
+            .is_none()
+    );
+    assert_ne!(removed_bytes, first_bytes);
 }
 
 #[test]
@@ -3580,11 +3591,13 @@ fn legacy_index_is_discarded_without_decode_and_failed_replacement_keeps_last_in
         .write(&DurableFragileIndex::empty())
         .expect("replace legacy index atomically");
     let committed = fs::read(store.path()).expect("committed index");
-    assert!(committed.starts_with(b"{\"version\":2,"));
-    fs::create_dir(store.temporary_path()).expect("block temporary replacement");
-    assert!(store.write(&DurableFragileIndex::empty()).is_err());
+    assert!(committed.starts_with(b"{\"schema_version\":1,\"format_version\":3,"));
+    fs::create_dir(store.temporary_path()).expect("stale legacy temporary");
+    store
+        .write(&DurableFragileIndex::empty())
+        .expect("unique v3 pointer publication ignores stale temporary");
     assert_eq!(
-        fs::read(store.path()).expect("index after failed replacement"),
+        fs::read(store.path()).expect("unchanged typed pointer"),
         committed
     );
 }

@@ -1,4 +1,5 @@
 pub mod build;
+pub mod cursor;
 pub mod instrumentation;
 pub mod limits;
 pub mod migration_v2;
@@ -10,7 +11,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
@@ -20,11 +21,11 @@ use serde_json::{Value, json};
 use signal_aggregator::{
     AuthoredStatus, AuthoredStatusFilter, ByteCount, ByteLimit, ByteRange, CardProjection,
     DurationUnit, FilesystemPath, FragileOutputReference, FragileOutputSegmentReference,
-    FragilePageCursor, FragileSessionReference, FragileSubagentReference,
-    FragileTranscriptBlockReference, IndexHealth, ItemCount, LineCount, LineNumber, LineRange,
-    ListingOrder, OperationKind, OperationRejected, OperationRejectionReason, OutputCard,
-    OutputEstimateRequest, OutputEstimated, OutputListFilter, OutputListRequest, OutputProvenance,
-    OutputRead, OutputReadRange, OutputReadRequest, OutputSegmentCard, OutputSegmentListFilter,
+    FragileSessionReference, FragileSubagentReference, FragileTranscriptBlockReference,
+    IndexHealth, ItemCount, LineCount, LineNumber, LineRange, ListingOrder, OperationKind,
+    OperationRejected, OperationRejectionReason, OutputCard, OutputEstimateRequest,
+    OutputEstimated, OutputListFilter, OutputListRequest, OutputProvenance, OutputRead,
+    OutputReadRange, OutputReadRequest, OutputSegmentCard, OutputSegmentListFilter,
     OutputSegmentListRequest, OutputSegmentsListed, OutputText, OutputTextExcerpt, OutputsListed,
     PageLimit, PageMetadata, PageRequest, RejectedFragileReference, RequestIdentifier,
     RootRelativePath, RuntimeCapabilities, RuntimeCapabilityStatus, RuntimeHealthObserved,
@@ -71,7 +72,7 @@ impl OutputInterfaceRuntime {
     }
 
     pub fn observe_health(&self, request: RuntimeHealthRequest) -> RuntimeHealthObserved {
-        let current = CurrentIndexBuilder::new(self.configuration.clone()).build();
+        let current = RuntimeIndexBuild::new(self.configuration.clone()).build();
         let index_status =
             FragileIndexStore::from_store_path(self.configuration.store_path()).health_status();
         let sources = self
@@ -118,6 +119,20 @@ impl OutputInterfaceRuntime {
             refreshed.scans,
         )
         .build();
+        if inventory.sessions.len() as u64
+            > self
+                .configuration
+                .output_interfaces()
+                .limits()
+                .maximum_page_items
+                .into_u64()
+        {
+            return Err(OperationRejectedFactory::new(
+                request.request_identifier,
+                OperationKind::InventorySessions,
+            )
+            .oversized(None));
+        }
         Ok(SessionsInventoried {
             request_identifier: request.request_identifier,
             sessions: inventory.sessions,
@@ -144,7 +159,21 @@ impl OutputInterfaceRuntime {
             .sessions
             .into_iter()
             .filter(|session| SessionLookupMatcher::new(&request.selector).accepts(session))
-            .collect();
+            .collect::<Vec<_>>();
+        if sessions.len() as u64
+            > self
+                .configuration
+                .output_interfaces()
+                .limits()
+                .maximum_page_items
+                .into_u64()
+        {
+            return Err(OperationRejectedFactory::new(
+                request.request_identifier,
+                OperationKind::LookupSession,
+            )
+            .oversized(None));
+        }
         Ok(SessionLookedUp {
             request_identifier: request.request_identifier,
             sessions,
@@ -200,8 +229,7 @@ impl OutputInterfaceRuntime {
             OperationKind::ListSessions,
         )?;
         let mut sessions = index
-            .current_sessions()
-            .into_iter()
+            .all_sessions()
             .filter(|session| {
                 SourceSelectionFilter::new(&request.filter.source_selection).accepts(session.source)
             })
@@ -247,8 +275,7 @@ impl OutputInterfaceRuntime {
             OperationKind::ListSubagents,
         )?;
         let mut subagents = index
-            .current_subagents()
-            .into_iter()
+            .all_subagents()
             .filter(|subagent| subagent.session_reference == request.filter.session_reference)
             .filter(|subagent| {
                 AuthoredStatusFilterMatcher::new(&request.filter.authored_status)
@@ -316,8 +343,7 @@ impl OutputInterfaceRuntime {
             OperationKind::ListOutputs,
         )?;
         let mut outputs = index
-            .current_outputs()
-            .into_iter()
+            .all_outputs()
             .filter(|output| {
                 SourceSelectionFilter::new(&request.filter.source_selection)
                     .accepts(output.provenance.source)
@@ -401,8 +427,7 @@ impl OutputInterfaceRuntime {
             OperationKind::ListOutputSegments,
         )?;
         let mut segments = index
-            .current_segments()
-            .into_iter()
+            .all_segments()
             .filter(|segment| segment.output_reference == request.filter.output_reference)
             .collect::<Vec<_>>();
         IndexedSegmentSorter::new(request.page.order).sort(&mut segments);
@@ -529,7 +554,7 @@ impl OutputInterfaceRuntime {
         )?;
         let mut blocks =
             TranscriptBlockFilterMatcher::new(&request.filter, lowered_time_window.as_ref())
-                .matching_blocks(index.current_transcript_blocks());
+                .matching_blocks(index.all_transcript_blocks());
         IndexedTranscriptBlockSorter::new(request.page.order).sort(&mut blocks);
         let page = PaginationWindow::new(
             request.request_identifier.clone(),
@@ -590,14 +615,16 @@ impl OutputInterfaceRuntime {
         )?;
         let mut blocks =
             TranscriptBlockFilterMatcher::new(&request.filter, lowered_time_window.as_ref())
-                .matching_blocks(index.current_transcript_blocks());
+                .matching_blocks(index.all_transcript_blocks());
         IndexedTranscriptBlockSorter::new(request.page.order).sort(&mut blocks);
-        let matches = TranscriptBlockSearcher::new(
+        let matches = StreamingTranscriptBlockSearch::new(
             request.query.clone(),
             self.configuration
                 .output_interfaces()
                 .limits()
                 .maximum_read_bytes,
+            request.page.limit.into_u64(),
+            limits::IndexStoreLimits::default().maximum_query_candidates,
         )
         .search(
             blocks,
@@ -713,8 +740,8 @@ impl OutputInterfaceRuntime {
         let existing_format = store.format().map_err(|_| {
             OperationRejectedFactory::new(request_identifier.clone(), operation).unsupported()
         })?;
-        match CurrentIndexBuilder::new(self.configuration.clone()).build() {
-            CurrentIndexBuild::Complete {
+        match RuntimeIndexBuild::new(self.configuration.clone()).build() {
+            RuntimeIndexBuildResult::Complete {
                 index: current,
                 scans,
             } => {
@@ -725,7 +752,7 @@ impl OutputInterfaceRuntime {
                 })?;
                 Ok(RefreshedFragileIndex::new(durable, scans))
             }
-            CurrentIndexBuild::Incomplete {
+            RuntimeIndexBuildResult::Incomplete {
                 index: current,
                 scans,
             } => {
@@ -817,7 +844,7 @@ impl DurableFragileIndex {
         }
     }
 
-    pub fn from_current(current: CurrentFragileIndex) -> Self {
+    pub fn from_current(current: RuntimeBuildIndex) -> Self {
         Self {
             sessions: current.sessions,
             subagents: current.subagents,
@@ -831,24 +858,26 @@ impl DurableFragileIndex {
         self.sessions.is_empty() && self.outputs.is_empty() && self.transcript_blocks.is_empty()
     }
 
-    pub fn current_sessions(&self) -> Vec<IndexedSession> {
-        self.sessions.clone()
+    /// Streams one card at a time. This compatibility snapshot does not hand callers a cloned
+    /// collection, which keeps request-owned page memory independent of the stored collection.
+    pub fn all_sessions(&self) -> impl Iterator<Item = IndexedSession> + '_ {
+        self.sessions.iter().cloned()
     }
 
-    pub fn current_subagents(&self) -> Vec<IndexedSubagent> {
-        self.subagents.clone()
+    pub fn all_subagents(&self) -> impl Iterator<Item = IndexedSubagent> + '_ {
+        self.subagents.iter().cloned()
     }
 
-    pub fn current_outputs(&self) -> Vec<IndexedOutput> {
-        self.outputs.clone()
+    pub fn all_outputs(&self) -> impl Iterator<Item = IndexedOutput> + '_ {
+        self.outputs.iter().cloned()
     }
 
-    pub fn current_segments(&self) -> Vec<IndexedOutputSegment> {
-        self.segments.clone()
+    pub fn all_segments(&self) -> impl Iterator<Item = IndexedOutputSegment> + '_ {
+        self.segments.iter().cloned()
     }
 
-    pub fn current_transcript_blocks(&self) -> Vec<IndexedTranscriptBlock> {
-        self.transcript_blocks.clone()
+    pub fn all_transcript_blocks(&self) -> impl Iterator<Item = IndexedTranscriptBlock> + '_ {
+        self.transcript_blocks.iter().cloned()
     }
 
     pub fn session(&self, reference: &FragileSessionReference) -> Option<IndexedSession> {
@@ -893,30 +922,32 @@ impl DurableFragileIndex {
     }
 
     pub fn collection_signature(&self) -> String {
-        StableHash::new(
-            self.sessions
-                .iter()
-                .map(|session| session.reference.as_str())
-                .chain(
-                    self.subagents
-                        .iter()
-                        .map(|subagent| subagent.reference.as_str()),
-                )
-                .chain(self.outputs.iter().map(|output| output.reference.as_str()))
-                .chain(
-                    self.segments
-                        .iter()
-                        .map(|segment| segment.reference.as_str()),
-                )
-                .chain(
-                    self.transcript_blocks
-                        .iter()
-                        .map(|block| block.reference.as_str()),
-                )
-                .collect::<Vec<_>>()
-                .join("|"),
-        )
-        .hex()
+        let mut hasher = blake3::Hasher::new();
+        for reference in self
+            .sessions
+            .iter()
+            .map(|session| session.reference.as_str())
+            .chain(
+                self.subagents
+                    .iter()
+                    .map(|subagent| subagent.reference.as_str()),
+            )
+            .chain(self.outputs.iter().map(|output| output.reference.as_str()))
+            .chain(
+                self.segments
+                    .iter()
+                    .map(|segment| segment.reference.as_str()),
+            )
+            .chain(
+                self.transcript_blocks
+                    .iter()
+                    .map(|block| block.reference.as_str()),
+            )
+        {
+            hasher.update(reference.as_bytes());
+            hasher.update(&[0]);
+        }
+        hasher.finalize().to_hex().to_string()
     }
 
     pub fn from_json(value: &Value) -> Self {
@@ -952,7 +983,7 @@ impl DurableFragileIndex {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CurrentFragileIndex {
+pub struct RuntimeBuildIndex {
     sessions: Vec<IndexedSession>,
     subagents: Vec<IndexedSubagent>,
     outputs: Vec<IndexedOutput>,
@@ -960,7 +991,7 @@ pub struct CurrentFragileIndex {
     transcript_blocks: Vec<IndexedTranscriptBlock>,
 }
 
-impl CurrentFragileIndex {
+impl RuntimeBuildIndex {
     pub fn new(
         sessions: Vec<IndexedSession>,
         subagents: Vec<IndexedSubagent>,
@@ -979,18 +1010,18 @@ impl CurrentFragileIndex {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CurrentIndexBuild {
+pub enum RuntimeIndexBuildResult {
     Complete {
-        index: CurrentFragileIndex,
+        index: RuntimeBuildIndex,
         scans: Vec<TranscriptRawReadOutcome>,
     },
     Incomplete {
-        index: CurrentFragileIndex,
+        index: RuntimeBuildIndex,
         scans: Vec<TranscriptRawReadOutcome>,
     },
 }
 
-impl CurrentIndexBuild {
+impl RuntimeIndexBuildResult {
     pub fn health_counts(&self) -> (u64, u64, u64, u64) {
         let index = self.index();
         (
@@ -1001,7 +1032,7 @@ impl CurrentIndexBuild {
         )
     }
 
-    pub fn index(&self) -> &CurrentFragileIndex {
+    pub fn index(&self) -> &RuntimeBuildIndex {
         match self {
             Self::Complete { index, .. } | Self::Incomplete { index, .. } => index,
         }
@@ -1015,17 +1046,17 @@ impl CurrentIndexBuild {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CurrentIndexBuilder {
+pub struct RuntimeIndexBuild {
     configuration: RuntimeConfiguration,
 }
 
-impl CurrentIndexBuilder {
+impl RuntimeIndexBuild {
     pub fn new(configuration: RuntimeConfiguration) -> Self {
         Self { configuration }
     }
 
-    pub fn build(&self) -> CurrentIndexBuild {
-        let mut accumulator = CurrentIndexAccumulator::new(
+    pub fn build(&self) -> RuntimeIndexBuildResult {
+        let mut accumulator = RuntimeBuildAccumulator::new(
             self.configuration
                 .output_interfaces()
                 .limits()
@@ -1040,9 +1071,9 @@ impl CurrentIndexBuilder {
         }
         let index = accumulator.finish();
         if complete {
-            CurrentIndexBuild::Complete { index, scans }
+            RuntimeIndexBuildResult::Complete { index, scans }
         } else {
-            CurrentIndexBuild::Incomplete { index, scans }
+            RuntimeIndexBuildResult::Incomplete { index, scans }
         }
     }
 
@@ -1228,8 +1259,7 @@ impl SessionInventoryBuilder {
             .collect::<BTreeMap<_, _>>();
         let mut sessions = self
             .index
-            .current_sessions()
-            .into_iter()
+            .all_sessions()
             .filter(|session| {
                 SourceSelectionFilter::new(&self.source_selection).accepts(session.source)
             })
@@ -1303,8 +1333,7 @@ impl SessionInventoryBuilder {
             });
         let sessions = self
             .index
-            .current_sessions()
-            .into_iter()
+            .all_sessions()
             .filter(|session| {
                 session.source == source.kind()
                     && session.source_identifier
@@ -1526,18 +1555,18 @@ impl<'a> TimestampOrderingOption<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CurrentIndexAccumulator {
-    sessions: BTreeMap<String, SessionAccumulator>,
+pub struct RuntimeBuildAccumulator {
+    sessions: BTreeMap<String, SessionReducer>,
     preview_limit: ByteLimit,
 }
 
-impl TranscriptRecordSink for CurrentIndexAccumulator {
+impl TranscriptRecordSink for RuntimeBuildAccumulator {
     fn observe_record(&mut self, record: TranscriptRecord) {
         self.observe(record);
     }
 }
 
-impl CurrentIndexAccumulator {
+impl RuntimeBuildAccumulator {
     pub fn new(preview_limit: ByteLimit) -> Self {
         Self {
             sessions: BTreeMap::new(),
@@ -1556,7 +1585,7 @@ impl CurrentIndexAccumulator {
         self.sessions
             .entry(session_key)
             .or_insert_with(|| {
-                SessionAccumulator::new(
+                SessionReducer::new(
                     record.source,
                     record.source_identifier.clone(),
                     record.path.clone(),
@@ -1566,7 +1595,7 @@ impl CurrentIndexAccumulator {
             .observe(record);
     }
 
-    pub fn finish(self) -> CurrentFragileIndex {
+    pub fn finish(self) -> RuntimeBuildIndex {
         let mut sessions = Vec::new();
         let mut subagents = Vec::new();
         let mut outputs = Vec::new();
@@ -1586,7 +1615,7 @@ impl CurrentIndexAccumulator {
         segments.sort_by(|left, right| left.reference.as_str().cmp(right.reference.as_str()));
         transcript_blocks
             .sort_by(|left, right| left.reference.as_str().cmp(right.reference.as_str()));
-        CurrentFragileIndex::new(sessions, subagents, outputs, segments, transcript_blocks)
+        RuntimeBuildIndex::new(sessions, subagents, outputs, segments, transcript_blocks)
     }
 }
 
@@ -1621,7 +1650,7 @@ impl<'a> TranscriptRecordSessionKey<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionAccumulator {
+pub struct SessionReducer {
     source: SourceKind,
     source_identifier: signal_aggregator::SourceIdentifier,
     path: PathBuf,
@@ -1630,14 +1659,14 @@ pub struct SessionAccumulator {
     outputs: Vec<IndexedOutput>,
     segments: Vec<IndexedOutputSegment>,
     transcript_blocks: Vec<IndexedTranscriptBlock>,
-    subagents: BTreeMap<String, SubagentAccumulator>,
+    subagents: BTreeMap<String, SubagentReducer>,
     size: SizeAccumulator,
     started_at: Option<Timestamp>,
     last_observed_at: Option<Timestamp>,
     session_identifier: Option<SessionIdentifier>,
 }
 
-impl SessionAccumulator {
+impl SessionReducer {
     pub fn new(
         source: SourceKind,
         source_identifier: signal_aggregator::SourceIdentifier,
@@ -1690,7 +1719,7 @@ impl SessionAccumulator {
             self.subagents
                 .entry(key)
                 .or_insert_with(|| {
-                    SubagentAccumulator::new(session_reference.clone(), subagent_reference, name)
+                    SubagentReducer::new(session_reference.clone(), subagent_reference, name)
                 })
                 .observe(&output);
         }
@@ -1753,14 +1782,14 @@ impl SessionAccumulator {
         )
     }
 
-    pub fn finish(self) -> IndexedSessionBundle {
+    pub fn finish(self) -> ReducedSessionBundle {
         let session_reference = self.session_reference();
         let subagents = self
             .subagents
             .into_values()
-            .map(SubagentAccumulator::finish)
+            .map(SubagentReducer::finish)
             .collect::<Vec<_>>();
-        IndexedSessionBundle {
+        ReducedSessionBundle {
             session: IndexedSession {
                 reference: session_reference,
                 source: self.source,
@@ -1790,7 +1819,7 @@ impl SessionAccumulator {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IndexedSessionBundle {
+pub struct ReducedSessionBundle {
     session: IndexedSession,
     subagents: Vec<IndexedSubagent>,
     outputs: Vec<IndexedOutput>,
@@ -1799,7 +1828,7 @@ pub struct IndexedSessionBundle {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SubagentAccumulator {
+pub struct SubagentReducer {
     session_reference: FragileSessionReference,
     reference: FragileSubagentReference,
     name: signal_aggregator::SubagentName,
@@ -1811,7 +1840,7 @@ pub struct SubagentAccumulator {
     last_observed_at: Option<Timestamp>,
 }
 
-impl SubagentAccumulator {
+impl SubagentReducer {
     pub fn new(
         session_reference: FragileSessionReference,
         reference: FragileSubagentReference,
@@ -2570,12 +2599,14 @@ impl IndexedTranscriptBlock {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FragileIndexStore {
     path: PathBuf,
+    limits: limits::IndexStoreLimits,
 }
 
 impl FragileIndexStore {
     pub fn from_store_path(store_path: &Path) -> Self {
         Self {
             path: RuntimeStorePath::new(store_path.to_path_buf()).fragile_index_path(),
+            limits: limits::IndexStoreLimits::default(),
         }
     }
 
@@ -2603,35 +2634,193 @@ impl FragileIndexStore {
         }
     }
 
+    /// Publishes the compatibility pointer and immutable typed v3 chunks. The pointer remains at
+    /// its established path; collection bodies are never written as a replacement JSON corpus.
     pub fn write(&self, index: &DurableFragileIndex) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| Error::io("creating fragile output index directory", error))?;
+        use schema::{IndexChunk, IndexFileKind};
+        use store::{IndexLocator, IndexStore};
+
+        let store = IndexStore::new(self.path.clone(), self.limits);
+        // A v2 document is never decoded on the live path. Preserve its immutable migration
+        // evidence, then remove only the compatibility pointer so v3 publication can establish
+        // the normal compare-and-swap root without accepting an oversized JSON pointer.
+        if matches!(self.format(), Ok(FragileIndexFormat::Legacy)) {
+            store.retain_v2_backup(&self.path)?;
+            fs::remove_file(&self.path)
+                .map_err(|error| Error::io("retiring migrated v2 index pointer", error))?;
         }
-        let temporary_path = self.temporary_path();
-        let mut temporary = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary_path)
-            .map_err(|error| Error::io("creating fragile output index temporary file", error))?;
-        let write_result = IndexJsonStream::new(index)
-            .write_to(&mut temporary)
-            .and_then(|_| {
-                temporary
-                    .sync_all()
-                    .map_err(|error| Error::io("syncing fragile output index", error))
+        let identity = *blake3::hash(
+            &serde_json::to_vec(&index.collection_signature()).map_err(|error| {
+                Error::protocol("typed fragile index identity", error.to_string())
+            })?,
+        )
+        .as_bytes();
+        if matches!(self.format(), Ok(FragileIndexFormat::Current))
+            && store
+                .read_current_pointer()?
+                .is_some_and(|pointer| pointer.snapshot_identity == identity)
+        {
+            return Ok(());
+        }
+        let staging = store.create_staging("runtime-index")?;
+        let mut manifest_records = Vec::new();
+        let mut sequence = 0_u64;
+        self.write_collection(
+            &staging,
+            "sessions",
+            index.sessions.iter().map(IndexedSession::to_json),
+            &mut sequence,
+            &mut manifest_records,
+        )?;
+        self.write_collection(
+            &staging,
+            "subagents",
+            index.subagents.iter().map(IndexedSubagent::to_json),
+            &mut sequence,
+            &mut manifest_records,
+        )?;
+        self.write_collection(
+            &staging,
+            "outputs",
+            index.outputs.iter().map(IndexedOutput::to_json),
+            &mut sequence,
+            &mut manifest_records,
+        )?;
+        self.write_collection(
+            &staging,
+            "segments",
+            index.segments.iter().map(IndexedOutputSegment::to_json),
+            &mut sequence,
+            &mut manifest_records,
+        )?;
+        self.write_collection(
+            &staging,
+            "transcript-blocks",
+            index
+                .transcript_blocks
+                .iter()
+                .map(IndexedTranscriptBlock::to_json),
+            &mut sequence,
+            &mut manifest_records,
+        )?;
+        let manifest = IndexLocator::new("manifest");
+        staging.write_chunk(
+            &manifest,
+            IndexFileKind::Manifest,
+            &IndexChunk {
+                schema_version: 1,
+                records: manifest_records,
+            },
+        )?;
+        store.publish(&staging, &manifest, identity)?;
+        Ok(())
+    }
+
+    fn write_collection(
+        &self,
+        staging: &store::IndexStaging,
+        collection: &str,
+        values: impl Iterator<Item = Value>,
+        sequence: &mut u64,
+        manifest_records: &mut Vec<schema::IndexRecordDto>,
+    ) -> Result<()> {
+        use schema::{IndexFieldDto, IndexRecordDto};
+
+        let mut records = Vec::new();
+        let mut logical_bytes = 0_u64;
+        for value in values {
+            let payload = serde_json::to_vec(&value).map_err(|error| {
+                Error::protocol("typed fragile index encode", error.to_string())
+            })?;
+            let record_bytes = collection.len() as u64 + payload.len() as u64;
+            if record_bytes > self.limits.maximum_record_bytes {
+                return Err(Error::index_store(
+                    crate::error::IndexStoreError::OversizedRecord,
+                ));
+            }
+            if !records.is_empty()
+                && !self.limits.accepts_chunk(
+                    logical_bytes.saturating_add(record_bytes),
+                    records.len() as u64 + 1,
+                )
+            {
+                self.write_collection_chunk(
+                    staging,
+                    collection,
+                    sequence,
+                    manifest_records,
+                    &mut records,
+                )?;
+                logical_bytes = 0;
+            }
+            logical_bytes = logical_bytes.saturating_add(record_bytes);
+            records.push(IndexRecordDto {
+                schema_version: 1,
+                record_kind: 20,
+                fields: vec![
+                    IndexFieldDto {
+                        name: "collection".to_owned(),
+                        bytes: collection.as_bytes().to_vec(),
+                    },
+                    IndexFieldDto {
+                        name: "json".to_owned(),
+                        bytes: payload,
+                    },
+                ],
             });
-        if let Err(error) = write_result {
-            let _ = fs::remove_file(&temporary_path);
-            return Err(error);
         }
-        fs::rename(&temporary_path, &self.path)
-            .map_err(|error| Error::io("committing fragile output index", error))?;
-        if let Some(parent) = self.path.parent() {
-            fs::File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|error| Error::io("syncing fragile output index directory", error))?;
+        if !records.is_empty() {
+            self.write_collection_chunk(
+                staging,
+                collection,
+                sequence,
+                manifest_records,
+                &mut records,
+            )?;
         }
+        Ok(())
+    }
+
+    fn write_collection_chunk(
+        &self,
+        staging: &store::IndexStaging,
+        collection: &str,
+        sequence: &mut u64,
+        manifest_records: &mut Vec<schema::IndexRecordDto>,
+        records: &mut Vec<schema::IndexRecordDto>,
+    ) -> Result<()> {
+        use schema::{IndexChunk, IndexFieldDto, IndexFileKind, IndexRecordDto};
+        use store::IndexLocator;
+
+        let locator = IndexLocator::new(format!("records-{}-{:016x}", collection, *sequence));
+        *sequence += 1;
+        staging.write_chunk(
+            &locator,
+            IndexFileKind::Chunk,
+            &IndexChunk {
+                schema_version: 1,
+                records: std::mem::take(records),
+            },
+        )?;
+        manifest_records.push(IndexRecordDto {
+            schema_version: 1,
+            record_kind: 21,
+            fields: vec![
+                IndexFieldDto {
+                    name: "collection".to_owned(),
+                    bytes: collection.as_bytes().to_vec(),
+                },
+                IndexFieldDto {
+                    name: "chunk-locator".to_owned(),
+                    bytes: format!(
+                        "generations/{}/{}",
+                        staging.generation().as_str(),
+                        locator.as_str()
+                    )
+                    .into_bytes(),
+                },
+            ],
+        });
         Ok(())
     }
 
@@ -2655,15 +2844,72 @@ impl FragileIndexStore {
         let read = file
             .read(&mut prefix)
             .map_err(|error| Error::io("probing fragile output index version", error))?;
-        IndexFormatProbe::new(&prefix[..read]).format()
+        match migration_v2::IndexFormatProbe::new(&prefix[..read]).format() {
+            migration_v2::IndexFormat::CurrentV3 => Ok(FragileIndexFormat::Current),
+            migration_v2::IndexFormat::Missing => Ok(FragileIndexFormat::Missing),
+            migration_v2::IndexFormat::ObsoleteV1 | migration_v2::IndexFormat::MigratableV2 => {
+                Ok(FragileIndexFormat::Legacy)
+            }
+            migration_v2::IndexFormat::Unsupported => Err(Error::protocol(
+                "fragile output index version",
+                "unsupported version header",
+            )),
+        }
     }
 
     pub fn read_current(&self) -> Result<DurableFragileIndex> {
-        let text = fs::read_to_string(&self.path)
-            .map_err(|error| Error::io("reading fragile output index", error))?;
-        let value = serde_json::from_str::<Value>(&text)
-            .map_err(|error| Error::protocol("fragile output index decode", error.to_string()))?;
-        Ok(DurableFragileIndex::from_json(&value))
+        use schema::IndexFileKind;
+        use store::{IndexLocator, IndexStore};
+
+        let store = IndexStore::new(self.path.clone(), self.limits);
+        let pointer = store.read_current_pointer()?.ok_or_else(|| {
+            Error::protocol("typed fragile output index", "missing v3 current pointer")
+        })?;
+        let manifest = store
+            .open_reader(
+                &IndexLocator::new(pointer.manifest_locator),
+                IndexFileKind::Manifest,
+            )?
+            .read()?;
+        let mut index = DurableFragileIndex::empty();
+        for descriptor in manifest.records {
+            let collection = TypedRecordFields::new(&descriptor).utf8("collection")?;
+            let locator = TypedRecordFields::new(&descriptor).utf8("chunk-locator")?;
+            let chunk = store
+                .open_reader(&IndexLocator::new(locator), IndexFileKind::Chunk)?
+                .read()?;
+            for record in chunk.records {
+                let fields = TypedRecordFields::new(&record);
+                if fields.utf8("collection")? != collection {
+                    return Err(Error::protocol(
+                        "typed fragile output index",
+                        "collection mismatch",
+                    ));
+                }
+                let value =
+                    serde_json::from_slice::<Value>(fields.bytes("json")?).map_err(|error| {
+                        Error::protocol("typed fragile output index decode", error.to_string())
+                    })?;
+                match collection.as_str() {
+                    "sessions" => index.sessions.extend(IndexedSession::from_json(&value)),
+                    "subagents" => index.subagents.extend(IndexedSubagent::from_json(&value)),
+                    "outputs" => index.outputs.extend(IndexedOutput::from_json(&value)),
+                    "segments" => index
+                        .segments
+                        .extend(IndexedOutputSegment::from_json(&value)),
+                    "transcript-blocks" => index
+                        .transcript_blocks
+                        .extend(IndexedTranscriptBlock::from_json(&value)),
+                    _ => {
+                        return Err(Error::protocol(
+                            "typed fragile output index",
+                            "unknown collection",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(index)
     }
 }
 
@@ -2674,104 +2920,29 @@ pub enum FragileIndexFormat {
     Current,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IndexFormatProbe<'a> {
-    prefix: &'a [u8],
+#[derive(Debug, Clone, Copy)]
+struct TypedRecordFields<'a> {
+    record: &'a schema::IndexRecordDto,
 }
 
-impl<'a> IndexFormatProbe<'a> {
-    pub fn new(prefix: &'a [u8]) -> Self {
-        Self { prefix }
+impl<'a> TypedRecordFields<'a> {
+    fn new(record: &'a schema::IndexRecordDto) -> Self {
+        Self { record }
     }
 
-    pub fn format(&self) -> Result<FragileIndexFormat> {
-        let compact = self
-            .prefix
+    fn bytes(self, name: &str) -> Result<&'a [u8]> {
+        self.record
+            .fields
             .iter()
-            .filter(|byte| !byte.is_ascii_whitespace())
-            .copied()
-            .collect::<Vec<_>>();
-        if compact.starts_with(b"{\"version\":2,") {
-            return Ok(FragileIndexFormat::Current);
-        }
-        if compact.starts_with(b"{\"version\":1,") {
-            return Ok(FragileIndexFormat::Legacy);
-        }
-        Err(Error::protocol(
-            "fragile output index version",
-            "missing or unsupported version header",
-        ))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IndexJsonStream<'a> {
-    index: &'a DurableFragileIndex,
-}
-
-impl<'a> IndexJsonStream<'a> {
-    pub fn new(index: &'a DurableFragileIndex) -> Self {
-        Self { index }
+            .find(|field| field.name == name)
+            .map(|field| field.bytes.as_slice())
+            .ok_or_else(|| Error::protocol("typed fragile output index", "missing record field"))
     }
 
-    pub fn write_to(&self, writer: &mut fs::File) -> Result<()> {
-        self.write_bytes(writer, b"{\"version\":2")?;
-        self.write_values(
-            writer,
-            "sessions",
-            self.index.sessions.iter().map(IndexedSession::to_json),
-        )?;
-        self.write_values(
-            writer,
-            "subagents",
-            self.index.subagents.iter().map(IndexedSubagent::to_json),
-        )?;
-        self.write_values(
-            writer,
-            "outputs",
-            self.index.outputs.iter().map(IndexedOutput::to_json),
-        )?;
-        self.write_values(
-            writer,
-            "segments",
-            self.index
-                .segments
-                .iter()
-                .map(IndexedOutputSegment::to_json),
-        )?;
-        self.write_values(
-            writer,
-            "transcript_blocks",
-            self.index
-                .transcript_blocks
-                .iter()
-                .map(IndexedTranscriptBlock::to_json),
-        )?;
-        self.write_bytes(writer, b"}")
-    }
-
-    pub fn write_values(
-        &self,
-        writer: &mut fs::File,
-        name: &str,
-        values: impl Iterator<Item = Value>,
-    ) -> Result<()> {
-        self.write_bytes(writer, format!(",\"{name}\":[").as_bytes())?;
-        for (position, value) in values.enumerate() {
-            if position > 0 {
-                self.write_bytes(writer, b",")?;
-            }
-            serde_json::to_writer(&mut *writer, &value).map_err(|error| {
-                Error::protocol("fragile output index encode", error.to_string())
-            })?;
-        }
-        self.write_bytes(writer, b"]")
-    }
-
-    pub fn write_bytes(&self, writer: &mut fs::File, bytes: &[u8]) -> Result<()> {
-        writer
-            .write_all(bytes)
-            .map_err(|error| Error::io("writing fragile output index", error))
+    fn utf8(self, name: &str) -> Result<String> {
+        std::str::from_utf8(self.bytes(name)?)
+            .map(str::to_owned)
+            .map_err(|_| Error::protocol("typed fragile output index", "invalid record field"))
     }
 }
 
@@ -4460,18 +4631,43 @@ impl PaginationCursorBinding {
         }
     }
 
-    pub fn signature<T: PaginatedItemReference>(&self, items: &[T]) -> String {
-        let mut material = StableSignatureMaterial::new("pagination-cursor-binding")
-            .field("signature_version", "2")
+    /// Canonical request material never contains the raw query in a cursor.
+    pub fn query_digest(&self) -> String {
+        StableHash::new(
+            StableSignatureMaterial::new("v3-page-query")
+                .field("collection", self.collection.as_str())
+                .field("order", ListingOrderName::new(self.order).as_str())
+                .field("limit", self.limit.into_u64().to_string())
+                .field("query", self.query.material())
+                .finish(),
+        )
+        .hex()
+    }
+
+    /// The snapshot is content-bound. It intentionally excludes cursor position and request text.
+    pub fn snapshot_identity<T: PaginatedItemReference>(&self, items: &[T]) -> String {
+        let mut material = StableSignatureMaterial::new("v3-page-snapshot")
             .field("collection", self.collection.as_str())
-            .field("order", ListingOrderName::new(self.order).as_str())
-            .field("limit", self.limit.into_u64().to_string())
-            .field("query", self.query.material())
             .field("item_count", items.len().to_string());
         for item in items {
-            material = material.field("item_reference", item.pagination_reference());
+            material = material.field("item", item.pagination_reference());
         }
         StableHash::new(material.finish()).hex()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorSortTuple<'a> {
+    reference: &'a str,
+}
+
+impl<'a> CursorSortTuple<'a> {
+    pub fn new(reference: &'a str) -> Self {
+        Self { reference }
+    }
+
+    pub fn digest(self) -> String {
+        StableHash::new(self.reference).hex()
     }
 }
 
@@ -4511,57 +4707,86 @@ impl<T: Clone + PaginatedItemReference> PaginationWindow<T> {
     }
 
     pub fn select(&self, items: &[T]) -> OutputOperationResult<PaginatedItems<T>> {
-        let signature = self.binding.signature(items);
-        let offset = self.cursor_offset(items.len(), &signature)?;
+        let snapshot_identity = self.binding.snapshot_identity(items);
+        let query_digest = self.binding.query_digest();
+        let start = self.cursor_start(items, &snapshot_identity, &query_digest)?;
         let limit = self.page.limit.into_u64() as usize;
-        let selected = items
-            .iter()
-            .skip(offset)
+        // Materialize at most the requested page and one look-ahead candidate. The collection
+        // provider is responsible for presenting its own bounded candidate stream.
+        let mut page_and_look_ahead = items.iter().skip(start).take(limit + 1);
+        let selected = page_and_look_ahead
+            .by_ref()
             .take(limit)
             .cloned()
             .collect::<Vec<_>>();
-        let next_offset = offset + selected.len();
-        let next_cursor = if next_offset < items.len() {
-            Some(
-                PageCursor::new(self.collection, self.page.order, next_offset, signature)
-                    .to_reference(),
-            )
-        } else {
-            None
-        };
+        let has_more = page_and_look_ahead.next().is_some();
+        let next_cursor = has_more
+            .then(|| {
+                let last = selected
+                    .last()
+                    .expect("look-ahead requires an emitted item");
+                cursor::V3PageCursor::new(
+                    cursor::V3CursorBinding {
+                        collection: self.collection,
+                        order: self.page.order,
+                        limit: self.page.limit,
+                        snapshot_identity,
+                        query_digest,
+                    },
+                    last.pagination_reference().to_owned(),
+                    CursorSortTuple::new(last.pagination_reference()).digest(),
+                    last.pagination_reference().to_owned(),
+                )
+                .to_reference(limits::IndexStoreLimits::default().maximum_cursor_bytes)
+            })
+            .flatten();
         Ok(PaginatedItems {
             items: selected.clone(),
             metadata: PageMetadata {
                 limit: self.page.limit,
                 returned_items: ItemCount::new(selected.len() as u64),
-                total_items: Some(ItemCount::new(items.len() as u64)),
+                // A generic filtered page has no manifest aggregate. Callers that own one may
+                // replace this with the exact count without scanning.
+                total_items: None,
                 next_cursor,
                 order: self.page.order,
             },
         })
     }
 
-    pub fn cursor_offset(
+    pub fn cursor_start(
         &self,
-        item_count: usize,
-        signature: &str,
+        items: &[T],
+        snapshot_identity: &str,
+        query_digest: &str,
     ) -> OutputOperationResult<usize> {
         let Some(cursor) = &self.page.cursor else {
             return Ok(0);
         };
         let factory =
             OperationRejectedFactory::new(self.request_identifier.clone(), self.operation);
-        let parsed = PageCursor::parse(cursor).ok_or_else(|| {
-            factory.stale(Some(RejectedFragileReference::PageCursor(cursor.clone())))
-        })?;
+        let parsed = cursor::V3PageCursor::parse(
+            cursor,
+            limits::IndexStoreLimits::default().maximum_cursor_bytes,
+        )
+        .ok_or_else(|| factory.stale(Some(RejectedFragileReference::PageCursor(cursor.clone()))))?;
         if parsed.collection != self.collection
             || parsed.order != self.page.order
-            || parsed.signature != signature
-            || parsed.offset > item_count
+            || parsed.limit != self.page.limit
+            || parsed.snapshot_identity != snapshot_identity
+            || parsed.query_digest != query_digest
+            || parsed.sort_tuple_digest != CursorSortTuple::new(&parsed.last_reference).digest()
+            || parsed.last_candidate_reference != parsed.last_reference
         {
             return Err(factory.stale(Some(RejectedFragileReference::PageCursor(cursor.clone()))));
         }
-        Ok(parsed.offset)
+        items
+            .iter()
+            .position(|item| item.pagination_reference() == parsed.last_reference)
+            .map(|position| position + 1)
+            .ok_or_else(|| {
+                factory.stale(Some(RejectedFragileReference::PageCursor(cursor.clone())))
+            })
     }
 }
 
@@ -4594,53 +4819,6 @@ impl PageCollectionKind {
             "transcript-blocks" => Some(Self::TranscriptBlocks),
             _ => None,
         }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PageCursor {
-    collection: PageCollectionKind,
-    order: ListingOrder,
-    offset: usize,
-    signature: String,
-}
-
-impl PageCursor {
-    pub fn new(
-        collection: PageCollectionKind,
-        order: ListingOrder,
-        offset: usize,
-        signature: String,
-    ) -> Self {
-        Self {
-            collection,
-            order,
-            offset,
-            signature,
-        }
-    }
-
-    pub fn to_reference(&self) -> FragilePageCursor {
-        FragilePageCursor::new(format!(
-            "cursor:v3:{}:{}:{}:{}",
-            self.collection.as_str(),
-            ListingOrderName::new(self.order).as_str(),
-            self.offset,
-            self.signature
-        ))
-    }
-
-    pub fn parse(reference: &FragilePageCursor) -> Option<Self> {
-        let parts = reference.as_str().split(':').collect::<Vec<_>>();
-        if parts.len() != 6 || parts[0] != "cursor" || parts[1] != "v3" {
-            return None;
-        }
-        Some(Self {
-            collection: PageCollectionKind::parse(parts[2])?,
-            order: ListingOrderName::parse(parts[3])?,
-            offset: parts[4].parse().ok()?,
-            signature: parts[5].to_string(),
-        })
     }
 }
 
@@ -5031,7 +5209,7 @@ impl<'a> TranscriptBlockFilterMatcher<'a> {
 
     pub fn matching_blocks(
         &self,
-        blocks: Vec<IndexedTranscriptBlock>,
+        blocks: impl IntoIterator<Item = IndexedTranscriptBlock>,
     ) -> Vec<IndexedTranscriptBlock> {
         blocks
             .into_iter()
@@ -5125,32 +5303,49 @@ impl IndexedTranscriptBlockSearchMatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TranscriptBlockSearcher {
+pub struct StreamingTranscriptBlockSearch {
     query: TranscriptBlockTextQuery,
     maximum_read_bytes: ByteLimit,
+    page_limit: u64,
+    candidate_budget: u64,
 }
 
-impl TranscriptBlockSearcher {
-    pub fn new(query: TranscriptBlockTextQuery, maximum_read_bytes: ByteLimit) -> Self {
+impl StreamingTranscriptBlockSearch {
+    pub fn new(
+        query: TranscriptBlockTextQuery,
+        maximum_read_bytes: ByteLimit,
+        page_limit: u64,
+        candidate_budget: u64,
+    ) -> Self {
         Self {
             query,
             maximum_read_bytes,
+            page_limit,
+            candidate_budget,
         }
     }
 
     pub fn search(
         &self,
-        blocks: Vec<IndexedTranscriptBlock>,
+        blocks: impl IntoIterator<Item = IndexedTranscriptBlock>,
         request_identifier: &RequestIdentifier,
         operation: OperationKind,
     ) -> OutputOperationResult<Vec<IndexedTranscriptBlockSearchMatch>> {
         let mut matches = Vec::new();
-        for block in blocks {
+        let mut cache = OneBackingLineCache::default();
+        for block in blocks.into_iter().take(self.candidate_budget as usize) {
+            if matches.len() as u64 > self.page_limit {
+                break;
+            }
             if block.text_availability != TranscriptBlockTextAvailability::ReadableText {
                 continue;
             }
-            let text = TranscriptBlockBackingReader::new(block.clone(), self.maximum_read_bytes)
-                .read_text(request_identifier, operation)?;
+            let text = cache.read_block(
+                &block,
+                self.maximum_read_bytes,
+                request_identifier,
+                operation,
+            )?;
             let search_text = SearchText::new(text);
             if let Some(evidence) = self
                 .query
@@ -5166,6 +5361,65 @@ impl TranscriptBlockSearcher {
             }
         }
         Ok(matches)
+    }
+}
+
+#[derive(Debug, Default)]
+struct OneBackingLineCache {
+    path: Option<PathBuf>,
+    line_number: u64,
+    line: Option<String>,
+}
+
+impl OneBackingLineCache {
+    fn read_block(
+        &mut self,
+        block: &IndexedTranscriptBlock,
+        maximum_read_bytes: ByteLimit,
+        request_identifier: &RequestIdentifier,
+        operation: OperationKind,
+    ) -> OutputOperationResult<String> {
+        let factory = OperationRejectedFactory::new(request_identifier.clone(), operation);
+        let rejected = Some(RejectedFragileReference::TranscriptBlock(
+            block.reference.clone(),
+        ));
+        if self.path.as_ref() != Some(&block.path) || self.line_number != block.source_line_number {
+            let line_limit = maximum_read_bytes
+                .into_u64()
+                .max(block.size_byte_count().saturating_add(4096))
+                .max(4096);
+            let line =
+                BoundedLineReader::new(block.path.clone(), block.source_line_number, line_limit)
+                    .read_line()
+                    .map_err(|failure| {
+                        failure.transcript_block_rejection(&factory, block.reference.clone())
+                    })?;
+            self.path = Some(block.path.clone());
+            self.line_number = block.source_line_number;
+            self.line = Some(line);
+        }
+        let record = TranscriptLineParser::new(
+            block.provenance.source,
+            block.provenance.source_identifier.clone(),
+            block.path.clone(),
+            block.source_line_number,
+            self.line.clone().expect("cached backing line"),
+        )
+        .parse()
+        .ok_or_else(|| factory.stale(rejected.clone()))?;
+        let matching = record
+            .transcript_blocks()
+            .into_iter()
+            .find(|candidate| candidate.block_index == block.block_index.into_u64())
+            .ok_or_else(|| factory.stale(rejected.clone()))?;
+        let text = matching
+            .readable_text()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| factory.stale(rejected.clone()))?;
+        if StableHash::new(&text).hex() != block.text_hash || matching.kind != block.kind {
+            return Err(factory.stale(rejected));
+        }
+        Ok(text)
     }
 }
 

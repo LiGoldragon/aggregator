@@ -83,9 +83,11 @@ The ordinary contract exposes metadata-first output operations:
 - `ReadOutput` reads only an explicit range bounded by the configured read cap.
 
 UIs and agents should consume cards first, then request bounded reads only for
-selected references. Page cursors are bound to the collection, filters, order,
-page limit, canonical query material, item count, and sorted reference list.
-Changing the listing or transcript-block search shape makes the cursor stale.
+selected references. V3 page cursors are size-capped keyset continuations bound
+to the snapshot identity, collection, filters, order, and page limit. They hold
+the last emitted candidate and a sort-tuple digest, never an offset or a
+corpus-sized reference signature. Changing evidence, configuration, coverage,
+or listing shape makes a cursor stale; a legacy v2 cursor is rejected as stale.
 
 The grounded `TranscriptBlockKind` vocabulary is `UserPrompt`, `AgentResponse`,
 `ToolCall`, `ToolResult`, `Inference`, `SystemInstruction`, `Attachment`,
@@ -96,19 +98,23 @@ current developer-role messages.
 
 Fragile references are daemon-local opaque identifiers into backing runtime
 evidence. The durable sidecar index stores references, metadata, fingerprints,
-page state, segment spans, and bounded card material needed for navigation. It
-is not canonical content storage and must not become a report archive. A live
-refresh is a complete replacement of that derived state: it contains only the
-current configured backing evidence, never historical index records. The
-version-2 store is compactly streamed to a temporary file, synced, and atomically
-renamed. A truncated, unreadable, or malformed scan is not a replacement: the
-last complete version-2 index remains available. Before a first complete scan,
-a partial result may be returned for that request but is never persisted as the
-live index. Version-1 indexes are obsolete derived data and
-are discarded without decoding before the first version-2 rebuild. Backing
-evidence remains the read source, so references can become stale, missing, or
-broken when those files change; operations reject those cases with typed
-`OperationRejected` replies instead of guessing.
+segment spans, and bounded card material needed for navigation. It is not
+canonical content storage and must not become a report archive. The established
+`.output-index.json` path is a small v3 compatibility pointer; immutable typed
+chunks, manifests, checkpoints, migration backups, and best-effort garbage
+collection live in its adjacent `.output-index.json.d/` directory. Each chunk
+has fixed logical, serialized, record, and query-work limits and is validated
+for kind, checksum, and size before decoding.
+
+Refreshes publish snapshot-bound v3 state atomically. Complete sources advance
+independently; incomplete sources retain their last-complete view and report
+provisional/resumable coverage rather than being mistaken for complete data.
+A v2 document is migration-only: it is boundedly imported and copied once to an
+immutable rollback backup before the pointer is replaced. Version-1 data is
+obsolete and is discarded without decoding. Backing evidence remains the read
+source, so references can become stale, missing, or broken when those files
+change; operations reject those cases with typed `OperationRejected` replies
+instead of guessing.
 
 ## Privacy and projection
 
