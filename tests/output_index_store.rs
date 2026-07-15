@@ -4,6 +4,7 @@ use aggregator::{
     Error, IndexStoreError,
     output_index::{
         limits::IndexStoreLimits,
+        migration_v2::IndexFormat,
         schema::{IndexChunk, IndexFieldDto, IndexFileKind, IndexRecordDto},
         store::{ChunkReader, ChunkWriter, IndexLocator, IndexStore},
     },
@@ -145,6 +146,18 @@ fn typed_chunk_rejects_wrong_kind_and_version_before_decode() {
             source: IndexStoreError::UnsupportedVersion { .. }
         }
     ));
+}
+
+#[test]
+fn current_format_classifies_v2_without_decoding_it_as_v3() {
+    let root = TempDir::new().expect("temporary root");
+    let store = test_store(&root);
+    fs::write(store.pointer_path(), b"{\"version\":2,\"sessions\":[]}").expect("v2 pointer");
+    assert_eq!(
+        store.current_format().expect("probe v2"),
+        IndexFormat::MigratableV2
+    );
+    assert!(store.read_current_pointer().is_err());
 }
 
 #[test]

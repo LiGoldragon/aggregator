@@ -3,8 +3,6 @@
 //! This module intentionally writes normalized observations before reducing them. A source run
 //! never owns a session's children: downstream reducers join by `SourceKey` and scalar keys.
 
-use std::fs;
-
 use signal_aggregator::{
     AuthoredStatus, ByteLimit, SourceIdentifier, SourceKind, TranscriptBlockKind,
     TranscriptBlockTextAvailability,
@@ -23,6 +21,7 @@ use super::{
     IndexedTranscriptBlock, SourceFingerprint, SourceKindName, StableReference,
     instrumentation::{IndexReservation, IndexResourceMeter, IndexWorkCategory},
     limits::IndexStoreLimits,
+    migration_v2::{IndexFormat, MigrationSource, V2Migration},
     schema::{
         CurrentPointer, DiskPath, IndexChunk, IndexFieldDto, IndexFileKind, IndexRecordDto,
         ProjectionOutputDto, ProjectionRecordDto, ProjectionSegmentDto, ProjectionSessionDto,
@@ -108,6 +107,9 @@ pub struct SourceGenerationRun {
     /// Chunk names are deterministic from this source occurrence and ordinal; no child locator
     /// vector is retained in a source summary.
     pub chunk_count: u64,
+    /// Projection locators are a deterministic source-local sequence.  Publishers consume this
+    /// scalar count instead of enumerating the staging directory.
+    pub projection_count: u64,
     pub logical_bytes: u64,
     pub record_count: u64,
     pub content_identity: [u8; 32],
@@ -150,6 +152,7 @@ impl BoundedIndexRefresher {
 
     pub fn refresh(&self) -> Result<BoundedGenerationPublication> {
         let staging = self.store.create_staging("bounded-build")?;
+        self.migrate_v2_before_v3_publication(&staging)?;
         let mut source_runs = Vec::new();
         let mut scan_outcomes = Vec::new();
         for (occurrence, source) in self.configuration.transcript_sources().iter().enumerate() {
@@ -196,7 +199,8 @@ impl BoundedIndexRefresher {
                 resource_high_water_bytes: self.meter.snapshot().high_water_bytes,
             });
         }
-        let tree_roots = FixedFanoutTreePublisher::new(staging.clone(), self.limits).publish()?;
+        let tree_roots =
+            FixedFanoutTreePublisher::new(staging.clone(), self.limits, &source_runs).publish()?;
         let manifest = IndexManifestRecord::new(&source_runs, &tree_roots).chunk();
         let manifest_locator = IndexLocator::new("manifest");
         staging.write_chunk(&manifest_locator, IndexFileKind::Manifest, &manifest)?;
@@ -209,6 +213,33 @@ impl BoundedIndexRefresher {
             scan_outcomes,
             resource_high_water_bytes: self.meter.snapshot().high_water_bytes,
         })
+    }
+
+    /// A v2 pointer is immutable rollback evidence until `IndexStore::publish` has committed a
+    /// complete v3 manifest.  Importing into the same unlinked staging generation ensures a
+    /// crash can leave either the original v2 pointer or a fully verified v3 pointer, never a
+    /// partially replaced compatibility file.
+    fn migrate_v2_before_v3_publication(&self, staging: &IndexStaging) -> Result<()> {
+        if self.store.current_format()? != IndexFormat::MigratableV2 {
+            return Ok(());
+        }
+        let legacy_pointer = self.store.pointer_path().to_path_buf();
+        self.store.retain_v2_backup(&legacy_pointer)?;
+        let sources = self
+            .configuration
+            .transcript_sources()
+            .iter()
+            .enumerate()
+            .map(|(occurrence, source)| {
+                MigrationSource::from_source_key(&SourceKey::new(
+                    source.kind(),
+                    self.source_identifier(source),
+                    occurrence as u64,
+                ))
+            })
+            .collect();
+        V2Migration::new(self.limits, sources).import_into_staging(&legacy_pointer, staging)?;
+        Ok(())
     }
 
     fn scan_source(
@@ -330,6 +361,7 @@ pub struct BoundedGenerationBuilder {
     record_count: u64,
     next_chunk: u64,
     next_projection_chunk: u64,
+    next_index_chunk: u64,
     content_hasher: blake3::Hasher,
     failure: Option<Error>,
 }
@@ -354,6 +386,7 @@ impl BoundedGenerationBuilder {
             record_count: 0,
             next_chunk: 0,
             next_projection_chunk: 0,
+            next_index_chunk: 0,
             content_hasher: blake3::Hasher::new(),
             failure: None,
         }
@@ -367,6 +400,7 @@ impl BoundedGenerationBuilder {
         Ok(SourceGenerationRun {
             source_key: self.source_key,
             chunk_count: self.chunk_count,
+            projection_count: self.next_projection_chunk,
             logical_bytes: self.logical_bytes_written,
             record_count: self.record_count,
             content_identity: *self.content_hasher.finalize().as_bytes(),
@@ -588,7 +622,7 @@ impl BoundedGenerationBuilder {
         let locator = IndexLocator::new(format!(
             "run-{}-index-{:016x}",
             self.source_key.configured_occurrence(),
-            self.next_projection_chunk
+            self.next_index_chunk
         ));
         self.staging.write_chunk(
             &locator,
@@ -599,7 +633,7 @@ impl BoundedGenerationBuilder {
                 projection: None,
             },
         )?;
-        self.next_projection_chunk += 1;
+        self.next_index_chunk += 1;
         self.chunk_count += 1;
         Ok(())
     }
@@ -1060,16 +1094,25 @@ impl FixedTreeCollection {
 /// External-sort publication. Directory order is explicitly treated as hostile input: only
 /// bounded sorted run chunks participate in the deterministic fixed-fanout tree.
 #[derive(Debug, Clone)]
-struct FixedFanoutTreePublisher {
+struct FixedFanoutTreePublisher<'a> {
     staging: IndexStaging,
     limits: IndexStoreLimits,
+    source_runs: &'a [SourceGenerationRun],
 }
 
-impl FixedFanoutTreePublisher {
+impl<'a> FixedFanoutTreePublisher<'a> {
     const FANOUT: usize = 16;
 
-    fn new(staging: IndexStaging, limits: IndexStoreLimits) -> Self {
-        Self { staging, limits }
+    fn new(
+        staging: IndexStaging,
+        limits: IndexStoreLimits,
+        source_runs: &'a [SourceGenerationRun],
+    ) -> Self {
+        Self {
+            staging,
+            limits,
+            source_runs,
+        }
     }
 
     fn publish(&self) -> Result<Vec<FixedTreeRoot>> {
@@ -1105,39 +1148,29 @@ impl FixedFanoutTreePublisher {
     fn write_sorted_runs(&self, collection: FixedTreeCollection) -> Result<u64> {
         let mut entries = Vec::new();
         let mut run = 0_u64;
-        let directory = fs::read_dir(self.staging.path()).map_err(|error| {
-            Error::index_store(crate::error::IndexStoreError::io(
-                "reading projection staging",
-                error,
-            ))
-        })?;
-        for directory_entry in directory {
-            let directory_entry = directory_entry.map_err(|error| {
-                Error::index_store(crate::error::IndexStoreError::io(
-                    "reading projection staging entry",
-                    error,
-                ))
-            })?;
-            let name = directory_entry.file_name().to_string_lossy().into_owned();
-            if !name.contains("-projection-") {
-                continue;
-            }
-            let chunk = self
-                .staging
-                .read_chunk(&IndexLocator::new(name.clone()), IndexFileKind::Projection)?;
-            let Some(projection) = chunk.projection else {
-                continue;
-            };
-            let Some(reference) = collection.projection_reference(&projection) else {
-                continue;
-            };
-            entries.push(TreeLeafEntry {
-                key: reference.to_owned(),
-                locator: name,
-            });
-            if entries.len() as u64 == self.limits.maximum_records_per_chunk {
-                self.write_run(collection, run, &mut entries)?;
-                run += 1;
+        for source_run in self.source_runs {
+            for ordinal in 0..source_run.projection_count {
+                let name = format!(
+                    "run-{}-projection-{ordinal:016x}",
+                    source_run.source_key.configured_occurrence(),
+                );
+                let chunk = self
+                    .staging
+                    .read_chunk(&IndexLocator::new(name.clone()), IndexFileKind::Projection)?;
+                let Some(projection) = chunk.projection else {
+                    continue;
+                };
+                let Some(reference) = collection.projection_reference(&projection) else {
+                    continue;
+                };
+                entries.push(TreeLeafEntry {
+                    key: reference.to_owned(),
+                    locator: name,
+                });
+                if entries.len() as u64 == self.limits.maximum_records_per_chunk {
+                    self.write_run(collection, run, &mut entries)?;
+                    run += 1;
+                }
             }
         }
         if !entries.is_empty() {

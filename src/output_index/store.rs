@@ -15,6 +15,7 @@ use crate::{Error, Result, error::IndexStoreError};
 
 use super::{
     limits::IndexStoreLimits,
+    migration_v2::{IndexFormat, IndexFormatProbe},
     schema::{CurrentPointer, IndexChunk, IndexFileKind, IndexStoreFormatVersion},
 };
 
@@ -144,6 +145,15 @@ impl IndexStore {
         let path = self.chunk_path(locator)?;
         self.verify_regular_file(&path)?;
         Ok(ChunkReader::new(path, kind, self.limits))
+    }
+
+    /// Classifies the current pointer from a bounded prefix before a migration attempts to read it.
+    /// The JSON v2 file remains untouched until a complete v3 generation atomically replaces it.
+    pub fn current_format(&self) -> Result<IndexFormat> {
+        let Some(bytes) = self.read_pointer_bytes()? else {
+            return Ok(IndexFormat::Missing);
+        };
+        Ok(IndexFormatProbe::new(&bytes[..bytes.len().min(4096)]).format())
     }
 
     /// Reads the typed compatibility pointer without decoding any referenced manifest.
