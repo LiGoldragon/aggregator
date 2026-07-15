@@ -20,6 +20,8 @@ pub enum IndexStoreError {
     InvalidChecksum,
     #[error("corrupt index-store archive")]
     CorruptArchive,
+    #[error("unexpected index-store file kind {actual}; expected {expected}")]
+    UnexpectedFileKind { expected: u8, actual: u8 },
     #[error("fragile-reference collision")]
     ReferenceCollision,
     #[error("unsafe index-store path")]
