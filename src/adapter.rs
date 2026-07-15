@@ -203,6 +203,10 @@ impl TranscriptRawReadOutcome {
         self
     }
 
+    pub fn is_complete(&self) -> bool {
+        self.truncations.is_empty() && self.read_failures.is_empty() && self.scan_limits.is_empty()
+    }
+
     pub fn empty(source: SourceKind, source_identifier: SourceIdentifier) -> Self {
         Self::new(
             source,

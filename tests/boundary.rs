@@ -31,7 +31,7 @@ use aggregator::{
     },
     configuration::LegacyAggregatorConfiguration,
     daemon::{PrototypeDaemon, PrototypeSocket},
-    output_index::SourceHealthObserver,
+    output_index::{DurableFragileIndex, SourceHealthObserver},
 };
 use meta_signal_aggregator::{
     ActiveRepository, AggregatorConfiguration, ConfigurationCandidate, ConfigurationChange,
@@ -3354,6 +3354,204 @@ fn health_reports_unreadable_durable_index_store() {
     assert_eq!(
         health.index.status,
         SourceHealthStatus::IndexStoreUnreadable
+    );
+}
+
+#[test]
+fn live_index_reconciles_current_evidence_idempotently_and_removes_stale_records() {
+    let root = TempDir::new().expect("temporary root");
+    let configuration = accepted_configuration(&root);
+    let transcript = root.path().join("claude/session.jsonl");
+    fs::write(
+        &transcript,
+        "{\"timestamp\":\"2026-07-09T10:00:00Z\",\"text\":\"first evidence\"}\n",
+    )
+    .expect("write first evidence");
+    let runtime = RuntimeConfiguration::validate_from_meta(&configuration)
+        .accepted_configuration()
+        .expect("accepted configuration")
+        .clone();
+    let index_store = FragileIndexStore::from_store_path(runtime.store_path());
+    let nexus = NexusPlane::with_runtime_configuration(
+        runtime,
+        CollectionClock::fixed(
+            ReferenceTime::from_timestamp(Timestamp::new("2026-07-09T11:00:00Z"))
+                .expect("reference time"),
+        ),
+    );
+    let request = TranscriptBlockListRequest {
+        request_identifier: RequestIdentifier::new("reconcile-current-evidence"),
+        filter: all_transcript_block_filter(),
+        page: PageRequest {
+            limit: PageLimit::new(10),
+            cursor: None,
+            order: ListingOrder::OldestFirst,
+        },
+        projection: CardProjection::MetadataOnly,
+    };
+
+    let first = nexus
+        .list_transcript_blocks(request.clone())
+        .expect("first refresh");
+    let first_bytes = fs::read(index_store.path()).expect("first index bytes");
+    let repeated = nexus
+        .list_transcript_blocks(request.clone())
+        .expect("identical refresh");
+    assert_eq!(repeated.blocks, first.blocks);
+    assert_eq!(
+        fs::read(index_store.path()).expect("repeated index bytes"),
+        first_bytes
+    );
+
+    fs::write(
+        &transcript,
+        "{\"timestamp\":\"2026-07-09T10:00:00Z\",\"text\":\"replacement evidence\"}\n",
+    )
+    .expect("replace evidence");
+    let replacement = nexus
+        .list_transcript_blocks(request.clone())
+        .expect("replacement refresh");
+    assert_eq!(replacement.blocks.len(), 1);
+    assert_ne!(replacement.blocks[0].reference, first.blocks[0].reference);
+    let replacement_index = serde_json::from_slice::<serde_json::Value>(
+        &fs::read(index_store.path()).expect("replacement index bytes"),
+    )
+    .expect("version two index json");
+    assert_eq!(replacement_index["version"], 2);
+    assert!(replacement_index.get("active_outputs").is_none());
+    assert_eq!(
+        replacement_index["outputs"].as_array().map(Vec::len),
+        Some(1)
+    );
+
+    fs::remove_file(&transcript).expect("remove evidence");
+    let removed = nexus
+        .list_transcript_blocks(request)
+        .expect("deletion refresh");
+    assert!(removed.blocks.is_empty());
+    let removed_bytes = fs::read(index_store.path()).expect("deletion index bytes");
+    let removed_index =
+        serde_json::from_slice::<serde_json::Value>(&removed_bytes).expect("deletion index json");
+    assert_eq!(removed_index["outputs"].as_array().map(Vec::len), Some(0));
+    assert!(removed_bytes.len() < first_bytes.len());
+}
+
+#[test]
+fn truncated_scan_preserves_last_complete_live_index_without_erasing_scope() {
+    let root = TempDir::new().expect("temporary root");
+    let mut configuration = accepted_configuration(&root);
+    configuration.transcript_sources = vec![TranscriptSource::Claude(TranscriptRoot {
+        path: FilesystemPath::new(root.path().join("claude").display().to_string()),
+    })];
+    for index in 0..2 {
+        fs::write(
+            root.path().join("claude").join(format!("{index}.jsonl")),
+            format!(
+                "{{\"timestamp\":\"2026-07-09T10:00:0{index}Z\",\"text\":\"evidence {index}\"}}\n"
+            ),
+        )
+        .expect("write complete evidence");
+    }
+    let complete_runtime = RuntimeConfiguration::validate_from_meta(&configuration)
+        .accepted_configuration()
+        .expect("complete configuration")
+        .clone();
+    let index_store = FragileIndexStore::from_store_path(complete_runtime.store_path());
+    let complete_nexus = NexusPlane::with_runtime_configuration(
+        complete_runtime,
+        CollectionClock::fixed(
+            ReferenceTime::from_timestamp(Timestamp::new("2026-07-09T11:00:00Z"))
+                .expect("reference time"),
+        ),
+    );
+    let list_request = SessionListRequest {
+        request_identifier: RequestIdentifier::new("complete-coverage"),
+        filter: SessionListFilter {
+            source_selection: SourceSelection::AllConfigured,
+            time_window: None,
+        },
+        page: PageRequest {
+            limit: PageLimit::new(10),
+            cursor: None,
+            order: ListingOrder::OldestFirst,
+        },
+    };
+    assert_eq!(
+        complete_nexus
+            .list_sessions(list_request.clone())
+            .expect("complete refresh")
+            .sessions
+            .len(),
+        2
+    );
+    let complete_bytes = fs::read(index_store.path()).expect("complete index bytes");
+
+    let mut limited_configuration = configuration;
+    limited_configuration
+        .output_interfaces
+        .limits
+        .maximum_transcript_discovered_files = ItemCount::new(1);
+    let limited_runtime = RuntimeConfiguration::validate_from_meta(&limited_configuration)
+        .accepted_configuration()
+        .expect("limited configuration")
+        .clone();
+    let limited_nexus = NexusPlane::with_runtime_configuration(
+        limited_runtime,
+        CollectionClock::fixed(
+            ReferenceTime::from_timestamp(Timestamp::new("2026-07-09T11:00:00Z"))
+                .expect("reference time"),
+        ),
+    );
+    let preserved = limited_nexus
+        .list_sessions(list_request)
+        .expect("truncated scan uses last complete index");
+    assert_eq!(preserved.sessions.len(), 2);
+    assert_eq!(
+        fs::read(index_store.path()).expect("preserved index bytes"),
+        complete_bytes
+    );
+    let health = limited_nexus
+        .observe_health(RuntimeHealthRequest {
+            request_identifier: RequestIdentifier::new("truncated-coverage-health"),
+        })
+        .expect("truncated health");
+    assert!(
+        health
+            .sources
+            .iter()
+            .any(|source| source.status == SourceHealthStatus::DiscoveryTruncated)
+    );
+}
+
+#[test]
+fn legacy_index_is_discarded_without_decode_and_failed_replacement_keeps_last_index() {
+    let root = TempDir::new().expect("temporary root");
+    let store = FragileIndexStore::from_store_path(&root.path().join("store"));
+    fs::write(
+        store.path(),
+        format!(
+            "{{\"version\": 1,\"legacy\":\"{}\"}}",
+            "x".repeat(1_048_576)
+        ),
+    )
+    .expect("write legacy index");
+    assert!(
+        store
+            .read_or_empty()
+            .expect("probe legacy index")
+            .is_empty()
+    );
+
+    store
+        .write(&DurableFragileIndex::empty())
+        .expect("replace legacy index atomically");
+    let committed = fs::read(store.path()).expect("committed index");
+    assert!(committed.starts_with(b"{\"version\":2,"));
+    fs::create_dir(store.temporary_path()).expect("block temporary replacement");
+    assert!(store.write(&DurableFragileIndex::empty()).is_err());
+    assert_eq!(
+        fs::read(store.path()).expect("index after failed replacement"),
+        committed
     );
 }
 

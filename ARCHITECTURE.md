@@ -97,7 +97,15 @@ current developer-role messages.
 Fragile references are daemon-local opaque identifiers into backing runtime
 evidence. The durable sidecar index stores references, metadata, fingerprints,
 page state, segment spans, and bounded card material needed for navigation. It
-is not canonical content storage and must not become a report archive. Backing
+is not canonical content storage and must not become a report archive. A live
+refresh is a complete replacement of that derived state: it contains only the
+current configured backing evidence, never historical index records. The
+version-2 store is compactly streamed to a temporary file, synced, and atomically
+renamed. A truncated, unreadable, or malformed scan is not a replacement: the
+last complete version-2 index remains available. Before a first complete scan,
+a partial result may be returned for that request but is never persisted as the
+live index. Version-1 indexes are obsolete derived data and
+are discarded without decoding before the first version-2 rebuild. Backing
 evidence remains the read source, so references can become stale, missing, or
 broken when those files change; operations reject those cases with typed
 `OperationRejected` replies instead of guessing.

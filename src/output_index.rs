@@ -2,7 +2,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
@@ -72,6 +72,7 @@ impl OutputInterfaceRuntime {
             .iter()
             .map(|source| SourceHealthObserver::new(source.clone()).observe())
             .collect::<Vec<_>>();
+        let counts = current.health_counts();
         RuntimeHealthObserved {
             request_identifier: request.request_identifier,
             capabilities: RuntimeCapabilities {
@@ -83,10 +84,10 @@ impl OutputInterfaceRuntime {
             sources,
             index: IndexHealth {
                 status: index_status,
-                session_count: ItemCount::new(current.sessions.len() as u64),
-                subagent_count: ItemCount::new(current.subagents.len() as u64),
-                output_count: ItemCount::new(current.outputs.len() as u64),
-                transcript_block_count: ItemCount::new(current.transcript_blocks.len() as u64),
+                session_count: ItemCount::new(counts.0),
+                subagent_count: ItemCount::new(counts.1),
+                output_count: ItemCount::new(counts.2),
+                transcript_block_count: ItemCount::new(counts.3),
             },
         }
     }
@@ -688,15 +689,30 @@ impl OutputInterfaceRuntime {
         operation: OperationKind,
     ) -> OutputOperationResult<DurableFragileIndex> {
         let store = FragileIndexStore::from_store_path(self.configuration.store_path());
-        let mut durable = store.read_or_empty().map_err(|_| {
+        let existing_format = store.format().map_err(|_| {
             OperationRejectedFactory::new(request_identifier.clone(), operation).unsupported()
         })?;
-        let current = CurrentIndexBuilder::new(self.configuration.clone()).build();
-        durable.merge_current(current);
-        store.write(&durable).map_err(|_| {
-            OperationRejectedFactory::new(request_identifier.clone(), operation).unsupported()
-        })?;
-        Ok(durable)
+        match CurrentIndexBuilder::new(self.configuration.clone()).build() {
+            CurrentIndexBuild::Complete(current) => {
+                let durable = DurableFragileIndex::from_current(current);
+                store.write(&durable).map_err(|_| {
+                    OperationRejectedFactory::new(request_identifier.clone(), operation)
+                        .unsupported()
+                })?;
+                Ok(durable)
+            }
+            CurrentIndexBuild::Incomplete(current) => {
+                if existing_format == FragileIndexFormat::Current {
+                    drop(current);
+                    store.read_current().map_err(|_| {
+                        OperationRejectedFactory::new(request_identifier.clone(), operation)
+                            .unsupported()
+                    })
+                } else {
+                    Ok(DurableFragileIndex::from_current(current))
+                }
+            }
+        }
     }
 
     pub fn index_for_reference_operation(
@@ -739,11 +755,6 @@ pub struct DurableFragileIndex {
     outputs: Vec<IndexedOutput>,
     segments: Vec<IndexedOutputSegment>,
     transcript_blocks: Vec<IndexedTranscriptBlock>,
-    active_sessions: Vec<FragileSessionReference>,
-    active_subagents: Vec<FragileSubagentReference>,
-    active_outputs: Vec<FragileOutputReference>,
-    active_segments: Vec<FragileOutputSegmentReference>,
-    active_transcript_blocks: Vec<FragileTranscriptBlockReference>,
 }
 
 impl DurableFragileIndex {
@@ -754,11 +765,16 @@ impl DurableFragileIndex {
             outputs: Vec::new(),
             segments: Vec::new(),
             transcript_blocks: Vec::new(),
-            active_sessions: Vec::new(),
-            active_subagents: Vec::new(),
-            active_outputs: Vec::new(),
-            active_segments: Vec::new(),
-            active_transcript_blocks: Vec::new(),
+        }
+    }
+
+    pub fn from_current(current: CurrentFragileIndex) -> Self {
+        Self {
+            sessions: current.sessions,
+            subagents: current.subagents,
+            outputs: current.outputs,
+            segments: current.segments,
+            transcript_blocks: current.transcript_blocks,
         }
     }
 
@@ -766,202 +782,87 @@ impl DurableFragileIndex {
         self.sessions.is_empty() && self.outputs.is_empty() && self.transcript_blocks.is_empty()
     }
 
-    pub fn merge_current(&mut self, current: CurrentFragileIndex) {
-        self.sessions =
-            IndexedSessionMerger::new(self.sessions.clone(), current.sessions.clone()).merge();
-        self.subagents =
-            IndexedSubagentMerger::new(self.subagents.clone(), current.subagents.clone()).merge();
-        self.outputs =
-            IndexedOutputMerger::new(self.outputs.clone(), current.outputs.clone()).merge();
-        self.segments =
-            IndexedSegmentMerger::new(self.segments.clone(), current.segments.clone()).merge();
-        self.transcript_blocks = IndexedTranscriptBlockMerger::new(
-            self.transcript_blocks.clone(),
-            current.transcript_blocks.clone(),
-        )
-        .merge();
-        self.active_sessions = current
-            .sessions
-            .into_iter()
-            .map(|session| session.reference)
-            .collect();
-        self.active_subagents = current
-            .subagents
-            .into_iter()
-            .map(|subagent| subagent.reference)
-            .collect();
-        self.active_outputs = current
-            .outputs
-            .into_iter()
-            .map(|output| output.reference)
-            .collect();
-        self.active_segments = current
-            .segments
-            .into_iter()
-            .map(|segment| segment.reference)
-            .collect();
-        self.active_transcript_blocks = current
-            .transcript_blocks
-            .into_iter()
-            .map(|block| block.reference)
-            .collect();
-    }
-
     pub fn current_sessions(&self) -> Vec<IndexedSession> {
-        let active = self
-            .active_sessions
-            .iter()
-            .map(|reference| reference.as_str().to_string())
-            .collect::<BTreeSet<_>>();
-        self.sessions
-            .iter()
-            .filter(|session| active.contains(session.reference.as_str()))
-            .cloned()
-            .collect()
+        self.sessions.clone()
     }
 
     pub fn current_subagents(&self) -> Vec<IndexedSubagent> {
-        let active = self
-            .active_subagents
-            .iter()
-            .map(|reference| reference.as_str().to_string())
-            .collect::<BTreeSet<_>>();
-        self.subagents
-            .iter()
-            .filter(|subagent| active.contains(subagent.reference.as_str()))
-            .cloned()
-            .collect()
+        self.subagents.clone()
     }
 
     pub fn current_outputs(&self) -> Vec<IndexedOutput> {
-        let active = self
-            .active_outputs
-            .iter()
-            .map(|reference| reference.as_str().to_string())
-            .collect::<BTreeSet<_>>();
-        self.outputs
-            .iter()
-            .filter(|output| active.contains(output.reference.as_str()))
-            .cloned()
-            .collect()
+        self.outputs.clone()
     }
 
     pub fn current_segments(&self) -> Vec<IndexedOutputSegment> {
-        let active = self
-            .active_segments
-            .iter()
-            .map(|reference| reference.as_str().to_string())
-            .collect::<BTreeSet<_>>();
-        self.segments
-            .iter()
-            .filter(|segment| active.contains(segment.reference.as_str()))
-            .cloned()
-            .collect()
+        self.segments.clone()
     }
 
     pub fn current_transcript_blocks(&self) -> Vec<IndexedTranscriptBlock> {
-        let active = self
-            .active_transcript_blocks
-            .iter()
-            .map(|reference| reference.as_str().to_string())
-            .collect::<BTreeSet<_>>();
-        self.transcript_blocks
-            .iter()
-            .filter(|block| active.contains(block.reference.as_str()))
-            .cloned()
-            .collect()
+        self.transcript_blocks.clone()
     }
 
     pub fn session(&self, reference: &FragileSessionReference) -> Option<IndexedSession> {
-        self.active_sessions
-            .contains(reference)
-            .then(|| {
-                self.sessions
-                    .iter()
-                    .find(|session| &session.reference == reference)
-                    .cloned()
-            })
-            .flatten()
+        self.sessions
+            .iter()
+            .find(|session| &session.reference == reference)
+            .cloned()
     }
 
     pub fn subagent(&self, reference: &FragileSubagentReference) -> Option<IndexedSubagent> {
-        self.active_subagents
-            .contains(reference)
-            .then(|| {
-                self.subagents
-                    .iter()
-                    .find(|subagent| &subagent.reference == reference)
-                    .cloned()
-            })
-            .flatten()
+        self.subagents
+            .iter()
+            .find(|subagent| &subagent.reference == reference)
+            .cloned()
     }
 
     pub fn output(&self, reference: &FragileOutputReference) -> Option<IndexedOutput> {
-        self.active_outputs
-            .contains(reference)
-            .then(|| {
-                self.outputs
-                    .iter()
-                    .find(|output| &output.reference == reference)
-                    .cloned()
-            })
-            .flatten()
+        self.outputs
+            .iter()
+            .find(|output| &output.reference == reference)
+            .cloned()
     }
 
     pub fn segment(
         &self,
         reference: &FragileOutputSegmentReference,
     ) -> Option<IndexedOutputSegment> {
-        self.active_segments
-            .contains(reference)
-            .then(|| {
-                self.segments
-                    .iter()
-                    .find(|segment| &segment.reference == reference)
-                    .cloned()
-            })
-            .flatten()
+        self.segments
+            .iter()
+            .find(|segment| &segment.reference == reference)
+            .cloned()
     }
 
     pub fn transcript_block(
         &self,
         reference: &FragileTranscriptBlockReference,
     ) -> Option<IndexedTranscriptBlock> {
-        self.active_transcript_blocks
-            .contains(reference)
-            .then(|| {
-                self.transcript_blocks
-                    .iter()
-                    .find(|block| &block.reference == reference)
-                    .cloned()
-            })
-            .flatten()
+        self.transcript_blocks
+            .iter()
+            .find(|block| &block.reference == reference)
+            .cloned()
     }
 
     pub fn collection_signature(&self) -> String {
         StableHash::new(
-            self.active_sessions
+            self.sessions
                 .iter()
-                .map(|reference| reference.as_str())
+                .map(|session| session.reference.as_str())
                 .chain(
-                    self.active_subagents
+                    self.subagents
                         .iter()
-                        .map(|reference| reference.as_str()),
+                        .map(|subagent| subagent.reference.as_str()),
+                )
+                .chain(self.outputs.iter().map(|output| output.reference.as_str()))
+                .chain(
+                    self.segments
+                        .iter()
+                        .map(|segment| segment.reference.as_str()),
                 )
                 .chain(
-                    self.active_outputs
+                    self.transcript_blocks
                         .iter()
-                        .map(|reference| reference.as_str()),
-                )
-                .chain(
-                    self.active_segments
-                        .iter()
-                        .map(|reference| reference.as_str()),
-                )
-                .chain(
-                    self.active_transcript_blocks
-                        .iter()
-                        .map(|reference| reference.as_str()),
+                        .map(|block| block.reference.as_str()),
                 )
                 .collect::<Vec<_>>()
                 .join("|"),
@@ -969,50 +870,9 @@ impl DurableFragileIndex {
         .hex()
     }
 
-    pub fn to_json(&self) -> Value {
-        json!({
-            "version": 1,
-            "active_sessions": self.active_sessions.iter().map(|reference| reference.as_str().to_string()).collect::<Vec<_>>(),
-            "active_subagents": self.active_subagents.iter().map(|reference| reference.as_str().to_string()).collect::<Vec<_>>(),
-            "active_outputs": self.active_outputs.iter().map(|reference| reference.as_str().to_string()).collect::<Vec<_>>(),
-            "active_segments": self.active_segments.iter().map(|reference| reference.as_str().to_string()).collect::<Vec<_>>(),
-            "active_transcript_blocks": self.active_transcript_blocks.iter().map(|reference| reference.as_str().to_string()).collect::<Vec<_>>(),
-            "sessions": self.sessions.iter().map(IndexedSession::to_json).collect::<Vec<_>>(),
-            "subagents": self.subagents.iter().map(IndexedSubagent::to_json).collect::<Vec<_>>(),
-            "outputs": self.outputs.iter().map(IndexedOutput::to_json).collect::<Vec<_>>(),
-            "segments": self.segments.iter().map(IndexedOutputSegment::to_json).collect::<Vec<_>>(),
-            "transcript_blocks": self.transcript_blocks.iter().map(IndexedTranscriptBlock::to_json).collect::<Vec<_>>(),
-        })
-    }
-
     pub fn from_json(value: &Value) -> Self {
         let reader = JsonReader::new(value);
         Self {
-            active_sessions: reader
-                .strings("active_sessions")
-                .into_iter()
-                .map(FragileSessionReference::new)
-                .collect(),
-            active_subagents: reader
-                .strings("active_subagents")
-                .into_iter()
-                .map(FragileSubagentReference::new)
-                .collect(),
-            active_outputs: reader
-                .strings("active_outputs")
-                .into_iter()
-                .map(FragileOutputReference::new)
-                .collect(),
-            active_segments: reader
-                .strings("active_segments")
-                .into_iter()
-                .map(FragileOutputSegmentReference::new)
-                .collect(),
-            active_transcript_blocks: reader
-                .strings("active_transcript_blocks")
-                .into_iter()
-                .map(FragileTranscriptBlockReference::new)
-                .collect(),
             sessions: reader
                 .array("sessions")
                 .into_iter()
@@ -1070,6 +930,31 @@ impl CurrentFragileIndex {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CurrentIndexBuild {
+    Complete(CurrentFragileIndex),
+    Incomplete(CurrentFragileIndex),
+}
+
+impl CurrentIndexBuild {
+    pub fn health_counts(&self) -> (u64, u64, u64, u64) {
+        match self {
+            Self::Complete(index) => (
+                index.sessions.len() as u64,
+                index.subagents.len() as u64,
+                index.outputs.len() as u64,
+                index.transcript_blocks.len() as u64,
+            ),
+            Self::Incomplete(index) => (
+                index.sessions.len() as u64,
+                index.subagents.len() as u64,
+                index.outputs.len() as u64,
+                index.transcript_blocks.len() as u64,
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CurrentIndexBuilder {
     configuration: RuntimeConfiguration,
 }
@@ -1079,17 +964,25 @@ impl CurrentIndexBuilder {
         Self { configuration }
     }
 
-    pub fn build(&self) -> CurrentFragileIndex {
+    pub fn build(&self) -> CurrentIndexBuild {
         let mut accumulator = CurrentIndexAccumulator::new(
             self.configuration
                 .output_interfaces()
                 .limits()
                 .maximum_preview_bytes,
         );
+        let mut complete = true;
         for source in self.configuration.transcript_sources() {
-            accumulator.merge(self.read_source(source));
+            let outcome = self.read_source(source);
+            complete &= outcome.is_complete();
+            accumulator.merge(outcome);
         }
-        accumulator.finish()
+        let index = accumulator.finish();
+        if complete {
+            CurrentIndexBuild::Complete(index)
+        } else {
+            CurrentIndexBuild::Incomplete(index)
+        }
     }
 
     pub fn read_source(&self, source: &TranscriptAdapterConfiguration) -> TranscriptRawReadOutcome {
@@ -2592,20 +2485,22 @@ impl FragileIndexStore {
     }
 
     pub fn read_or_empty(&self) -> Result<DurableFragileIndex> {
-        if !self.path.exists() {
-            return Ok(DurableFragileIndex::empty());
+        match self.format()? {
+            FragileIndexFormat::Missing | FragileIndexFormat::Legacy => {
+                Ok(DurableFragileIndex::empty())
+            }
+            FragileIndexFormat::Current => self.read_current(),
         }
-        let text = fs::read_to_string(&self.path)
-            .map_err(|error| Error::io("reading fragile output index", error))?;
-        let value = serde_json::from_str::<Value>(&text)
-            .map_err(|error| Error::protocol("fragile output index decode", error.to_string()))?;
-        Ok(DurableFragileIndex::from_json(&value))
     }
 
     pub fn health_status(&self) -> SourceHealthStatus {
-        match self.read_or_empty() {
-            Ok(_) => SourceHealthStatus::ReadableIndexed,
-            Err(_) => SourceHealthStatus::IndexStoreUnreadable,
+        match self.format() {
+            Ok(FragileIndexFormat::Current) => match self.read_current() {
+                Ok(_) => SourceHealthStatus::ReadableIndexed,
+                Err(_) => SourceHealthStatus::IndexStoreUnreadable,
+            },
+            Ok(FragileIndexFormat::Missing) => SourceHealthStatus::ReadableEmpty,
+            Ok(FragileIndexFormat::Legacy) | Err(_) => SourceHealthStatus::IndexStoreUnreadable,
         }
     }
 
@@ -2615,12 +2510,30 @@ impl FragileIndexStore {
                 .map_err(|error| Error::io("creating fragile output index directory", error))?;
         }
         let temporary_path = self.temporary_path();
-        let text = serde_json::to_string_pretty(&index.to_json())
-            .map_err(|error| Error::protocol("fragile output index encode", error.to_string()))?;
-        fs::write(&temporary_path, text)
-            .map_err(|error| Error::io("writing fragile output index", error))?;
+        let mut temporary = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+            .map_err(|error| Error::io("creating fragile output index temporary file", error))?;
+        let write_result = IndexJsonStream::new(index)
+            .write_to(&mut temporary)
+            .and_then(|_| {
+                temporary
+                    .sync_all()
+                    .map_err(|error| Error::io("syncing fragile output index", error))
+            });
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(error);
+        }
         fs::rename(&temporary_path, &self.path)
-            .map_err(|error| Error::io("committing fragile output index", error))
+            .map_err(|error| Error::io("committing fragile output index", error))?;
+        if let Some(parent) = self.path.parent() {
+            fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| Error::io("syncing fragile output index directory", error))?;
+        }
+        Ok(())
     }
 
     pub fn temporary_path(&self) -> PathBuf {
@@ -2631,6 +2544,135 @@ impl FragileIndexStore {
             .unwrap_or("output-index.json");
         self.path
             .with_file_name(format!(".{file_name}.{}.tmp", std::process::id()))
+    }
+
+    pub fn format(&self) -> Result<FragileIndexFormat> {
+        if !self.path.exists() {
+            return Ok(FragileIndexFormat::Missing);
+        }
+        let mut file = fs::File::open(&self.path)
+            .map_err(|error| Error::io("opening fragile output index", error))?;
+        let mut prefix = [0_u8; 256];
+        let read = file
+            .read(&mut prefix)
+            .map_err(|error| Error::io("probing fragile output index version", error))?;
+        IndexFormatProbe::new(&prefix[..read]).format()
+    }
+
+    pub fn read_current(&self) -> Result<DurableFragileIndex> {
+        let text = fs::read_to_string(&self.path)
+            .map_err(|error| Error::io("reading fragile output index", error))?;
+        let value = serde_json::from_str::<Value>(&text)
+            .map_err(|error| Error::protocol("fragile output index decode", error.to_string()))?;
+        Ok(DurableFragileIndex::from_json(&value))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FragileIndexFormat {
+    Missing,
+    Legacy,
+    Current,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexFormatProbe<'a> {
+    prefix: &'a [u8],
+}
+
+impl<'a> IndexFormatProbe<'a> {
+    pub fn new(prefix: &'a [u8]) -> Self {
+        Self { prefix }
+    }
+
+    pub fn format(&self) -> Result<FragileIndexFormat> {
+        let compact = self
+            .prefix
+            .iter()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .copied()
+            .collect::<Vec<_>>();
+        if compact.starts_with(b"{\"version\":2,") {
+            return Ok(FragileIndexFormat::Current);
+        }
+        if compact.starts_with(b"{\"version\":1,") {
+            return Ok(FragileIndexFormat::Legacy);
+        }
+        Err(Error::protocol(
+            "fragile output index version",
+            "missing or unsupported version header",
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexJsonStream<'a> {
+    index: &'a DurableFragileIndex,
+}
+
+impl<'a> IndexJsonStream<'a> {
+    pub fn new(index: &'a DurableFragileIndex) -> Self {
+        Self { index }
+    }
+
+    pub fn write_to(&self, writer: &mut fs::File) -> Result<()> {
+        self.write_bytes(writer, b"{\"version\":2")?;
+        self.write_values(
+            writer,
+            "sessions",
+            self.index.sessions.iter().map(IndexedSession::to_json),
+        )?;
+        self.write_values(
+            writer,
+            "subagents",
+            self.index.subagents.iter().map(IndexedSubagent::to_json),
+        )?;
+        self.write_values(
+            writer,
+            "outputs",
+            self.index.outputs.iter().map(IndexedOutput::to_json),
+        )?;
+        self.write_values(
+            writer,
+            "segments",
+            self.index
+                .segments
+                .iter()
+                .map(IndexedOutputSegment::to_json),
+        )?;
+        self.write_values(
+            writer,
+            "transcript_blocks",
+            self.index
+                .transcript_blocks
+                .iter()
+                .map(IndexedTranscriptBlock::to_json),
+        )?;
+        self.write_bytes(writer, b"}")
+    }
+
+    pub fn write_values(
+        &self,
+        writer: &mut fs::File,
+        name: &str,
+        values: impl Iterator<Item = Value>,
+    ) -> Result<()> {
+        self.write_bytes(writer, format!(",\"{name}\":[").as_bytes())?;
+        for (position, value) in values.enumerate() {
+            if position > 0 {
+                self.write_bytes(writer, b",")?;
+            }
+            serde_json::to_writer(&mut *writer, &value).map_err(|error| {
+                Error::protocol("fragile output index encode", error.to_string())
+            })?;
+        }
+        self.write_bytes(writer, b"]")
+    }
+
+    pub fn write_bytes(&self, writer: &mut fs::File, bytes: &[u8]) -> Result<()> {
+        writer
+            .write_all(bytes)
+            .map_err(|error| Error::io("writing fragile output index", error))
     }
 }
 
@@ -5564,37 +5606,3 @@ impl StableHash {
         format!("{hash:016x}")
     }
 }
-
-macro_rules! index_merger {
-    ($name:ident, $item:ty, $reference:ident) => {
-        #[derive(Debug, Clone, PartialEq, Eq)]
-        pub struct $name {
-            existing: Vec<$item>,
-            current: Vec<$item>,
-        }
-
-        impl $name {
-            pub fn new(existing: Vec<$item>, current: Vec<$item>) -> Self {
-                Self { existing, current }
-            }
-
-            pub fn merge(self) -> Vec<$item> {
-                let mut map = BTreeMap::new();
-                for item in self.existing.into_iter().chain(self.current.into_iter()) {
-                    map.insert(item.$reference.as_str().to_string(), item);
-                }
-                map.into_values().collect()
-            }
-        }
-    };
-}
-
-index_merger!(IndexedSessionMerger, IndexedSession, reference);
-index_merger!(IndexedSubagentMerger, IndexedSubagent, reference);
-index_merger!(IndexedOutputMerger, IndexedOutput, reference);
-index_merger!(IndexedSegmentMerger, IndexedOutputSegment, reference);
-index_merger!(
-    IndexedTranscriptBlockMerger,
-    IndexedTranscriptBlock,
-    reference
-);
