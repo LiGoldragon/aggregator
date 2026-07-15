@@ -1608,8 +1608,10 @@ impl<'a> FixedFanoutTreePublisher<'a> {
                         &IndexLocator::new(child_name.clone()),
                         IndexFileKind::IndexNode,
                     )?;
+                    let child_tree = TreeChunk::from_chunk(child_chunk)?;
                     let entry = TreeLeafEntry::branch(
-                        TreeChunk::from_chunk(child_chunk)?.first_key()?,
+                        child_tree.first_key()?,
+                        child_tree.last_key()?,
                         child_name,
                     );
                     if !entries.is_empty()
@@ -1770,6 +1772,7 @@ struct TreeLeafEntry {
     key: String,
     reference: String,
     locator: String,
+    range_max: Option<String>,
 }
 impl TreeLeafEntry {
     fn new(key: String, reference: String, locator: String) -> Self {
@@ -1777,10 +1780,16 @@ impl TreeLeafEntry {
             key,
             reference,
             locator,
+            range_max: None,
         }
     }
-    fn branch(key: String, locator: String) -> Self {
-        Self::new(key, String::new(), locator)
+    fn branch(key: String, range_max: String, locator: String) -> Self {
+        Self {
+            key,
+            reference: String::new(),
+            locator,
+            range_max: Some(range_max),
+        }
     }
     fn logical_bytes(&self) -> u64 {
         ("tree-key".len()
@@ -1790,7 +1799,11 @@ impl TreeLeafEntry {
             + "tree-reference".len()
             + self.reference.len()
             + "tree-projection".len()
-            + self.locator.len()) as u64
+            + self.locator.len()
+            + self
+                .range_max
+                .as_ref()
+                .map_or(0, |value| "tree-range-max".len() + value.len())) as u64
     }
     fn compare(left: &Self, right: &Self) -> std::cmp::Ordering {
         left.key
@@ -1844,6 +1857,10 @@ impl TreeChunk {
                                 bytes: entry.reference.into_bytes(),
                             },
                             IndexFieldDto {
+                                name: "tree-range-max".to_owned(),
+                                bytes: entry.range_max.unwrap_or_default().into_bytes(),
+                            },
+                            IndexFieldDto {
                                 name: if self.children {
                                     "tree-child".to_owned()
                                 } else {
@@ -1893,7 +1910,11 @@ impl TreeChunk {
                 .to_vec(),
             )
             .map_err(|_| Error::protocol("typed tree", "invalid locator"))?;
-            entries.push(TreeLeafEntry::new(key, reference, locator));
+            let range_max = String::from_utf8(value("tree-range-max")?.to_vec())
+                .map_err(|_| Error::protocol("typed tree", "invalid range max"))?;
+            let mut entry = TreeLeafEntry::new(key, reference, locator);
+            entry.range_max = (!range_max.is_empty()).then_some(range_max);
+            entries.push(entry);
         }
         if entries
             .windows(2)
@@ -1910,6 +1931,12 @@ impl TreeChunk {
         self.entries
             .first()
             .map(|entry| entry.key.clone())
+            .ok_or_else(|| Error::protocol("typed tree", "empty node"))
+    }
+    fn last_key(&self) -> Result<String> {
+        self.entries
+            .last()
+            .map(|entry| entry.range_max.clone().unwrap_or_else(|| entry.key.clone()))
             .ok_or_else(|| Error::protocol("typed tree", "empty node"))
     }
 }
@@ -1971,8 +1998,8 @@ mod persistent_tree_tests {
 
     fn limits() -> IndexStoreLimits {
         IndexStoreLimits {
-            maximum_logical_chunk_bytes: 16 * 1024,
-            maximum_serialized_chunk_bytes: 32 * 1024,
+            maximum_logical_chunk_bytes: 32 * 1024,
+            maximum_serialized_chunk_bytes: 64 * 1024,
             maximum_records_per_chunk: 64,
             maximum_manifest_bytes: 64 * 1024,
             maximum_checkpoint_bytes: 4096,
@@ -2127,6 +2154,27 @@ mod persistent_tree_tests {
             index.output(&output.reference).is_some(),
             "guarded point lookup"
         );
+        let page = index
+            .persistent_tree_projection_page("outputs", 2)
+            .expect("metered page owner");
+        assert_eq!(page.projections().len(), 2);
+        assert_eq!(page.reservation_count(), 2);
+        assert!(
+            meter.snapshot().live_bytes > 0,
+            "page owns live reservations"
+        );
+        drop(page);
+        assert_eq!(meter.snapshot().live_bytes, 0, "page drop releases bytes");
+        let lookup = index
+            .persistent_tree_lookup("outputs", output.reference.as_str())
+            .expect("metered lookup")
+            .expect("lookup projection");
+        assert!(
+            meter.snapshot().live_bytes > 0,
+            "lookup owns live reservation"
+        );
+        drop(lookup);
+        assert_eq!(meter.snapshot().live_bytes, 0, "lookup drop releases bytes");
         let (_larger_store, _larger_roots, larger_index, larger_meter) = published(257);
         larger_index
             .visit_persistent_tree("order:outputs:oldest", 32, |_, _| true)

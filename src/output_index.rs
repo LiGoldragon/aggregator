@@ -943,6 +943,40 @@ impl ProjectionTreeOrdering {
     }
 }
 
+/// Owns decoded projection data and its matching live-byte reservations. Dropping the page is
+/// the sole point at which page bytes stop contributing to the resource meter.
+#[derive(Debug)]
+pub struct PersistentProjectionPage {
+    projections: Vec<ProjectionRecordDto>,
+    reservations: Vec<instrumentation::IndexReservation>,
+}
+impl PersistentProjectionPage {
+    pub fn projections(&self) -> &[ProjectionRecordDto] {
+        &self.projections
+    }
+    pub fn reservation_count(&self) -> usize {
+        self.reservations.len()
+    }
+    pub fn into_projections(self) -> Vec<ProjectionRecordDto> {
+        self.projections
+    }
+}
+
+/// Owns one lookup projection and its live-byte reservation.
+#[derive(Debug)]
+pub struct PersistentProjection {
+    projection: ProjectionRecordDto,
+    _reservation: instrumentation::IndexReservation,
+}
+impl PersistentProjection {
+    pub fn projection(&self) -> &ProjectionRecordDto {
+        &self.projection
+    }
+    fn into_projection(self) -> ProjectionRecordDto {
+        self.projection
+    }
+}
+
 /// Query handle for one immutable v3 publication. It owns scalar roots only: decoding a
 /// collection is a bounded tree walk, never a directory enumeration or corpus reconstruction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1117,6 +1151,33 @@ impl PersistentIndex {
             None => Ok(0),
         }
     }
+    /// Returns a metered named-root page whose reservations outlive traversal.
+    pub fn persistent_tree_projection_page(
+        &self,
+        name: &str,
+        budget: u64,
+    ) -> Result<PersistentProjectionPage> {
+        match &self.tree {
+            Some(tree) => tree.named_projection_page(name, budget),
+            None => Ok(PersistentProjectionPage {
+                projections: Vec::new(),
+                reservations: Vec::new(),
+            }),
+        }
+    }
+
+    /// Returns a metered point-lookup owner whose reservation lives with the projection.
+    pub fn persistent_tree_lookup(
+        &self,
+        name: &str,
+        reference: &str,
+    ) -> Result<Option<PersistentProjection>> {
+        match &self.tree {
+            Some(tree) => tree.named_lookup(name, reference),
+            None => Ok(None),
+        }
+    }
+
     fn count(&self, collection: PersistentCollection) -> u64 {
         self.tree
             .as_ref()
@@ -1128,6 +1189,7 @@ impl PersistentIndex {
         self.tree
             .as_ref()
             .and_then(|tree| tree.projections(collection).ok())
+            .map(PersistentProjectionPage::into_projections)
             .unwrap_or_default()
     }
     fn lookup(
@@ -1139,6 +1201,7 @@ impl PersistentIndex {
             .as_ref()
             .and_then(|tree| tree.lookup(collection, reference).ok())
             .flatten()
+            .map(PersistentProjection::into_projection)
     }
 }
 
@@ -1242,12 +1305,38 @@ impl PersistentProjectionTree {
             .map(|byte| format!("{byte:02x}"))
             .collect()
     }
-    fn projections(&self, collection: PersistentCollection) -> Result<Vec<ProjectionRecordDto>> {
-        let Some(root) = self.root(collection) else {
-            return Ok(Vec::new());
+    fn named_projection_page(&self, name: &str, budget: u64) -> Result<PersistentProjectionPage> {
+        let Some(root) = self.named_root(name) else {
+            return Ok(PersistentProjectionPage {
+                projections: Vec::new(),
+                reservations: Vec::new(),
+            });
         };
         let Some(locator) = &root.locator else {
-            return Ok(Vec::new());
+            return Ok(PersistentProjectionPage {
+                projections: Vec::new(),
+                reservations: Vec::new(),
+            });
+        };
+        GuardedTreeWalker::new(
+            self,
+            TreeTraversalLimits::new(root.count, self.store.limits(), budget),
+        )
+        .collect_projections(locator)
+    }
+
+    fn projections(&self, collection: PersistentCollection) -> Result<PersistentProjectionPage> {
+        let Some(root) = self.root(collection) else {
+            return Ok(PersistentProjectionPage {
+                projections: Vec::new(),
+                reservations: Vec::new(),
+            });
+        };
+        let Some(locator) = &root.locator else {
+            return Ok(PersistentProjectionPage {
+                projections: Vec::new(),
+                reservations: Vec::new(),
+            });
         };
         GuardedTreeWalker::new(
             self,
@@ -1259,11 +1348,25 @@ impl PersistentProjectionTree {
         )
         .collect_projections(locator)
     }
+    fn named_lookup(&self, name: &str, reference: &str) -> Result<Option<PersistentProjection>> {
+        let Some(root) = self.named_root(name) else {
+            return Ok(None);
+        };
+        let Some(locator) = root.locator.clone() else {
+            return Ok(None);
+        };
+        GuardedTreeWalker::new(
+            self,
+            TreeTraversalLimits::new(root.count, self.store.limits(), 1),
+        )
+        .lookup(&locator, reference)
+    }
+
     fn lookup(
         &self,
         collection: PersistentCollection,
         reference: &str,
-    ) -> Result<Option<ProjectionRecordDto>> {
+    ) -> Result<Option<PersistentProjection>> {
         let Some(root) = self.root(collection) else {
             return Ok(None);
         };
@@ -1362,10 +1465,14 @@ struct PersistentTreeEntry {
     key: String,
     reference: String,
     locator: String,
+    range_max: Option<String>,
 }
 impl PersistentTreeEntry {
     fn logical_bytes(&self) -> u64 {
-        (self.key.len() + self.reference.len() + self.locator.len()) as u64
+        (self.key.len()
+            + self.reference.len()
+            + self.locator.len()
+            + self.range_max.as_ref().map_or(0, String::len)) as u64
     }
 }
 
@@ -1447,6 +1554,8 @@ impl PersistentTreeNode {
             }
             let reference = String::from_utf8(get("tree-reference")?.to_vec())
                 .map_err(|_| Error::protocol("persistent tree", "invalid reference"))?;
+            let range_max = String::from_utf8(get("tree-range-max")?.to_vec())
+                .map_err(|_| Error::protocol("persistent tree", "invalid range max"))?;
             let locator = String::from_utf8(get(expected_locator)?.to_vec())
                 .map_err(|_| Error::protocol("persistent tree", "invalid locator"))?;
             if locator.is_empty()
@@ -1455,22 +1564,23 @@ impl PersistentTreeNode {
             {
                 return Err(Error::protocol("persistent tree", "malformed child range"));
             }
-            if kind == PersistentTreeNodeKind::Branch && !reference.is_empty() {
-                return Err(Error::protocol(
-                    "persistent tree",
-                    "branch carries leaf reference",
-                ));
+            if kind == PersistentTreeNodeKind::Branch
+                && (!reference.is_empty()
+                    || range_max.is_empty()
+                    || range_max.as_str() < key.as_str())
+            {
+                return Err(Error::protocol("persistent tree", "invalid branch range"));
             }
-            if kind == PersistentTreeNodeKind::Leaf && reference.is_empty() {
-                return Err(Error::protocol(
-                    "persistent tree",
-                    "leaf lacks exact reference",
-                ));
+            if kind == PersistentTreeNodeKind::Leaf
+                && (reference.is_empty() || !range_max.is_empty())
+            {
+                return Err(Error::protocol("persistent tree", "invalid leaf range"));
             }
             let entry = PersistentTreeEntry {
                 key,
                 reference,
                 locator,
+                range_max: (!range_max.is_empty()).then_some(range_max),
             };
             logical_bytes = logical_bytes.saturating_add(entry.logical_bytes());
             entries.push(entry);
@@ -1488,12 +1598,15 @@ impl PersistentTreeNode {
         })
     }
 
-    fn select(&self, key: &str) -> Option<&PersistentTreeEntry> {
+    fn first_key(&self) -> &str {
+        &self.entries[0].key
+    }
+
+    fn last_key(&self) -> &str {
         self.entries
-            .iter()
-            .take_while(|entry| entry.key.as_str() <= key)
             .last()
-            .or_else(|| self.entries.first())
+            .and_then(|entry| entry.range_max.as_deref())
+            .unwrap_or_else(|| self.entries.last().expect("nonempty node").key.as_str())
     }
 }
 
@@ -1526,6 +1639,43 @@ impl TreeTraversalLimits {
     }
 }
 
+#[derive(Debug, Clone)]
+struct BranchRange {
+    lower: String,
+    upper: String,
+    next_lower: Option<String>,
+}
+impl BranchRange {
+    fn from_parent(entries: &[PersistentTreeEntry], index: usize) -> Result<Self> {
+        let entry = entries
+            .get(index)
+            .ok_or_else(|| Error::protocol("persistent tree", "missing branch entry"))?;
+        Ok(Self {
+            lower: entry.key.clone(),
+            upper: entry
+                .range_max
+                .clone()
+                .ok_or_else(|| Error::protocol("persistent tree", "missing branch range"))?,
+            next_lower: entries.get(index + 1).map(|entry| entry.key.clone()),
+        })
+    }
+
+    fn authenticate(&self, child: &PersistentTreeNode) -> Result<()> {
+        if child.first_key() != self.lower || child.last_key() != self.upper {
+            return Err(Error::protocol("persistent tree", "mislinked child range"));
+        }
+        if let Some(next_lower) = &self.next_lower
+            && child.last_key() >= next_lower.as_str()
+        {
+            return Err(Error::protocol(
+                "persistent tree",
+                "overlapping child range",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The sole guarded tree reader. Collection traversal, named-root traversal, and point lookup
 /// all pass through this object, so every node read has the same depth, node, leaf, and cycle
 /// limits and its actual decoded logical bytes remain metered for the node's live scope.
@@ -1554,7 +1704,7 @@ impl<'a> GuardedTreeWalker<'a> {
         locator: &str,
         visitor: &mut impl FnMut(&str, &str) -> bool,
     ) -> Result<u64> {
-        self.visit_entry_node(locator, 1, visitor)?;
+        self.visit_entry_node(locator, 1, None, visitor)?;
         Ok(self.candidates)
     }
 
@@ -1562,17 +1712,24 @@ impl<'a> GuardedTreeWalker<'a> {
         &mut self,
         locator: &str,
         depth: u64,
+        expected: Option<&BranchRange>,
         visitor: &mut impl FnMut(&str, &str) -> bool,
     ) -> Result<bool> {
-        let node = self.load_node(locator, depth)?;
+        let node = self.load_node(locator, depth, expected)?;
         let _node_reservation = self.tree.meter.reserve(
             instrumentation::IndexWorkCategory::DecodedChunk,
             node.logical_bytes,
         );
         match node.kind {
             PersistentTreeNodeKind::Branch => {
-                for entry in &node.entries {
-                    if !self.visit_entry_node(&entry.locator, depth.saturating_add(1), visitor)? {
+                for (index, entry) in node.entries.iter().enumerate() {
+                    let range = BranchRange::from_parent(&node.entries, index)?;
+                    if !self.visit_entry_node(
+                        &entry.locator,
+                        depth.saturating_add(1),
+                        Some(&range),
+                        visitor,
+                    )? {
                         return Ok(false);
                     }
                 }
@@ -1588,27 +1745,37 @@ impl<'a> GuardedTreeWalker<'a> {
         Ok(true)
     }
 
-    fn collect_projections(mut self, locator: &str) -> Result<Vec<ProjectionRecordDto>> {
+    fn collect_projections(mut self, locator: &str) -> Result<PersistentProjectionPage> {
         let mut projections = Vec::new();
-        self.collect_node(locator, 1, &mut projections)?;
-        Ok(projections)
+        self.collect_node(locator, 1, None, &mut projections)?;
+        Ok(PersistentProjectionPage {
+            projections,
+            reservations: std::mem::take(&mut self.page_reservations),
+        })
     }
 
     fn collect_node(
         &mut self,
         locator: &str,
         depth: u64,
+        expected: Option<&BranchRange>,
         projections: &mut Vec<ProjectionRecordDto>,
     ) -> Result<bool> {
-        let node = self.load_node(locator, depth)?;
+        let node = self.load_node(locator, depth, expected)?;
         let _node_reservation = self.tree.meter.reserve(
             instrumentation::IndexWorkCategory::DecodedChunk,
             node.logical_bytes,
         );
         match node.kind {
             PersistentTreeNodeKind::Branch => {
-                for entry in node.entries {
-                    if !self.collect_node(&entry.locator, depth.saturating_add(1), projections)? {
+                for (index, entry) in node.entries.iter().enumerate() {
+                    let range = BranchRange::from_parent(&node.entries, index)?;
+                    if !self.collect_node(
+                        &entry.locator,
+                        depth.saturating_add(1),
+                        Some(&range),
+                        projections,
+                    )? {
                         return Ok(false);
                     }
                 }
@@ -1642,20 +1809,28 @@ impl<'a> GuardedTreeWalker<'a> {
         Ok(true)
     }
 
-    fn lookup(mut self, locator: &str, reference: &str) -> Result<Option<ProjectionRecordDto>> {
+    fn lookup(mut self, locator: &str, reference: &str) -> Result<Option<PersistentProjection>> {
         let mut locator = locator.to_owned();
         let mut depth = 1_u64;
+        let mut expected: Option<BranchRange> = None;
         loop {
-            let node = self.load_node(&locator, depth)?;
+            let node = self.load_node(&locator, depth, expected.as_ref())?;
             let _node_reservation = self.tree.meter.reserve(
                 instrumentation::IndexWorkCategory::DecodedChunk,
                 node.logical_bytes,
             );
-            let Some(entry) = node.select(reference).cloned() else {
+            let Some(position) = node
+                .entries
+                .iter()
+                .rposition(|entry| entry.key.as_str() <= reference)
+                .or(Some(0))
+            else {
                 return Ok(None);
             };
+            let entry = node.entries[position].clone();
             match node.kind {
                 PersistentTreeNodeKind::Branch => {
+                    expected = Some(BranchRange::from_parent(&node.entries, position)?);
                     locator = entry.locator;
                     depth = depth.saturating_add(1);
                 }
@@ -1670,12 +1845,15 @@ impl<'a> GuardedTreeWalker<'a> {
                         )?
                         .read()?
                         .projection;
-                    if let Some(projection) = &projection {
-                        let _page_reservation = self.tree.meter.reserve(
+                    if let Some(projection) = projection {
+                        let reservation = self.tree.meter.reserve(
                             instrumentation::IndexWorkCategory::PageResult,
-                            ProjectionLogicalBytes::new(projection).bytes(),
+                            ProjectionLogicalBytes::new(&projection).bytes(),
                         );
-                        return Ok(Some(projection.clone()));
+                        return Ok(Some(PersistentProjection {
+                            projection,
+                            _reservation: reservation,
+                        }));
                     }
                     return Ok(None);
                 }
@@ -1684,7 +1862,12 @@ impl<'a> GuardedTreeWalker<'a> {
         }
     }
 
-    fn load_node(&mut self, locator: &str, depth: u64) -> Result<PersistentTreeNode> {
+    fn load_node(
+        &mut self,
+        locator: &str,
+        depth: u64,
+        expected: Option<&BranchRange>,
+    ) -> Result<PersistentTreeNode> {
         if depth > self.limits.depth_budget {
             return Err(Error::protocol(
                 "persistent tree",
@@ -1703,7 +1886,7 @@ impl<'a> GuardedTreeWalker<'a> {
                 "tree node-read budget exceeded",
             ));
         }
-        PersistentTreeNode::from_chunk(
+        let node = PersistentTreeNode::from_chunk(
             self.tree
                 .store
                 .open_reader(
@@ -1711,7 +1894,11 @@ impl<'a> GuardedTreeWalker<'a> {
                     schema::IndexFileKind::IndexNode,
                 )?
                 .read()?,
-        )
+        )?;
+        if let Some(expected) = expected {
+            expected.authenticate(&node)?;
+        }
+        Ok(node)
     }
 
     fn observe_candidate(&mut self) -> bool {
@@ -1735,43 +1922,90 @@ impl<'a> ProjectionLogicalBytes<'a> {
     }
 
     fn bytes(&self) -> u64 {
-        match self.projection {
-            ProjectionRecordDto::Session(value) => self.string_bytes(&[
-                &value.reference,
-                &value.source_identifier,
-                &value.path.display,
-            ]),
-            ProjectionRecordDto::Subagent(value) => {
-                self.string_bytes(&[&value.reference, &value.session_reference, &value.name])
+        let base = std::mem::size_of_val(self.projection) as u64;
+        base.saturating_add(match self.projection {
+            ProjectionRecordDto::Session(value) => {
+                self.text(&value.reference)
+                    + self.text(&value.source_identifier)
+                    + self.path(&value.path)
+                    + self.optional(&value.started_at)
+                    + self.optional(&value.last_observed_at)
+                    + self.optional(&value.producer_session_identifier)
+                    + self.size(&value.size)
             }
-            ProjectionRecordDto::Output(value) => self.string_bytes(&[
-                &value.reference,
-                &value.session_reference,
-                &value.source_identifier,
-                &value.path.display,
-                &value.text_hash,
-                &value.preview_text,
-            ]),
-            ProjectionRecordDto::Segment(value) => self.string_bytes(&[
-                &value.reference,
-                &value.output_reference,
-                &value.path.display,
-                &value.preview_text,
-            ]),
-            ProjectionRecordDto::TranscriptBlock(value) => self.string_bytes(&[
-                &value.reference,
-                &value.session_reference,
-                &value.source_identifier,
-                &value.path.display,
-                &value.text_hash,
-                &value.preview_text,
-            ]),
-        }
+            ProjectionRecordDto::Subagent(value) => {
+                self.text(&value.reference)
+                    + self.text(&value.session_reference)
+                    + self.text(&value.name)
+                    + self.task(value.task.as_ref())
+                    + self.optional(&value.first_observed_at)
+                    + self.optional(&value.last_observed_at)
+                    + self.size(&value.size)
+            }
+            ProjectionRecordDto::Output(value) => {
+                self.text(&value.reference)
+                    + self.text(&value.session_reference)
+                    + self.optional(&value.subagent_reference)
+                    + self.optional(&value.title)
+                    + self.task(value.task.as_ref())
+                    + self.text(&value.source_identifier)
+                    + self.optional(&value.produced_at)
+                    + self.path(&value.path)
+                    + self.text(&value.text_hash)
+                    + self.size(&value.size)
+                    + self.text(&value.preview_text)
+            }
+            ProjectionRecordDto::Segment(value) => {
+                self.text(&value.reference)
+                    + self.text(&value.output_reference)
+                    + self.range(value.byte_range)
+                    + self.range(value.line_range)
+                    + self.size(&value.size)
+                    + self.text(&value.preview_text)
+                    + self.path(&value.path)
+            }
+            ProjectionRecordDto::TranscriptBlock(value) => {
+                self.text(&value.reference)
+                    + self.text(&value.session_reference)
+                    + self.optional(&value.subagent_reference)
+                    + self.task(value.task.as_ref())
+                    + self.text(&value.source_identifier)
+                    + self.optional(&value.observed_at)
+                    + self.path(&value.path)
+                    + self.text(&value.text_hash)
+                    + self.size(&value.size)
+                    + self.text(&value.preview_text)
+            }
+        })
     }
 
-    fn string_bytes(&self, values: &[&String]) -> u64 {
-        (std::mem::size_of_val(self.projection)
-            + values.iter().map(|value| value.len()).sum::<usize>()) as u64
+    fn text(&self, value: &str) -> u64 {
+        value.len() as u64 + std::mem::size_of::<String>() as u64
+    }
+
+    fn optional(&self, value: &Option<String>) -> u64 {
+        std::mem::size_of::<Option<String>>() as u64
+            + value.as_deref().map_or(0, |value| value.len() as u64)
+    }
+
+    fn path(&self, path: &schema::DiskPath) -> u64 {
+        std::mem::size_of::<schema::DiskPath>() as u64
+            + path.unix_bytes.len() as u64
+            + path.display.len() as u64
+    }
+
+    fn task(&self, task: Option<&ProjectionTaskDto>) -> u64 {
+        std::mem::size_of::<Option<ProjectionTaskDto>>() as u64
+            + task.map_or(0, |task| self.text(&task.task_identifier))
+    }
+
+    fn size(&self, _size: &ProjectionSizeDto) -> u64 {
+        std::mem::size_of::<ProjectionSizeDto>() as u64
+    }
+
+    fn range<T>(&self, range: Option<T>) -> u64 {
+        std::mem::size_of::<Option<T>>() as u64
+            + range.map_or(0, |_| std::mem::size_of::<T>() as u64)
     }
 }
 
@@ -6060,6 +6294,10 @@ mod persistent_tree_audit_tests {
                                 bytes: Vec::new(),
                             },
                             schema::IndexFieldDto {
+                                name: "tree-range-max".to_owned(),
+                                bytes: key.as_bytes().to_vec(),
+                            },
+                            schema::IndexFieldDto {
                                 name: "tree-child".to_owned(),
                                 bytes: child.as_bytes().to_vec(),
                             },
@@ -6106,6 +6344,132 @@ mod persistent_tree_audit_tests {
         let index =
             PersistentIndex::from_typed_store_with_meter(&store, meter.clone()).expect("index");
         (index, meter)
+    }
+
+    fn leaf(keys: &[&str]) -> schema::IndexChunk {
+        schema::IndexChunk {
+            schema_version: 1,
+            projection: None,
+            records: keys
+                .iter()
+                .map(|key| schema::IndexRecordDto {
+                    schema_version: 1,
+                    record_kind: 62,
+                    fields: vec![
+                        schema::IndexFieldDto {
+                            name: "tree-key".to_owned(),
+                            bytes: key.as_bytes().to_vec(),
+                        },
+                        schema::IndexFieldDto {
+                            name: "tree-key-hash".to_owned(),
+                            bytes: blake3::hash(key.as_bytes()).as_bytes().to_vec(),
+                        },
+                        schema::IndexFieldDto {
+                            name: "tree-reference".to_owned(),
+                            bytes: format!("reference-{key}").into_bytes(),
+                        },
+                        schema::IndexFieldDto {
+                            name: "tree-range-max".to_owned(),
+                            bytes: Vec::new(),
+                        },
+                        schema::IndexFieldDto {
+                            name: "tree-projection".to_owned(),
+                            bytes: b"projection".to_vec(),
+                        },
+                    ],
+                })
+                .collect(),
+        }
+    }
+
+    fn branch(ranges: &[(&str, &str, &str)]) -> schema::IndexChunk {
+        schema::IndexChunk {
+            schema_version: 1,
+            projection: None,
+            records: ranges
+                .iter()
+                .map(|(key, maximum, child)| schema::IndexRecordDto {
+                    schema_version: 1,
+                    record_kind: 63,
+                    fields: vec![
+                        schema::IndexFieldDto {
+                            name: "tree-key".to_owned(),
+                            bytes: key.as_bytes().to_vec(),
+                        },
+                        schema::IndexFieldDto {
+                            name: "tree-key-hash".to_owned(),
+                            bytes: blake3::hash(key.as_bytes()).as_bytes().to_vec(),
+                        },
+                        schema::IndexFieldDto {
+                            name: "tree-reference".to_owned(),
+                            bytes: Vec::new(),
+                        },
+                        schema::IndexFieldDto {
+                            name: "tree-range-max".to_owned(),
+                            bytes: maximum.as_bytes().to_vec(),
+                        },
+                        schema::IndexFieldDto {
+                            name: "tree-child".to_owned(),
+                            bytes: child.as_bytes().to_vec(),
+                        },
+                    ],
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn branch_ranges_authenticate_child_contents_before_visiting_leaves() {
+        let (valid, _) = published_adversarial_tree(vec![
+            ("node-0".to_owned(), branch(&[("a", "b", "node-1")])),
+            ("node-1".to_owned(), leaf(&["a", "b"])),
+        ]);
+        assert_eq!(
+            valid
+                .visit_persistent_tree("outputs", 2, |_, _| true)
+                .expect("ordered parent"),
+            2
+        );
+
+        let (mislinked, _) = published_adversarial_tree(vec![
+            ("node-0".to_owned(), branch(&[("x", "y", "node-1")])),
+            ("node-1".to_owned(), leaf(&["a", "b"])),
+        ]);
+        assert!(
+            mislinked
+                .visit_persistent_tree("outputs", 2, |_, _| true)
+                .is_err()
+        );
+
+        let (overlapping, _) = published_adversarial_tree(vec![
+            (
+                "node-0".to_owned(),
+                branch(&[("a", "b", "node-1"), ("b", "c", "node-2")]),
+            ),
+            ("node-1".to_owned(), leaf(&["a", "b"])),
+            ("node-2".to_owned(), leaf(&["b", "c"])),
+        ]);
+        assert!(
+            overlapping
+                .visit_persistent_tree("outputs", 2, |_, _| true)
+                .is_err()
+        );
+
+        let (erroring, error_meter) = published_adversarial_tree(vec![
+            (
+                "node-0".to_owned(),
+                branch(&[("a", "a", "node-1"), ("x", "z", "node-2")]),
+            ),
+            ("node-1".to_owned(), leaf(&["a"])),
+            ("node-2".to_owned(), leaf(&["y", "z"])),
+        ]);
+        assert!(
+            erroring
+                .visit_persistent_tree("outputs", 16, |_, _| true)
+                .is_err()
+        );
+        assert!(error_meter.snapshot().high_water_bytes > 0);
+        assert_eq!(error_meter.snapshot().live_bytes, 0);
     }
 
     #[test]
