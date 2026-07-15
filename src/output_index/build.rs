@@ -1675,6 +1675,7 @@ struct TreeRunCursor<'a> {
     chunks: u64,
     chunk_ordinal: u64,
     entries: Vec<TreeLeafEntry>,
+    entry_reservation: Option<IndexReservation>,
     entry_ordinal: usize,
 }
 impl<'a> TreeRunCursor<'a> {
@@ -1706,16 +1707,27 @@ impl<'a> TreeRunCursor<'a> {
             chunks,
             chunk_ordinal: 0,
             entries: Vec::new(),
+            entry_reservation: None,
             entry_ordinal: 0,
         })
     }
     fn current(&mut self) -> Result<Option<&TreeLeafEntry>> {
         while self.entry_ordinal >= self.entries.len() && self.chunk_ordinal < self.chunks {
-            self.entries = TreeChunk::from_chunk(self.publisher.staging.read_chunk(
+            let entries = TreeChunk::from_chunk(self.publisher.staging.read_chunk(
                 &IndexLocator::new(self.run.chunk_name(&self.specification, self.chunk_ordinal)),
                 IndexFileKind::OrderIndex,
             )?)?
             .entries;
+            let bytes = entries
+                .iter()
+                .map(TreeLeafEntry::logical_bytes)
+                .sum::<u64>();
+            self.entry_reservation = Some(
+                self.publisher
+                    .meter
+                    .reserve(IndexWorkCategory::DecodedChunk, bytes),
+            );
+            self.entries = entries;
             self.entry_ordinal = 0;
             self.chunk_ordinal += 1;
         }
@@ -2044,7 +2056,8 @@ mod persistent_tree_tests {
         store
             .publish(&staging, &manifest_locator, identity)
             .expect("atomic publication");
-        let index = PersistentIndex::from_typed_store(&store).expect("reopen persistent trees");
+        let index = PersistentIndex::from_typed_store_with_meter(&store, meter.clone())
+            .expect("reopen persistent trees");
         (store, roots, index, meter)
     }
 
@@ -2106,13 +2119,31 @@ mod persistent_tree_tests {
             "the visitor caps requested candidates at the persistent query limit"
         );
         assert_eq!(references.len(), limits().maximum_query_candidates as usize);
-        let larger_meter = published(257).3;
-        assert_eq!(
-            meter.snapshot().high_water_bytes,
-            larger_meter.snapshot().high_water_bytes,
-            "published-tree high water follows the fixed run/fan-in formula, not corpus size"
+        let output = index
+            .output_records()
+            .next()
+            .expect("live collection projection");
+        assert!(
+            index.output(&output.reference).is_some(),
+            "guarded point lookup"
         );
-        assert!(meter.snapshot().high_water_bytes <= 2 * limits().maximum_logical_chunk_bytes);
+        let (_larger_store, _larger_roots, larger_index, larger_meter) = published(257);
+        larger_index
+            .visit_persistent_tree("order:outputs:oldest", 32, |_, _| true)
+            .expect("larger bounded traversal");
+        assert_eq!(
+            larger_index.output_records().count(),
+            limits().maximum_query_candidates as usize,
+            "live collection traversal is candidate-capped"
+        );
+        let fixed_high_water = 6 * limits().maximum_logical_chunk_bytes;
+        assert!(
+            meter.snapshot().high_water_bytes <= fixed_high_water
+                && larger_meter.snapshot().high_water_bytes <= fixed_high_water,
+            "reader and merge high water are bounded by the fixed fan-in/chunk formula"
+        );
+        assert_eq!(meter.snapshot().live_bytes, 0);
+        assert_eq!(larger_meter.snapshot().live_bytes, 0);
     }
 
     fn relationship_output(session_reference: String, reference: &str) -> ProjectionRecordDto {

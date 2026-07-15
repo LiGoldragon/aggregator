@@ -960,6 +960,13 @@ impl PersistentIndex {
     }
 
     pub fn from_typed_store(store: &IndexStore) -> Result<Self> {
+        Self::from_typed_store_with_meter(store, instrumentation::IndexResourceMeter::default())
+    }
+
+    pub fn from_typed_store_with_meter(
+        store: &IndexStore,
+        meter: instrumentation::IndexResourceMeter,
+    ) -> Result<Self> {
         let Some(pointer) = store.read_current_pointer()? else {
             return Ok(Self::empty());
         };
@@ -969,6 +976,7 @@ impl PersistentIndex {
                 store.clone(),
                 pointer,
                 manifest,
+                meter,
             )?),
         })
     }
@@ -1134,18 +1142,26 @@ impl PersistentIndex {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct PersistentProjectionTree {
     store: IndexStore,
     pointer: schema::CurrentPointer,
     roots: Vec<PersistentTreeRoot>,
+    meter: instrumentation::IndexResourceMeter,
 }
+impl PartialEq for PersistentProjectionTree {
+    fn eq(&self, other: &Self) -> bool {
+        self.store == other.store && self.pointer == other.pointer && self.roots == other.roots
+    }
+}
+impl Eq for PersistentProjectionTree {}
 
 impl PersistentProjectionTree {
     fn from_manifest(
         store: IndexStore,
         pointer: schema::CurrentPointer,
         manifest: schema::IndexChunk,
+        meter: instrumentation::IndexResourceMeter,
     ) -> Result<Self> {
         let roots = manifest
             .records
@@ -1177,6 +1193,7 @@ impl PersistentProjectionTree {
             store,
             pointer,
             roots,
+            meter,
         })
     }
     fn root(&self, collection: PersistentCollection) -> Option<&PersistentTreeRoot> {
@@ -1201,12 +1218,11 @@ impl PersistentProjectionTree {
         let Some(locator) = &root.locator else {
             return Ok(0);
         };
-        PersistentTreeEntryWalk::new(
+        GuardedTreeWalker::new(
             self,
             TreeTraversalLimits::new(root.count, self.store.limits(), budget),
-            visitor,
         )
-        .visit(locator)
+        .visit_entries(locator, visitor)
     }
     fn locator(&self, leaf: &str) -> String {
         if leaf.contains('/') {
@@ -1233,13 +1249,15 @@ impl PersistentProjectionTree {
         let Some(locator) = &root.locator else {
             return Ok(Vec::new());
         };
-        let mut projections = Vec::new();
-        PersistentTreeWalk::new(
+        GuardedTreeWalker::new(
             self,
-            limits::IndexStoreLimits::default().maximum_query_candidates,
+            TreeTraversalLimits::new(
+                root.count,
+                self.store.limits(),
+                self.store.limits().maximum_query_candidates,
+            ),
         )
-        .visit(locator, &mut projections)?;
-        Ok(projections)
+        .collect_projections(locator)
     }
     fn lookup(
         &self,
@@ -1249,37 +1267,14 @@ impl PersistentProjectionTree {
         let Some(root) = self.root(collection) else {
             return Ok(None);
         };
-        let Some(mut locator) = root.locator.clone() else {
+        let Some(locator) = root.locator.clone() else {
             return Ok(None);
         };
-        loop {
-            let node = PersistentTreeNode::from_chunk(
-                self.store
-                    .open_reader(
-                        &store::IndexLocator::new(self.locator(&locator)),
-                        schema::IndexFileKind::IndexNode,
-                    )?
-                    .read()?,
-            )?;
-            let Some(entry) = node.select(reference) else {
-                return Ok(None);
-            };
-            if node.children {
-                locator = entry.locator.clone();
-            } else if entry.key == reference {
-                let projection = self
-                    .store
-                    .open_reader(
-                        &store::IndexLocator::new(self.locator(&entry.locator)),
-                        schema::IndexFileKind::Projection,
-                    )?
-                    .read()?
-                    .projection;
-                return Ok(projection);
-            } else {
-                return Ok(None);
-            }
-        }
+        GuardedTreeWalker::new(
+            self,
+            TreeTraversalLimits::new(root.count, self.store.limits(), 1),
+        )
+        .lookup(&locator, reference)
     }
 }
 
@@ -1368,22 +1363,60 @@ struct PersistentTreeEntry {
     reference: String,
     locator: String,
 }
+impl PersistentTreeEntry {
+    fn logical_bytes(&self) -> u64 {
+        (self.key.len() + self.reference.len() + self.locator.len()) as u64
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistentTreeNodeKind {
+    Leaf,
+    Branch,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PersistentTreeNode {
     entries: Vec<PersistentTreeEntry>,
-    children: bool,
+    kind: PersistentTreeNodeKind,
+    logical_bytes: u64,
 }
 impl PersistentTreeNode {
     fn from_chunk(chunk: schema::IndexChunk) -> Result<Self> {
-        if chunk.records.len() > 16 {
-            return Err(Error::protocol("persistent tree", "fixed fanout exceeded"));
+        if chunk.records.is_empty() || chunk.records.len() > 16 {
+            return Err(Error::protocol("persistent tree", "invalid fixed fanout"));
         }
-        let children = chunk
-            .records
-            .first()
-            .is_some_and(|record| record.record_kind == 63);
+        let kind = match chunk.records[0].record_kind {
+            62 => PersistentTreeNodeKind::Leaf,
+            63 => PersistentTreeNodeKind::Branch,
+            _ => {
+                return Err(Error::protocol(
+                    "persistent tree",
+                    "invalid node record kind",
+                ));
+            }
+        };
+        let expected_locator = match kind {
+            PersistentTreeNodeKind::Leaf => "tree-projection",
+            PersistentTreeNodeKind::Branch => "tree-child",
+        };
+        let forbidden_locator = match kind {
+            PersistentTreeNodeKind::Leaf => "tree-child",
+            PersistentTreeNodeKind::Branch => "tree-projection",
+        };
         let mut entries = Vec::with_capacity(chunk.records.len());
+        let mut logical_bytes = 0_u64;
         for record in chunk.records {
+            let expected_kind = match kind {
+                PersistentTreeNodeKind::Leaf => 62,
+                PersistentTreeNodeKind::Branch => 63,
+            };
+            if record.record_kind != expected_kind {
+                return Err(Error::protocol(
+                    "persistent tree",
+                    "mixed node record kinds",
+                ));
+            }
             let get = |name: &str| {
                 record
                     .fields
@@ -1392,96 +1425,75 @@ impl PersistentTreeNode {
                     .map(|field| field.bytes.as_slice())
                     .ok_or_else(|| Error::protocol("persistent tree", "missing node field"))
             };
+            if record
+                .fields
+                .iter()
+                .any(|field| field.name == forbidden_locator)
+            {
+                return Err(Error::protocol(
+                    "persistent tree",
+                    "wrong child range shape",
+                ));
+            }
             let key = String::from_utf8(get("tree-key")?.to_vec())
                 .map_err(|_| Error::protocol("persistent tree", "invalid key"))?;
-            if let Some(field) = record
-                .fields
-                .iter()
-                .find(|field| field.name == "tree-key-hash")
-            {
-                let key_hash = <[u8; 32]>::try_from(field.bytes.as_slice())
-                    .map_err(|_| Error::protocol("persistent tree", "invalid key hash"))?;
-                if blake3::hash(key.as_bytes()).as_bytes() != &key_hash {
-                    return Err(Error::protocol(
-                        "persistent tree",
-                        "key collision or corruption",
-                    ));
-                }
+            let key_hash = <[u8; 32]>::try_from(get("tree-key-hash")?)
+                .map_err(|_| Error::protocol("persistent tree", "invalid key hash"))?;
+            if blake3::hash(key.as_bytes()).as_bytes() != &key_hash {
+                return Err(Error::protocol(
+                    "persistent tree",
+                    "key collision or corruption",
+                ));
             }
-            let reference = record
-                .fields
-                .iter()
-                .find(|field| field.name == "tree-reference")
-                .map(|field| String::from_utf8(field.bytes.clone()))
-                .transpose()
-                .map_err(|_| Error::protocol("persistent tree", "invalid reference"))?
-                .unwrap_or_else(|| key.clone());
-            entries.push(PersistentTreeEntry {
+            let reference = String::from_utf8(get("tree-reference")?.to_vec())
+                .map_err(|_| Error::protocol("persistent tree", "invalid reference"))?;
+            let locator = String::from_utf8(get(expected_locator)?.to_vec())
+                .map_err(|_| Error::protocol("persistent tree", "invalid locator"))?;
+            if locator.is_empty()
+                || std::path::Path::new(&locator).is_absolute()
+                || std::path::Path::new(&locator).components().count() != 1
+            {
+                return Err(Error::protocol("persistent tree", "malformed child range"));
+            }
+            if kind == PersistentTreeNodeKind::Branch && !reference.is_empty() {
+                return Err(Error::protocol(
+                    "persistent tree",
+                    "branch carries leaf reference",
+                ));
+            }
+            if kind == PersistentTreeNodeKind::Leaf && reference.is_empty() {
+                return Err(Error::protocol(
+                    "persistent tree",
+                    "leaf lacks exact reference",
+                ));
+            }
+            let entry = PersistentTreeEntry {
                 key,
                 reference,
-                locator: String::from_utf8(
-                    get(if children {
-                        "tree-child"
-                    } else {
-                        "tree-projection"
-                    })?
-                    .to_vec(),
-                )
-                .map_err(|_| Error::protocol("persistent tree", "invalid locator"))?,
-            });
+                locator,
+            };
+            logical_bytes = logical_bytes.saturating_add(entry.logical_bytes());
+            entries.push(entry);
         }
-        Ok(Self { entries, children })
+        if entries.windows(2).any(|pair| pair[0].key >= pair[1].key) {
+            return Err(Error::protocol(
+                "persistent tree",
+                "unsorted or duplicate node keys",
+            ));
+        }
+        Ok(Self {
+            entries,
+            kind,
+            logical_bytes,
+        })
     }
+
     fn select(&self, key: &str) -> Option<&PersistentTreeEntry> {
         self.entries
             .iter()
             .take_while(|entry| entry.key.as_str() <= key)
             .last()
             .or_else(|| self.entries.first())
-    }
-}
-#[derive(Debug, Clone, Copy)]
-struct PersistentTreeWalk<'a> {
-    tree: &'a PersistentProjectionTree,
-    budget: u64,
-}
-impl<'a> PersistentTreeWalk<'a> {
-    fn new(tree: &'a PersistentProjectionTree, budget: u64) -> Self {
-        Self { tree, budget }
-    }
-    fn visit(self, locator: &str, projections: &mut Vec<ProjectionRecordDto>) -> Result<()> {
-        if projections.len() as u64 >= self.budget {
-            return Ok(());
-        }
-        let node = PersistentTreeNode::from_chunk(
-            self.tree
-                .store
-                .open_reader(
-                    &store::IndexLocator::new(self.tree.locator(locator)),
-                    schema::IndexFileKind::IndexNode,
-                )?
-                .read()?,
-        )?;
-        for entry in node.entries {
-            if projections.len() as u64 >= self.budget {
-                break;
-            }
-            if node.children {
-                Self::new(self.tree, self.budget).visit(&entry.locator, projections)?;
-            } else if let Some(projection) = self
-                .tree
-                .store
-                .open_reader(
-                    &store::IndexLocator::new(self.tree.locator(&entry.locator)),
-                    schema::IndexFileKind::Projection,
-                )?
-                .read()?
-                .projection
-            {
-                projections.push(projection);
-            }
-        }
-        Ok(())
     }
 }
 
@@ -1514,41 +1526,165 @@ impl TreeTraversalLimits {
     }
 }
 
-/// A bounded leaf-entry visitor used by order and relationship readers. It retains only one
-/// decoded node per recursion frame and rejects cyclic or repeated locators before repeated IO.
-struct PersistentTreeEntryWalk<'a, 'visitor, F> {
+/// The sole guarded tree reader. Collection traversal, named-root traversal, and point lookup
+/// all pass through this object, so every node read has the same depth, node, leaf, and cycle
+/// limits and its actual decoded logical bytes remain metered for the node's live scope.
+struct GuardedTreeWalker<'a> {
     tree: &'a PersistentProjectionTree,
     limits: TreeTraversalLimits,
-    visited: u64,
+    candidates: u64,
     node_reads: u64,
     locators: BTreeMap<String, u64>,
-    visitor: &'visitor mut F,
+    page_reservations: Vec<instrumentation::IndexReservation>,
 }
-impl<'a, 'visitor, F: FnMut(&str, &str) -> bool> PersistentTreeEntryWalk<'a, 'visitor, F> {
-    fn new(
-        tree: &'a PersistentProjectionTree,
-        limits: TreeTraversalLimits,
-        visitor: &'visitor mut F,
-    ) -> Self {
+impl<'a> GuardedTreeWalker<'a> {
+    fn new(tree: &'a PersistentProjectionTree, limits: TreeTraversalLimits) -> Self {
         Self {
             tree,
             limits,
-            visited: 0,
+            candidates: 0,
             node_reads: 0,
             locators: BTreeMap::new(),
-            visitor,
+            page_reservations: Vec::new(),
         }
     }
 
-    fn visit(mut self, locator: &str) -> Result<u64> {
-        self.visit_node(locator, 1)?;
-        Ok(self.visited)
+    fn visit_entries(
+        mut self,
+        locator: &str,
+        visitor: &mut impl FnMut(&str, &str) -> bool,
+    ) -> Result<u64> {
+        self.visit_entry_node(locator, 1, visitor)?;
+        Ok(self.candidates)
     }
 
-    fn visit_node(&mut self, locator: &str, depth: u64) -> Result<bool> {
-        if self.visited >= self.limits.candidate_budget {
-            return Ok(false);
+    fn visit_entry_node(
+        &mut self,
+        locator: &str,
+        depth: u64,
+        visitor: &mut impl FnMut(&str, &str) -> bool,
+    ) -> Result<bool> {
+        let node = self.load_node(locator, depth)?;
+        let _node_reservation = self.tree.meter.reserve(
+            instrumentation::IndexWorkCategory::DecodedChunk,
+            node.logical_bytes,
+        );
+        match node.kind {
+            PersistentTreeNodeKind::Branch => {
+                for entry in &node.entries {
+                    if !self.visit_entry_node(&entry.locator, depth.saturating_add(1), visitor)? {
+                        return Ok(false);
+                    }
+                }
+            }
+            PersistentTreeNodeKind::Leaf => {
+                for entry in &node.entries {
+                    if !self.observe_candidate() || !visitor(&entry.key, &entry.reference) {
+                        return Ok(false);
+                    }
+                }
+            }
         }
+        Ok(true)
+    }
+
+    fn collect_projections(mut self, locator: &str) -> Result<Vec<ProjectionRecordDto>> {
+        let mut projections = Vec::new();
+        self.collect_node(locator, 1, &mut projections)?;
+        Ok(projections)
+    }
+
+    fn collect_node(
+        &mut self,
+        locator: &str,
+        depth: u64,
+        projections: &mut Vec<ProjectionRecordDto>,
+    ) -> Result<bool> {
+        let node = self.load_node(locator, depth)?;
+        let _node_reservation = self.tree.meter.reserve(
+            instrumentation::IndexWorkCategory::DecodedChunk,
+            node.logical_bytes,
+        );
+        match node.kind {
+            PersistentTreeNodeKind::Branch => {
+                for entry in node.entries {
+                    if !self.collect_node(&entry.locator, depth.saturating_add(1), projections)? {
+                        return Ok(false);
+                    }
+                }
+            }
+            PersistentTreeNodeKind::Leaf => {
+                for entry in node.entries {
+                    if !self.observe_candidate() {
+                        return Ok(false);
+                    }
+                    if let Some(projection) = self
+                        .tree
+                        .store
+                        .open_reader(
+                            &store::IndexLocator::new(self.tree.locator(&entry.locator)),
+                            schema::IndexFileKind::Projection,
+                        )?
+                        .read()?
+                        .projection
+                    {
+                        let bytes = ProjectionLogicalBytes::new(&projection).bytes();
+                        self.page_reservations.push(
+                            self.tree
+                                .meter
+                                .reserve(instrumentation::IndexWorkCategory::PageResult, bytes),
+                        );
+                        projections.push(projection);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn lookup(mut self, locator: &str, reference: &str) -> Result<Option<ProjectionRecordDto>> {
+        let mut locator = locator.to_owned();
+        let mut depth = 1_u64;
+        loop {
+            let node = self.load_node(&locator, depth)?;
+            let _node_reservation = self.tree.meter.reserve(
+                instrumentation::IndexWorkCategory::DecodedChunk,
+                node.logical_bytes,
+            );
+            let Some(entry) = node.select(reference).cloned() else {
+                return Ok(None);
+            };
+            match node.kind {
+                PersistentTreeNodeKind::Branch => {
+                    locator = entry.locator;
+                    depth = depth.saturating_add(1);
+                }
+                PersistentTreeNodeKind::Leaf if entry.key == reference => {
+                    self.observe_candidate();
+                    let projection = self
+                        .tree
+                        .store
+                        .open_reader(
+                            &store::IndexLocator::new(self.tree.locator(&entry.locator)),
+                            schema::IndexFileKind::Projection,
+                        )?
+                        .read()?
+                        .projection;
+                    if let Some(projection) = &projection {
+                        let _page_reservation = self.tree.meter.reserve(
+                            instrumentation::IndexWorkCategory::PageResult,
+                            ProjectionLogicalBytes::new(projection).bytes(),
+                        );
+                        return Ok(Some(projection.clone()));
+                    }
+                    return Ok(None);
+                }
+                PersistentTreeNodeKind::Leaf => return Ok(None),
+            }
+        }
+    }
+
+    fn load_node(&mut self, locator: &str, depth: u64) -> Result<PersistentTreeNode> {
         if depth > self.limits.depth_budget {
             return Err(Error::protocol(
                 "persistent tree",
@@ -1567,7 +1703,7 @@ impl<'a, 'visitor, F: FnMut(&str, &str) -> bool> PersistentTreeEntryWalk<'a, 'vi
                 "tree node-read budget exceeded",
             ));
         }
-        let node = PersistentTreeNode::from_chunk(
+        PersistentTreeNode::from_chunk(
             self.tree
                 .store
                 .open_reader(
@@ -1575,23 +1711,67 @@ impl<'a, 'visitor, F: FnMut(&str, &str) -> bool> PersistentTreeEntryWalk<'a, 'vi
                     schema::IndexFileKind::IndexNode,
                 )?
                 .read()?,
-        )?;
-        for entry in node.entries {
-            if self.visited >= self.limits.candidate_budget {
-                return Ok(false);
-            }
-            if node.children {
-                if !self.visit_node(&entry.locator, depth.saturating_add(1))? {
-                    return Ok(false);
-                }
-            } else {
-                self.visited += 1;
-                if !(self.visitor)(&entry.key, &entry.reference) {
-                    return Ok(false);
-                }
-            }
+        )
+    }
+
+    fn observe_candidate(&mut self) -> bool {
+        if self.candidates >= self.limits.candidate_budget {
+            return false;
         }
-        Ok(true)
+        self.candidates = self.candidates.saturating_add(1);
+        self.tree.meter.observe_query_candidates(1);
+        true
+    }
+}
+
+/// The projection DTO itself is the page object. This is its live logical representation, not a
+/// configured reservation: every owned string and byte field is counted while the page vector owns it.
+struct ProjectionLogicalBytes<'a> {
+    projection: &'a ProjectionRecordDto,
+}
+impl<'a> ProjectionLogicalBytes<'a> {
+    fn new(projection: &'a ProjectionRecordDto) -> Self {
+        Self { projection }
+    }
+
+    fn bytes(&self) -> u64 {
+        match self.projection {
+            ProjectionRecordDto::Session(value) => self.string_bytes(&[
+                &value.reference,
+                &value.source_identifier,
+                &value.path.display,
+            ]),
+            ProjectionRecordDto::Subagent(value) => {
+                self.string_bytes(&[&value.reference, &value.session_reference, &value.name])
+            }
+            ProjectionRecordDto::Output(value) => self.string_bytes(&[
+                &value.reference,
+                &value.session_reference,
+                &value.source_identifier,
+                &value.path.display,
+                &value.text_hash,
+                &value.preview_text,
+            ]),
+            ProjectionRecordDto::Segment(value) => self.string_bytes(&[
+                &value.reference,
+                &value.output_reference,
+                &value.path.display,
+                &value.preview_text,
+            ]),
+            ProjectionRecordDto::TranscriptBlock(value) => self.string_bytes(&[
+                &value.reference,
+                &value.session_reference,
+                &value.source_identifier,
+                &value.path.display,
+                &value.text_hash,
+                &value.preview_text,
+            ]),
+        }
+    }
+
+    fn string_bytes(&self, values: &[&String]) -> u64 {
+        (std::mem::size_of_val(self.projection)
+            + values.iter().map(|value| value.len()).sum::<usize>()) as u64
     }
 }
 
@@ -5816,6 +5996,7 @@ mod persistent_tree_audit_tests {
                     records: missing,
                     projection: None
                 },
+                instrumentation::IndexResourceMeter::default(),
             )
             .is_err()
         );
@@ -5831,6 +6012,7 @@ mod persistent_tree_audit_tests {
                     records: duplicate,
                     projection: None
                 },
+                instrumentation::IndexResourceMeter::default(),
             )
             .is_err()
         );
@@ -5846,6 +6028,7 @@ mod persistent_tree_audit_tests {
                     records: unknown,
                     projection: None
                 },
+                instrumentation::IndexResourceMeter::default(),
             )
             .is_err()
         );
@@ -5887,7 +6070,9 @@ mod persistent_tree_audit_tests {
         }
     }
 
-    fn published_adversarial_tree(nodes: Vec<(String, schema::IndexChunk)>) -> PersistentIndex {
+    fn published_adversarial_tree(
+        nodes: Vec<(String, schema::IndexChunk)>,
+    ) -> (PersistentIndex, instrumentation::IndexResourceMeter) {
         let temporary = TempDir::new().expect("tree audit store");
         let root = temporary.keep();
         let store = IndexStore::new(root.join("index"), limits::IndexStoreLimits::default());
@@ -5917,18 +6102,73 @@ mod persistent_tree_audit_tests {
         store
             .publish(&staging, &manifest_locator, [7; 32])
             .expect("publish");
-        PersistentIndex::from_typed_store(&store).expect("index")
+        let meter = instrumentation::IndexResourceMeter::default();
+        let index =
+            PersistentIndex::from_typed_store_with_meter(&store, meter.clone()).expect("index");
+        (index, meter)
+    }
+
+    #[test]
+    fn guarded_reader_rejects_mixed_unsorted_duplicate_and_malformed_ranges() {
+        let mut mixed = node(&["child".to_owned()]);
+        mixed.records[0].record_kind = 62;
+        assert!(PersistentTreeNode::from_chunk(mixed.clone()).is_err());
+
+        let mut unsorted = node(&["first".to_owned(), "second".to_owned()]);
+        unsorted.records.swap(0, 1);
+        assert!(PersistentTreeNode::from_chunk(unsorted).is_err());
+
+        let mut duplicate = node(&["first".to_owned(), "second".to_owned()]);
+        let duplicate_key = duplicate.records[0]
+            .fields
+            .iter()
+            .find(|field| field.name == "tree-key")
+            .expect("key")
+            .bytes
+            .clone();
+        duplicate.records[1]
+            .fields
+            .iter_mut()
+            .find(|field| field.name == "tree-key")
+            .expect("key")
+            .bytes = duplicate_key.clone();
+        duplicate.records[1]
+            .fields
+            .iter_mut()
+            .find(|field| field.name == "tree-key-hash")
+            .expect("hash")
+            .bytes = blake3::hash(&duplicate_key).as_bytes().to_vec();
+        assert!(PersistentTreeNode::from_chunk(duplicate).is_err());
+
+        let mut malformed_range = node(&["child".to_owned()]);
+        malformed_range.records[0]
+            .fields
+            .iter_mut()
+            .find(|field| field.name == "tree-child")
+            .expect("child")
+            .name = "tree-projection".to_owned();
+        assert!(PersistentTreeNode::from_chunk(malformed_range.clone()).is_err());
+
+        let (index, meter) =
+            published_adversarial_tree(vec![("node-0".to_owned(), malformed_range)]);
+        let tree = index.tree.as_ref().expect("tree");
+        assert!(
+            tree.lookup(PersistentCollection::Outputs, "output")
+                .is_err()
+        );
+        assert_eq!(meter.snapshot().live_bytes, 0);
     }
 
     #[test]
     fn traversal_rejects_cycles_depth_excess_and_node_read_excess() {
-        let cycle =
+        let (cycle, cycle_meter) =
             published_adversarial_tree(vec![("node-0".to_owned(), node(&["node-0".to_owned()]))]);
         assert!(
             cycle
                 .visit_persistent_tree("outputs", 1, |_, _| true)
                 .is_err()
         );
+        assert_eq!(cycle_meter.snapshot().live_bytes, 0);
 
         let mut depth_nodes = Vec::new();
         for index in 0..18 {
@@ -5936,12 +6176,13 @@ mod persistent_tree_audit_tests {
             depth_nodes.push((format!("node-{index}"), node(&[next])));
         }
         depth_nodes.push(("node-18".to_owned(), node(&[])));
-        let depth = published_adversarial_tree(depth_nodes);
+        let (depth, depth_meter) = published_adversarial_tree(depth_nodes);
         assert!(
             depth
                 .visit_persistent_tree("outputs", 1, |_, _| true)
                 .is_err()
         );
+        assert_eq!(depth_meter.snapshot().live_bytes, 0);
 
         let children = (1..=16)
             .map(|index| format!("node-{index}"))
@@ -5954,11 +6195,12 @@ mod persistent_tree_audit_tests {
             broad_nodes.push((parent, node(&leaves)));
             broad_nodes.extend(leaves.into_iter().map(|name| (name, node(&[]))));
         }
-        let broad = published_adversarial_tree(broad_nodes);
+        let (broad, broad_meter) = published_adversarial_tree(broad_nodes);
         assert!(
             broad
                 .visit_persistent_tree("outputs", 1, |_, _| true)
                 .is_err()
         );
+        assert_eq!(broad_meter.snapshot().live_bytes, 0);
     }
 }
