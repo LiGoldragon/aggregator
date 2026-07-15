@@ -968,6 +968,31 @@ impl PersistentIndex {
             .map(PersistentProjectionTree::snapshot_identity)
             .unwrap_or_default()
     }
+
+    /// Returns only scalar manifest root names. It never enumerates a generation directory.
+    pub fn persistent_tree_names(&self) -> Vec<String> {
+        self.tree
+            .as_ref()
+            .map(|tree| tree.roots.iter().map(|root| root.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Visits at most `budget` leaf entries from one named persistent root. The caller receives
+    /// exact ordering and reference material without reconstructing a collection.
+    pub fn visit_persistent_tree(
+        &self,
+        name: &str,
+        budget: u64,
+        visitor: impl FnMut(&str, &str) -> bool,
+    ) -> Result<u64> {
+        match &self.tree {
+            Some(tree) => {
+                let mut visitor = visitor;
+                tree.visit_tree_entries(name, budget, &mut visitor)
+            }
+            None => Ok(0),
+        }
+    }
     fn count(&self, collection: PersistentCollection) -> u64 {
         self.tree
             .as_ref()
@@ -1019,7 +1044,28 @@ impl PersistentProjectionTree {
         })
     }
     fn root(&self, collection: PersistentCollection) -> Option<&PersistentTreeRoot> {
-        self.roots.iter().find(|root| root.collection == collection)
+        self.roots
+            .iter()
+            .find(|root| root.name == collection.name())
+    }
+
+    fn named_root(&self, name: &str) -> Option<&PersistentTreeRoot> {
+        self.roots.iter().find(|root| root.name == name)
+    }
+
+    fn visit_tree_entries(
+        &self,
+        name: &str,
+        budget: u64,
+        visitor: &mut impl FnMut(&str, &str) -> bool,
+    ) -> Result<u64> {
+        let Some(root) = self.named_root(name) else {
+            return Ok(0);
+        };
+        let Some(locator) = &root.locator else {
+            return Ok(0);
+        };
+        PersistentTreeEntryWalk::new(self, budget, visitor).visit(locator)
     }
     fn locator(&self, leaf: &str) -> String {
         if leaf.contains('/') {
@@ -1105,7 +1151,31 @@ enum PersistentCollection {
     TranscriptBlocks,
 }
 impl PersistentCollection {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Sessions => "sessions",
+            Self::Subagents => "subagents",
+            Self::Outputs => "outputs",
+            Self::Segments => "segments",
+            Self::TranscriptBlocks => "transcript-blocks",
+        }
+    }
+
     fn parse(value: &str) -> Option<Self> {
+        if let Some(value) = value.strip_prefix("order:") {
+            return Self::parse(value.split_once(':')?.0);
+        }
+        if let Some(value) = value.strip_prefix("relationship:") {
+            return match value.split_once(':')?.0 {
+                "session-subagent" => Some(Self::Subagents),
+                "session-output" | "subagent-output" => Some(Self::Outputs),
+                "output-segment" => Some(Self::Segments),
+                "session-transcript-block" | "subagent-transcript-block" => {
+                    Some(Self::TranscriptBlocks)
+                }
+                _ => None,
+            };
+        }
         match value {
             "sessions" => Some(Self::Sessions),
             "subagents" => Some(Self::Subagents),
@@ -1118,6 +1188,7 @@ impl PersistentCollection {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PersistentTreeRoot {
+    name: String,
     collection: PersistentCollection,
     locator: Option<String>,
     count: u64,
@@ -1132,11 +1203,10 @@ impl PersistentTreeRoot {
                 .map(|field| field.bytes.as_slice())
                 .ok_or_else(|| Error::protocol("persistent tree", "missing manifest field"))
         };
-        let collection = PersistentCollection::parse(
-            std::str::from_utf8(value("tree-collection")?)
-                .map_err(|_| Error::protocol("persistent tree", "invalid collection"))?,
-        )
-        .ok_or_else(|| Error::protocol("persistent tree", "unknown collection"))?;
+        let name = String::from_utf8(value("tree-collection")?.to_vec())
+            .map_err(|_| Error::protocol("persistent tree", "invalid collection"))?;
+        let collection = PersistentCollection::parse(&name)
+            .ok_or_else(|| Error::protocol("persistent tree", "unknown collection"))?;
         let locator = String::from_utf8(value("tree-root")?.to_vec())
             .map_err(|_| Error::protocol("persistent tree", "invalid root"))?;
         let count_bytes = value("tree-count")?;
@@ -1144,6 +1214,7 @@ impl PersistentTreeRoot {
             .map(u64::from_le_bytes)
             .map_err(|_| Error::protocol("persistent tree", "invalid count"))?;
         Ok(Self {
+            name,
             collection,
             locator: (!locator.is_empty()).then_some(locator),
             count,
@@ -1153,6 +1224,7 @@ impl PersistentTreeRoot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PersistentTreeEntry {
     key: String,
+    reference: String,
     locator: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1176,9 +1248,33 @@ impl PersistentTreeNode {
                     .map(|field| field.bytes.as_slice())
                     .ok_or_else(|| Error::protocol("persistent tree", "missing node field"))
             };
+            let key = String::from_utf8(get("tree-key")?.to_vec())
+                .map_err(|_| Error::protocol("persistent tree", "invalid key"))?;
+            if let Some(field) = record
+                .fields
+                .iter()
+                .find(|field| field.name == "tree-key-hash")
+            {
+                let key_hash = <[u8; 32]>::try_from(field.bytes.as_slice())
+                    .map_err(|_| Error::protocol("persistent tree", "invalid key hash"))?;
+                if blake3::hash(key.as_bytes()).as_bytes() != &key_hash {
+                    return Err(Error::protocol(
+                        "persistent tree",
+                        "key collision or corruption",
+                    ));
+                }
+            }
+            let reference = record
+                .fields
+                .iter()
+                .find(|field| field.name == "tree-reference")
+                .map(|field| String::from_utf8(field.bytes.clone()))
+                .transpose()
+                .map_err(|_| Error::protocol("persistent tree", "invalid reference"))?
+                .unwrap_or_else(|| key.clone());
             entries.push(PersistentTreeEntry {
-                key: String::from_utf8(get("tree-key")?.to_vec())
-                    .map_err(|_| Error::protocol("persistent tree", "invalid key"))?,
+                key,
+                reference,
                 locator: String::from_utf8(
                     get(if children {
                         "tree-child"
@@ -1242,6 +1338,61 @@ impl<'a> PersistentTreeWalk<'a> {
             }
         }
         Ok(())
+    }
+}
+
+/// A bounded leaf-entry visitor used by order and relationship readers. It retains only one
+/// decoded node per recursion frame and stops at the caller's fixed budget.
+struct PersistentTreeEntryWalk<'a, 'visitor, F> {
+    tree: &'a PersistentProjectionTree,
+    budget: u64,
+    visited: u64,
+    visitor: &'visitor mut F,
+}
+impl<'a, 'visitor, F: FnMut(&str, &str) -> bool> PersistentTreeEntryWalk<'a, 'visitor, F> {
+    fn new(tree: &'a PersistentProjectionTree, budget: u64, visitor: &'visitor mut F) -> Self {
+        Self {
+            tree,
+            budget,
+            visited: 0,
+            visitor,
+        }
+    }
+
+    fn visit(mut self, locator: &str) -> Result<u64> {
+        self.visit_node(locator)?;
+        Ok(self.visited)
+    }
+
+    fn visit_node(&mut self, locator: &str) -> Result<bool> {
+        if self.visited >= self.budget {
+            return Ok(false);
+        }
+        let node = PersistentTreeNode::from_chunk(
+            self.tree
+                .store
+                .open_reader(
+                    &store::IndexLocator::new(self.tree.locator(locator)),
+                    schema::IndexFileKind::IndexNode,
+                )?
+                .read()?,
+        )?;
+        for entry in node.entries {
+            if self.visited >= self.budget {
+                return Ok(false);
+            }
+            if node.children {
+                if !self.visit_node(&entry.locator)? {
+                    return Ok(false);
+                }
+            } else {
+                self.visited += 1;
+                if !(self.visitor)(&entry.key, &entry.reference) {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 }
 

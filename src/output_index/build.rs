@@ -175,7 +175,6 @@ impl BoundedIndexRefresher {
             scan_outcomes.push(resumable.outcome);
             source_runs.push(run);
         }
-        let snapshot_identity = SnapshotIdentity::new(&source_runs).value();
         let complete = scan_outcomes
             .iter()
             .all(TranscriptRawReadOutcome::is_complete);
@@ -189,6 +188,16 @@ impl BoundedIndexRefresher {
                 resource_high_water_bytes: self.meter.snapshot().high_water_bytes,
             });
         }
+        let tree_roots = FixedFanoutTreePublisher::new(
+            staging.clone(),
+            self.limits,
+            &source_runs,
+            self.meter.clone(),
+        )
+        .publish()?;
+        let snapshot_identity = SnapshotIdentity::new(&source_runs)
+            .with_roots(&tree_roots)
+            .value();
         if let Some(current) = self.store.read_current_pointer()?
             && current.snapshot_identity == snapshot_identity
         {
@@ -199,8 +208,6 @@ impl BoundedIndexRefresher {
                 resource_high_water_bytes: self.meter.snapshot().high_water_bytes,
             });
         }
-        let tree_roots =
-            FixedFanoutTreePublisher::new(staging.clone(), self.limits, &source_runs).publish()?;
         let manifest = IndexManifestRecord::new(&source_runs, &tree_roots).chunk();
         let manifest_locator = IndexLocator::new("manifest");
         staging.write_chunk(&manifest_locator, IndexFileKind::Manifest, &manifest)?;
@@ -1010,16 +1017,30 @@ impl SnapshotIdentity {
         }
     }
 
+    fn with_roots(mut self, roots: &[FixedTreeRoot]) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&self.value);
+        for root in roots {
+            hasher.update(root.specification.name().as_bytes());
+            hasher.update(&[0]);
+            // Locators are generation-local capabilities.  The snapshot binds the deterministic
+            // root identity and cardinality, not the random staging-generation spelling.
+            hasher.update(&root.item_count.to_le_bytes());
+        }
+        self.value = *hasher.finalize().as_bytes();
+        self
+    }
+
     fn value(&self) -> [u8; 32] {
         self.value
     }
 }
 
-/// An immutable collection root written only after a bounded external sort. The root is a
-/// scalar manifest fact; every branch and leaf has the same fixed fanout.
+/// An immutable tree root.  Every root is a scalar manifest fact; the tree body is a
+/// fixed-fanout external merge of scalar entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FixedTreeRoot {
-    collection: FixedTreeCollection,
+    specification: TreeSpecification,
     locator: Option<String>,
     item_count: u64,
 }
@@ -1032,7 +1053,7 @@ impl FixedTreeRoot {
             fields: vec![
                 IndexFieldDto {
                     name: "tree-collection".to_owned(),
-                    bytes: self.collection.name().as_bytes().to_vec(),
+                    bytes: self.specification.name().into_bytes(),
                 },
                 IndexFieldDto {
                     name: "tree-root".to_owned(),
@@ -1077,7 +1098,7 @@ impl FixedTreeCollection {
         }
     }
 
-    fn projection_reference(self, projection: &ProjectionRecordDto) -> Option<&str> {
+    fn reference(self, projection: &ProjectionRecordDto) -> Option<&str> {
         match (self, projection) {
             (Self::Sessions, ProjectionRecordDto::Session(value)) => Some(&value.reference),
             (Self::Subagents, ProjectionRecordDto::Subagent(value)) => Some(&value.reference),
@@ -1089,15 +1110,220 @@ impl FixedTreeCollection {
             _ => None,
         }
     }
+
+    fn ordering_material(self, projection: &ProjectionRecordDto) -> Option<String> {
+        let reference = self.reference(projection)?;
+        let timestamp = match projection {
+            ProjectionRecordDto::Session(value) => value.started_at.as_deref(),
+            ProjectionRecordDto::Subagent(value) => value.first_observed_at.as_deref(),
+            ProjectionRecordDto::Output(value) => value.produced_at.as_deref(),
+            ProjectionRecordDto::TranscriptBlock(value) => value.observed_at.as_deref(),
+            ProjectionRecordDto::Segment(_) => None,
+        };
+        let material = match projection {
+            ProjectionRecordDto::Segment(value) => format!("{:020}", value.segment_index),
+            ProjectionRecordDto::TranscriptBlock(value) => format!(
+                "{}\u{1f}{}\u{1f}{:020}\u{1f}{:020}",
+                Self::timestamp_material(timestamp),
+                value.source_identifier,
+                value.source_line_number,
+                value.block_index,
+            ),
+            _ => Self::timestamp_material(timestamp),
+        };
+        Some(format!("{material}\u{1f}{reference}"))
+    }
+
+    fn modified_ordering_material(self, projection: &ProjectionRecordDto) -> Option<String> {
+        let reference = self.reference(projection)?;
+        let timestamp = match projection {
+            ProjectionRecordDto::Session(value) => value.last_observed_at.as_deref(),
+            _ => return self.ordering_material(projection),
+        };
+        Some(format!(
+            "{}\u{1f}{reference}",
+            Self::timestamp_material(timestamp)
+        ))
+    }
+
+    fn timestamp_material(timestamp: Option<&str>) -> String {
+        match timestamp {
+            Some(timestamp) => format!("0\u{1f}{timestamp}"),
+            None => "1\u{1f}".to_owned(),
+        }
+    }
 }
 
-/// External-sort publication. Directory order is explicitly treated as hostile input: only
-/// bounded sorted run chunks participate in the deterministic fixed-fanout tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeOrder {
+    Reference,
+    Oldest,
+    Newest,
+    OldestModified,
+    NewestModified,
+}
+impl TreeOrder {
+    fn all() -> [Self; 5] {
+        [
+            Self::Reference,
+            Self::Oldest,
+            Self::Newest,
+            Self::OldestModified,
+            Self::NewestModified,
+        ]
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Reference => "reference",
+            Self::Oldest => "oldest",
+            Self::Newest => "newest",
+            Self::OldestModified => "modified-oldest",
+            Self::NewestModified => "modified-newest",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeRelationship {
+    SessionSubagent,
+    SessionOutput,
+    SubagentOutput,
+    OutputSegment,
+    SessionTranscriptBlock,
+    SubagentTranscriptBlock,
+}
+impl TreeRelationship {
+    fn all() -> [Self; 6] {
+        [
+            Self::SessionSubagent,
+            Self::SessionOutput,
+            Self::SubagentOutput,
+            Self::OutputSegment,
+            Self::SessionTranscriptBlock,
+            Self::SubagentTranscriptBlock,
+        ]
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::SessionSubagent => "session-subagent",
+            Self::SessionOutput => "session-output",
+            Self::SubagentOutput => "subagent-output",
+            Self::OutputSegment => "output-segment",
+            Self::SessionTranscriptBlock => "session-transcript-block",
+            Self::SubagentTranscriptBlock => "subagent-transcript-block",
+        }
+    }
+
+    fn child_collection(self) -> FixedTreeCollection {
+        match self {
+            Self::SessionSubagent => FixedTreeCollection::Subagents,
+            Self::SessionOutput | Self::SubagentOutput => FixedTreeCollection::Outputs,
+            Self::OutputSegment => FixedTreeCollection::Segments,
+            Self::SessionTranscriptBlock | Self::SubagentTranscriptBlock => {
+                FixedTreeCollection::TranscriptBlocks
+            }
+        }
+    }
+
+    fn parent_reference(self, projection: &ProjectionRecordDto) -> Option<&str> {
+        match (self, projection) {
+            (Self::SessionSubagent, ProjectionRecordDto::Subagent(value)) => {
+                Some(&value.session_reference)
+            }
+            (Self::SessionOutput, ProjectionRecordDto::Output(value)) => {
+                Some(&value.session_reference)
+            }
+            (Self::SubagentOutput, ProjectionRecordDto::Output(value)) => {
+                value.subagent_reference.as_deref()
+            }
+            (Self::OutputSegment, ProjectionRecordDto::Segment(value)) => {
+                Some(&value.output_reference)
+            }
+            (Self::SessionTranscriptBlock, ProjectionRecordDto::TranscriptBlock(value)) => {
+                Some(&value.session_reference)
+            }
+            (Self::SubagentTranscriptBlock, ProjectionRecordDto::TranscriptBlock(value)) => {
+                value.subagent_reference.as_deref()
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The manifest name is the query-independent selection key for a tree.  Filter predicates are
+/// evaluated from the leaf projection later; relationship roots make the cardinality boundary
+/// explicit before those predicates run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TreeSpecification {
+    collection: FixedTreeCollection,
+    relationship: Option<TreeRelationship>,
+    order: TreeOrder,
+}
+impl TreeSpecification {
+    fn all() -> Vec<Self> {
+        let collections = FixedTreeCollection::all()
+            .into_iter()
+            .flat_map(|collection| {
+                TreeOrder::all().into_iter().map(move |order| Self {
+                    collection,
+                    relationship: None,
+                    order,
+                })
+            });
+        let relationships = TreeRelationship::all()
+            .into_iter()
+            .flat_map(|relationship| {
+                TreeOrder::all().into_iter().map(move |order| Self {
+                    collection: relationship.child_collection(),
+                    relationship: Some(relationship),
+                    order,
+                })
+            });
+        collections.chain(relationships).collect()
+    }
+
+    fn name(self) -> String {
+        match self.relationship {
+            Some(relationship) => {
+                format!("relationship:{}:{}", relationship.name(), self.order.name())
+            }
+            // Reference roots retain their established v3 names for point lookup.
+            None if self.order == TreeOrder::Reference => self.collection.name().to_owned(),
+            None => format!("order:{}:{}", self.collection.name(), self.order.name()),
+        }
+    }
+
+    fn entry(self, projection: &ProjectionRecordDto, locator: String) -> Option<TreeLeafEntry> {
+        let reference = self.collection.reference(projection)?.to_owned();
+        let ordering = match self.order {
+            TreeOrder::Reference => reference.clone(),
+            TreeOrder::Oldest | TreeOrder::Newest => {
+                self.collection.ordering_material(projection)?
+            }
+            TreeOrder::OldestModified | TreeOrder::NewestModified => {
+                self.collection.modified_ordering_material(projection)?
+            }
+        };
+        let key = match self.relationship {
+            Some(relationship) => {
+                let parent = relationship.parent_reference(projection)?;
+                format!("{parent}\u{1e}{ordering}")
+            }
+            None => ordering,
+        };
+        Some(TreeLeafEntry::new(key, reference, locator))
+    }
+}
+
+/// External-sort publication is directory-independent.  Each pass opens at most the configured
+/// fan-in of bounded chunks and writes a new deterministic run, so a corpus larger than fanout
+/// cannot force a corpus-sized merge vector.
 #[derive(Debug, Clone)]
 struct FixedFanoutTreePublisher<'a> {
     staging: IndexStaging,
     limits: IndexStoreLimits,
     source_runs: &'a [SourceGenerationRun],
+    meter: IndexResourceMeter,
 }
 
 impl<'a> FixedFanoutTreePublisher<'a> {
@@ -1107,132 +1333,277 @@ impl<'a> FixedFanoutTreePublisher<'a> {
         staging: IndexStaging,
         limits: IndexStoreLimits,
         source_runs: &'a [SourceGenerationRun],
+        meter: IndexResourceMeter,
     ) -> Self {
         Self {
             staging,
             limits,
             source_runs,
+            meter,
         }
     }
 
     fn publish(&self) -> Result<Vec<FixedTreeRoot>> {
-        FixedTreeCollection::all()
+        TreeSpecification::all()
             .into_iter()
-            .map(|collection| self.publish_collection(collection))
+            .map(|specification| self.publish_specification(specification))
             .collect()
     }
 
-    fn publish_collection(&self, collection: FixedTreeCollection) -> Result<FixedTreeRoot> {
-        let run_count = self.write_sorted_runs(collection)?;
-        if run_count == 0 {
+    fn publish_specification(&self, specification: TreeSpecification) -> Result<FixedTreeRoot> {
+        let raw_runs = self.write_sorted_runs(specification)?;
+        if raw_runs == 0 {
             return Ok(FixedTreeRoot {
-                collection,
+                specification,
                 locator: None,
                 item_count: 0,
             });
         }
-        if run_count > Self::FANOUT as u64 {
-            return Err(Error::index_store(
-                crate::error::IndexStoreError::OversizedRecord,
-            ));
-        }
-        let (leaf_count, item_count) = self.write_leaves(collection, run_count)?;
-        let locator = self.write_branches(collection, leaf_count)?;
+        let final_run = self.merge_to_one_run(specification, raw_runs)?;
+        let (leaf_count, item_count) = self.write_leaves(specification, final_run)?;
+        let locator = self.write_branches(specification, leaf_count)?;
         Ok(FixedTreeRoot {
-            collection,
+            specification,
             locator: Some(locator),
             item_count,
         })
     }
 
-    fn write_sorted_runs(&self, collection: FixedTreeCollection) -> Result<u64> {
+    fn fanout(&self) -> u64 {
+        self.limits
+            .maximum_records_per_chunk
+            .max(2)
+            .min(Self::FANOUT as u64)
+    }
+
+    fn maximum_fan_in(&self) -> u64 {
+        self.limits.maximum_merge_fan_in.max(2).min(self.fanout())
+    }
+
+    fn write_sorted_runs(&self, specification: TreeSpecification) -> Result<u64> {
         let mut entries = Vec::new();
+        let mut logical_bytes = 0_u64;
         let mut run = 0_u64;
         for source_run in self.source_runs {
             for ordinal in 0..source_run.projection_count {
-                let name = format!(
+                let locator = format!(
                     "run-{}-projection-{ordinal:016x}",
-                    source_run.source_key.configured_occurrence(),
+                    source_run.source_key.configured_occurrence()
                 );
-                let chunk = self
-                    .staging
-                    .read_chunk(&IndexLocator::new(name.clone()), IndexFileKind::Projection)?;
-                let Some(projection) = chunk.projection else {
-                    continue;
-                };
-                let Some(reference) = collection.projection_reference(&projection) else {
-                    continue;
-                };
-                entries.push(TreeLeafEntry {
-                    key: reference.to_owned(),
-                    locator: name,
-                });
-                if entries.len() as u64 == self.limits.maximum_records_per_chunk {
-                    self.write_run(collection, run, &mut entries)?;
-                    run += 1;
+                let chunk = self.staging.read_chunk(
+                    &IndexLocator::new(locator.clone()),
+                    IndexFileKind::Projection,
+                )?;
+                if let Some(projection) = chunk.projection
+                    && let Some(entry) = specification.entry(&projection, locator)
+                {
+                    if !entries.is_empty()
+                        && !self.accepts_entries(logical_bytes, entries.len() as u64, &entry)
+                    {
+                        self.write_initial_run(specification, run, &mut entries)?;
+                        run += 1;
+                        logical_bytes = 0;
+                    }
+                    logical_bytes = logical_bytes.saturating_add(entry.logical_bytes());
+                    entries.push(entry);
                 }
             }
         }
         if !entries.is_empty() {
-            self.write_run(collection, run, &mut entries)?;
+            self.write_initial_run(specification, run, &mut entries)?;
             run += 1;
         }
         Ok(run)
     }
 
-    fn write_run(
+    fn write_initial_run(
         &self,
-        collection: FixedTreeCollection,
+        specification: TreeSpecification,
         ordinal: u64,
         entries: &mut Vec<TreeLeafEntry>,
     ) -> Result<()> {
-        entries.sort_by(|left, right| {
-            left.key
-                .cmp(&right.key)
-                .then(left.locator.cmp(&right.locator))
-        });
-        let locator = IndexLocator::new(format!("tree-run-{}-{ordinal:016x}", collection.name()));
-        self.staging.write_chunk(
-            &locator,
-            IndexFileKind::OrderIndex,
-            &TreeChunk::entries(std::mem::take(entries)).chunk(),
+        let _reservation = self.meter.reserve(
+            IndexWorkCategory::DecodedChunk,
+            self.limits.maximum_logical_chunk_bytes,
+        );
+        entries.sort_by(TreeLeafEntry::compare);
+        self.write_run_chunk(specification, 0, ordinal, 0, std::mem::take(entries))?;
+        self.write_run_metadata(specification, 0, ordinal, 1)
+    }
+
+    fn merge_to_one_run(
+        &self,
+        specification: TreeSpecification,
+        mut run_count: u64,
+    ) -> Result<TreeRun> {
+        let mut stage = 0_u64;
+        while run_count > 1 {
+            let output_count = run_count.div_ceil(self.maximum_fan_in());
+            for output in 0..output_count {
+                let first = output * self.maximum_fan_in();
+                let last = (first + self.maximum_fan_in()).min(run_count);
+                self.merge_run_group(specification, stage, output, first, last)?;
+            }
+            run_count = output_count;
+            stage += 1;
+        }
+        Ok(TreeRun::new(stage, 0))
+    }
+
+    fn merge_run_group(
+        &self,
+        specification: TreeSpecification,
+        output_stage: u64,
+        output_run: u64,
+        first_input: u64,
+        last_input: u64,
+    ) -> Result<()> {
+        let mut cursors = (first_input..last_input)
+            .map(|input| {
+                TreeRunCursor::open(self, specification, TreeRun::new(output_stage, input))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let _reservation = self.meter.reserve(
+            IndexWorkCategory::MergeHead,
+            self.maximum_fan_in() * self.limits.maximum_logical_chunk_bytes,
+        );
+        for cursor in &mut cursors {
+            cursor.current()?;
+        }
+        let mut output_chunk = 0_u64;
+        let mut entries = Vec::new();
+        let mut logical_bytes = 0_u64;
+        let mut previous: Option<TreeLeafEntry> = None;
+        while let Some(index) = TreeRunHead::new(&cursors).smallest() {
+            let entry = cursors[index]
+                .take_next()?
+                .expect("selected cursor has entry");
+            cursors[index].current()?;
+            if previous.as_ref().is_some_and(|previous| {
+                previous.key == entry.key && previous.reference == entry.reference
+            }) {
+                continue;
+            }
+            previous = Some(entry.clone());
+            if !entries.is_empty()
+                && !self.accepts_entries(logical_bytes, entries.len() as u64, &entry)
+            {
+                self.write_run_chunk(
+                    specification,
+                    output_stage + 1,
+                    output_run,
+                    output_chunk,
+                    std::mem::take(&mut entries),
+                )?;
+                output_chunk += 1;
+                logical_bytes = 0;
+            }
+            logical_bytes = logical_bytes.saturating_add(entry.logical_bytes());
+            entries.push(entry);
+            if entries.len() as u64 == self.limits.maximum_records_per_chunk {
+                self.write_run_chunk(
+                    specification,
+                    output_stage + 1,
+                    output_run,
+                    output_chunk,
+                    std::mem::take(&mut entries),
+                )?;
+                output_chunk += 1;
+                logical_bytes = 0;
+            }
+        }
+        if !entries.is_empty() {
+            self.write_run_chunk(
+                specification,
+                output_stage + 1,
+                output_run,
+                output_chunk,
+                entries,
+            )?;
+            output_chunk += 1;
+        }
+        self.write_run_metadata(specification, output_stage + 1, output_run, output_chunk)
+    }
+
+    fn accepts_entries(&self, logical_bytes: u64, count: u64, entry: &TreeLeafEntry) -> bool {
+        self.limits.accepts_chunk(
+            logical_bytes.saturating_add(entry.logical_bytes()),
+            count.saturating_add(1),
         )
     }
 
-    fn write_leaves(&self, collection: FixedTreeCollection, run_count: u64) -> Result<(u64, u64)> {
-        let mut runs = Vec::new();
-        for ordinal in 0..run_count {
-            let locator =
-                IndexLocator::new(format!("tree-run-{}-{ordinal:016x}", collection.name()));
-            runs.push(
-                TreeChunk::from_chunk(
-                    self.staging
-                        .read_chunk(&locator, IndexFileKind::OrderIndex)?,
-                )?
-                .entries,
-            );
-        }
-        let mut positions = vec![0_usize; runs.len()];
-        let mut leaf_entries = Vec::new();
+    fn write_run_chunk(
+        &self,
+        specification: TreeSpecification,
+        stage: u64,
+        run: u64,
+        chunk: u64,
+        entries: Vec<TreeLeafEntry>,
+    ) -> Result<()> {
+        self.staging.write_chunk(
+            &IndexLocator::new(TreeRun::new(stage, run).chunk_name(&specification, chunk)),
+            IndexFileKind::OrderIndex,
+            &TreeChunk::entries(entries).chunk(),
+        )
+    }
+
+    fn write_run_metadata(
+        &self,
+        specification: TreeSpecification,
+        stage: u64,
+        run: u64,
+        chunks: u64,
+    ) -> Result<()> {
+        self.staging.write_chunk(
+            &IndexLocator::new(TreeRun::new(stage, run).metadata_name(&specification)),
+            IndexFileKind::OrderIndex,
+            &IndexChunk {
+                schema_version: 1,
+                projection: None,
+                records: vec![IndexRecordDto {
+                    schema_version: 1,
+                    record_kind: 64,
+                    fields: vec![IndexFieldDto {
+                        name: "tree-run-chunks".to_owned(),
+                        bytes: chunks.to_le_bytes().to_vec(),
+                    }],
+                }],
+            },
+        )
+    }
+
+    fn write_leaves(&self, specification: TreeSpecification, run: TreeRun) -> Result<(u64, u64)> {
+        let mut cursor = TreeRunCursor::open(self, specification, run)?;
+        let mut leaves = Vec::new();
+        let mut leaf_logical_bytes = 0_u64;
         let mut leaf_count = 0_u64;
         let mut item_count = 0_u64;
-        let mut previous = None::<String>;
-        while let Some(index) = TreeMergeHead::new(&runs, &positions).smallest() {
-            let entry = runs[index][positions[index]].clone();
-            positions[index] += 1;
-            if previous.as_deref() == Some(entry.key.as_str()) {
+        let mut previous: Option<TreeLeafEntry> = None;
+        while let Some(entry) = cursor.take_next()? {
+            if previous.as_ref().is_some_and(|previous| {
+                previous.key == entry.key && previous.reference == entry.reference
+            }) {
                 continue;
             }
-            previous = Some(entry.key.clone());
+            previous = Some(entry.clone());
             item_count += 1;
-            leaf_entries.push(entry);
-            if leaf_entries.len() == Self::FANOUT {
-                self.write_leaf(collection, leaf_count, &mut leaf_entries)?;
+            if !leaves.is_empty()
+                && !self.accepts_entries(leaf_logical_bytes, leaves.len() as u64, &entry)
+            {
+                self.write_leaf(specification, leaf_count, &mut leaves)?;
                 leaf_count += 1;
+                leaf_logical_bytes = 0;
+            }
+            leaf_logical_bytes = leaf_logical_bytes.saturating_add(entry.logical_bytes());
+            leaves.push(entry);
+            if leaves.len() as u64 == self.fanout() {
+                self.write_leaf(specification, leaf_count, &mut leaves)?;
+                leaf_count += 1;
+                leaf_logical_bytes = 0;
             }
         }
-        if !leaf_entries.is_empty() {
-            self.write_leaf(collection, leaf_count, &mut leaf_entries)?;
+        if !leaves.is_empty() {
+            self.write_leaf(specification, leaf_count, &mut leaves)?;
             leaf_count += 1;
         }
         Ok((leaf_count, item_count))
@@ -1240,45 +1611,57 @@ impl<'a> FixedFanoutTreePublisher<'a> {
 
     fn write_leaf(
         &self,
-        collection: FixedTreeCollection,
+        specification: TreeSpecification,
         ordinal: u64,
         entries: &mut Vec<TreeLeafEntry>,
     ) -> Result<()> {
-        let locator = IndexLocator::new(format!("tree-leaf-{}-{ordinal:016x}", collection.name()));
         self.staging.write_chunk(
-            &locator,
+            &IndexLocator::new(format!("tree-leaf-{}-{ordinal:016x}", specification.name())),
             IndexFileKind::IndexNode,
             &TreeChunk::entries(std::mem::take(entries)).chunk(),
         )
     }
 
-    fn write_branches(&self, collection: FixedTreeCollection, mut children: u64) -> Result<String> {
+    fn write_branches(
+        &self,
+        specification: TreeSpecification,
+        mut children: u64,
+    ) -> Result<String> {
         let mut level = 0_u64;
         let mut prefix = "tree-leaf".to_owned();
         while children > 1 {
-            let parent_count = children.div_ceil(Self::FANOUT as u64);
+            let parent_count = children.div_ceil(self.fanout());
             for parent in 0..parent_count {
-                let start = parent * Self::FANOUT as u64;
-                let end = (start + Self::FANOUT as u64).min(children);
+                let start = parent * self.fanout();
+                let end = (start + self.fanout()).min(children);
                 let mut entries = Vec::new();
+                let mut logical_bytes = 0_u64;
                 for child in start..end {
-                    let child_name = format!("{prefix}-{}-{child:016x}", collection.name());
+                    let child_name = format!("{prefix}-{}-{child:016x}", specification.name());
                     let child_chunk = self.staging.read_chunk(
                         &IndexLocator::new(child_name.clone()),
                         IndexFileKind::IndexNode,
                     )?;
-                    let key = TreeChunk::from_chunk(child_chunk)?.first_key()?;
-                    entries.push(TreeLeafEntry {
-                        key,
-                        locator: child_name,
-                    });
+                    let entry = TreeLeafEntry::branch(
+                        TreeChunk::from_chunk(child_chunk)?.first_key()?,
+                        child_name,
+                    );
+                    if !entries.is_empty()
+                        && !self.accepts_entries(logical_bytes, entries.len() as u64, &entry)
+                    {
+                        return Err(Error::protocol(
+                            "typed tree",
+                            "branch fanout exceeds chunk limit",
+                        ));
+                    }
+                    logical_bytes = logical_bytes.saturating_add(entry.logical_bytes());
+                    entries.push(entry);
                 }
-                let locator = IndexLocator::new(format!(
-                    "tree-branch-{level}-{}-{parent:016x}",
-                    collection.name()
-                ));
                 self.staging.write_chunk(
-                    &locator,
+                    &IndexLocator::new(format!(
+                        "tree-branch-{level}-{}-{parent:016x}",
+                        specification.name()
+                    )),
                     IndexFileKind::IndexNode,
                     &TreeChunk::children(entries).chunk(),
                 )?;
@@ -1287,14 +1670,156 @@ impl<'a> FixedFanoutTreePublisher<'a> {
             prefix = format!("tree-branch-{level}");
             level += 1;
         }
-        Ok(format!("{prefix}-{}-{:016x}", collection.name(), 0))
+        Ok(format!("{prefix}-{}-{:016x}", specification.name(), 0))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TreeRun {
+    stage: u64,
+    ordinal: u64,
+}
+impl TreeRun {
+    fn new(stage: u64, ordinal: u64) -> Self {
+        Self { stage, ordinal }
+    }
+    fn chunk_name(self, specification: &TreeSpecification, chunk: u64) -> String {
+        format!(
+            "tree-run-{}-{:04x}-{:016x}-{chunk:016x}",
+            specification.name(),
+            self.stage,
+            self.ordinal
+        )
+    }
+    fn metadata_name(self, specification: &TreeSpecification) -> String {
+        format!(
+            "tree-run-meta-{}-{:04x}-{:016x}",
+            specification.name(),
+            self.stage,
+            self.ordinal
+        )
+    }
+}
+
+#[derive(Debug)]
+struct TreeRunCursor<'a> {
+    publisher: &'a FixedFanoutTreePublisher<'a>,
+    specification: TreeSpecification,
+    run: TreeRun,
+    chunks: u64,
+    chunk_ordinal: u64,
+    entries: Vec<TreeLeafEntry>,
+    entry_ordinal: usize,
+}
+impl<'a> TreeRunCursor<'a> {
+    fn open(
+        publisher: &'a FixedFanoutTreePublisher<'a>,
+        specification: TreeSpecification,
+        run: TreeRun,
+    ) -> Result<Self> {
+        let metadata = publisher.staging.read_chunk(
+            &IndexLocator::new(run.metadata_name(&specification)),
+            IndexFileKind::OrderIndex,
+        )?;
+        let chunks = metadata
+            .records
+            .first()
+            .and_then(|record| {
+                record
+                    .fields
+                    .iter()
+                    .find(|field| field.name == "tree-run-chunks")
+            })
+            .and_then(|field| <[u8; 8]>::try_from(field.bytes.as_slice()).ok())
+            .map(u64::from_le_bytes)
+            .ok_or_else(|| Error::protocol("typed tree", "invalid run metadata"))?;
+        Ok(Self {
+            publisher,
+            specification,
+            run,
+            chunks,
+            chunk_ordinal: 0,
+            entries: Vec::new(),
+            entry_ordinal: 0,
+        })
+    }
+    fn current(&mut self) -> Result<Option<&TreeLeafEntry>> {
+        while self.entry_ordinal >= self.entries.len() && self.chunk_ordinal < self.chunks {
+            self.entries = TreeChunk::from_chunk(self.publisher.staging.read_chunk(
+                &IndexLocator::new(self.run.chunk_name(&self.specification, self.chunk_ordinal)),
+                IndexFileKind::OrderIndex,
+            )?)?
+            .entries;
+            self.entry_ordinal = 0;
+            self.chunk_ordinal += 1;
+        }
+        Ok(self.entries.get(self.entry_ordinal))
+    }
+    fn take_next(&mut self) -> Result<Option<TreeLeafEntry>> {
+        let next = self.current()?.cloned();
+        if next.is_some() {
+            self.entry_ordinal += 1;
+        }
+        Ok(next)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TreeRunHead<'a> {
+    cursors: &'a [TreeRunCursor<'a>],
+}
+impl<'a> TreeRunHead<'a> {
+    fn new(cursors: &'a [TreeRunCursor<'a>]) -> Self {
+        Self { cursors }
+    }
+    fn smallest(self) -> Option<usize> {
+        self.cursors
+            .iter()
+            .enumerate()
+            .filter_map(|(index, cursor)| {
+                cursor
+                    .entries
+                    .get(cursor.entry_ordinal)
+                    .map(|entry| (index, entry))
+            })
+            .min_by(|(_, left), (_, right)| TreeLeafEntry::compare(left, right))
+            .map(|(index, _)| index)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TreeLeafEntry {
     key: String,
+    reference: String,
     locator: String,
+}
+impl TreeLeafEntry {
+    fn new(key: String, reference: String, locator: String) -> Self {
+        Self {
+            key,
+            reference,
+            locator,
+        }
+    }
+    fn branch(key: String, locator: String) -> Self {
+        Self::new(key, String::new(), locator)
+    }
+    fn logical_bytes(&self) -> u64 {
+        ("tree-key".len()
+            + self.key.len()
+            + "tree-key-hash".len()
+            + 32
+            + "tree-reference".len()
+            + self.reference.len()
+            + "tree-projection".len()
+            + self.locator.len()) as u64
+    }
+    fn compare(left: &Self, right: &Self) -> std::cmp::Ordering {
+        left.key
+            .cmp(&right.key)
+            .then(left.reference.cmp(&right.reference))
+            .then(left.locator.cmp(&right.locator))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1302,7 +1827,6 @@ struct TreeChunk {
     entries: Vec<TreeLeafEntry>,
     children: bool,
 }
-
 impl TreeChunk {
     fn entries(entries: Vec<TreeLeafEntry>) -> Self {
         Self {
@@ -1323,23 +1847,34 @@ impl TreeChunk {
             records: self
                 .entries
                 .into_iter()
-                .map(|entry| IndexRecordDto {
-                    schema_version: 1,
-                    record_kind: if self.children { 63 } else { 62 },
-                    fields: vec![
-                        IndexFieldDto {
-                            name: "tree-key".to_owned(),
-                            bytes: entry.key.into_bytes(),
-                        },
-                        IndexFieldDto {
-                            name: if self.children {
-                                "tree-child".to_owned()
-                            } else {
-                                "tree-projection".to_owned()
+                .map(|entry| {
+                    let key_hash = blake3::hash(entry.key.as_bytes());
+                    IndexRecordDto {
+                        schema_version: 1,
+                        record_kind: if self.children { 63 } else { 62 },
+                        fields: vec![
+                            IndexFieldDto {
+                                name: "tree-key".to_owned(),
+                                bytes: entry.key.into_bytes(),
                             },
-                            bytes: entry.locator.into_bytes(),
-                        },
-                    ],
+                            IndexFieldDto {
+                                name: "tree-key-hash".to_owned(),
+                                bytes: key_hash.as_bytes().to_vec(),
+                            },
+                            IndexFieldDto {
+                                name: "tree-reference".to_owned(),
+                                bytes: entry.reference.into_bytes(),
+                            },
+                            IndexFieldDto {
+                                name: if self.children {
+                                    "tree-child".to_owned()
+                                } else {
+                                    "tree-projection".to_owned()
+                                },
+                                bytes: entry.locator.into_bytes(),
+                            },
+                        ],
+                    }
                 })
                 .collect(),
         }
@@ -1351,29 +1886,45 @@ impl TreeChunk {
             .is_some_and(|record| record.record_kind == 63);
         let mut entries = Vec::with_capacity(chunk.records.len());
         for record in chunk.records {
-            let key = record
-                .fields
-                .iter()
-                .find(|field| field.name == "tree-key")
-                .ok_or_else(|| Error::protocol("typed tree", "missing key"))?;
-            let locator = record
-                .fields
-                .iter()
-                .find(|field| {
-                    field.name
-                        == if children {
-                            "tree-child"
-                        } else {
-                            "tree-projection"
-                        }
-                })
-                .ok_or_else(|| Error::protocol("typed tree", "missing locator"))?;
-            entries.push(TreeLeafEntry {
-                key: String::from_utf8(key.bytes.clone())
-                    .map_err(|_| Error::protocol("typed tree", "invalid key"))?,
-                locator: String::from_utf8(locator.bytes.clone())
-                    .map_err(|_| Error::protocol("typed tree", "invalid locator"))?,
-            });
+            let value = |name: &str| {
+                record
+                    .fields
+                    .iter()
+                    .find(|field| field.name == name)
+                    .map(|field| field.bytes.as_slice())
+                    .ok_or_else(|| Error::protocol("typed tree", "missing node field"))
+            };
+            let key = String::from_utf8(value("tree-key")?.to_vec())
+                .map_err(|_| Error::protocol("typed tree", "invalid key"))?;
+            let hash = <[u8; 32]>::try_from(value("tree-key-hash")?)
+                .map_err(|_| Error::protocol("typed tree", "invalid key hash"))?;
+            if blake3::hash(key.as_bytes()).as_bytes() != &hash {
+                return Err(Error::protocol(
+                    "typed tree",
+                    "key hash collision or corruption",
+                ));
+            }
+            let reference = String::from_utf8(value("tree-reference")?.to_vec())
+                .map_err(|_| Error::protocol("typed tree", "invalid reference"))?;
+            let locator = String::from_utf8(
+                value(if children {
+                    "tree-child"
+                } else {
+                    "tree-projection"
+                })?
+                .to_vec(),
+            )
+            .map_err(|_| Error::protocol("typed tree", "invalid locator"))?;
+            entries.push(TreeLeafEntry::new(key, reference, locator));
+        }
+        if entries
+            .windows(2)
+            .any(|pair| TreeLeafEntry::compare(&pair[0], &pair[1]).is_gt())
+        {
+            return Err(Error::protocol(
+                "typed tree",
+                "non-deterministic node ordering",
+            ));
         }
         Ok(Self { entries, children })
     }
@@ -1382,32 +1933,6 @@ impl TreeChunk {
             .first()
             .map(|entry| entry.key.clone())
             .ok_or_else(|| Error::protocol("typed tree", "empty node"))
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TreeMergeHead<'a> {
-    runs: &'a [Vec<TreeLeafEntry>],
-    positions: &'a [usize],
-}
-impl<'a> TreeMergeHead<'a> {
-    fn new(runs: &'a [Vec<TreeLeafEntry>], positions: &'a [usize]) -> Self {
-        Self { runs, positions }
-    }
-    fn smallest(self) -> Option<usize> {
-        self.runs
-            .iter()
-            .enumerate()
-            .filter(|(index, run)| self.positions[*index] < run.len())
-            .min_by(|(left, left_run), (right, right_run)| {
-                let left_entry = &left_run[self.positions[*left]];
-                let right_entry = &right_run[self.positions[*right]];
-                left_entry
-                    .key
-                    .cmp(&right_entry.key)
-                    .then(left_entry.locator.cmp(&right_entry.locator))
-            })
-            .map(|(index, _)| index)
     }
 }
 
@@ -1453,5 +1978,198 @@ impl IndexManifestRecord {
             records: self.records,
             projection: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod persistent_tree_tests {
+    use std::{fs, path::PathBuf};
+
+    use signal_aggregator::{SourceIdentifier, SourceKind, SubagentName, TranscriptBlockKind};
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::output_index::PersistentIndex;
+
+    fn limits() -> IndexStoreLimits {
+        IndexStoreLimits {
+            maximum_logical_chunk_bytes: 16 * 1024,
+            maximum_serialized_chunk_bytes: 32 * 1024,
+            maximum_records_per_chunk: 64,
+            maximum_manifest_bytes: 64 * 1024,
+            maximum_checkpoint_bytes: 4096,
+            maximum_cursor_bytes: 4096,
+            maximum_record_bytes: 4096,
+            maximum_string_bytes: 1024,
+            maximum_merge_fan_in: 2,
+            maximum_query_candidates: 16,
+            staging_generations_retained: 2,
+        }
+    }
+
+    fn transcript(line_number: u64) -> TranscriptRecord {
+        let path = PathBuf::from("/synthetic/persistent-tree.jsonl");
+        TranscriptRecord::new(
+            SourceKind::Claude,
+            SourceIdentifier::new("claude:persistent-tree"),
+            path.clone(),
+            line_number,
+            Some(signal_aggregator::Timestamp::new(format!(
+                "2026-01-01T00:00:{line_number:02}Z"
+            ))),
+            format!("synthetic bounded record {line_number}"),
+        )
+        .with_subagent_name(Some(SubagentName::new("worker")))
+        .with_blocks(vec![
+            crate::adapter::TranscriptBlockSourceContext::new(
+                SourceKind::Claude,
+                SourceIdentifier::new("claude:persistent-tree"),
+                path,
+                line_number,
+                Some(signal_aggregator::Timestamp::new(format!(
+                    "2026-01-01T00:00:{line_number:02}Z"
+                ))),
+            )
+            .readable_block(
+                0,
+                TranscriptBlockKind::AgentResponse,
+                format!("synthetic block {line_number}"),
+            ),
+        ])
+    }
+
+    fn published(
+        records: u64,
+    ) -> (
+        IndexStore,
+        Vec<FixedTreeRoot>,
+        PersistentIndex,
+        IndexResourceMeter,
+    ) {
+        let root = TempDir::new().expect("temporary persistent tree root");
+        let root_path = root.keep();
+        let store = IndexStore::new(root_path.join("output-index"), limits());
+        let staging = store.create_staging("tree-test").expect("staging");
+        let meter = IndexResourceMeter::default();
+        let mut builder = BoundedGenerationBuilder::new(
+            staging.clone(),
+            SourceKey::new(
+                SourceKind::Claude,
+                SourceIdentifier::new("claude:persistent-tree"),
+                0,
+            ),
+            limits(),
+            meter.clone(),
+        );
+        for line_number in 1..=records {
+            builder.observe_record(transcript(line_number));
+        }
+        let run = builder.finish().expect("source run");
+        let runs = vec![run];
+        let roots = FixedFanoutTreePublisher::new(staging.clone(), limits(), &runs, meter.clone())
+            .publish()
+            .expect("tree publication");
+        let manifest = IndexManifestRecord::new(&runs, &roots).chunk();
+        let manifest_locator = IndexLocator::new("manifest");
+        staging
+            .write_chunk(&manifest_locator, IndexFileKind::Manifest, &manifest)
+            .expect("manifest");
+        let identity = SnapshotIdentity::new(&runs).with_roots(&roots).value();
+        store
+            .publish(&staging, &manifest_locator, identity)
+            .expect("atomic publication");
+        let index = PersistentIndex::from_typed_store(&store).expect("reopen persistent trees");
+        (store, roots, index, meter)
+    }
+
+    #[test]
+    fn publication_emits_every_order_and_relationship_root_and_reopens_them() {
+        let (_store, roots, index, _meter) = published(5);
+        let expected = TreeSpecification::all()
+            .into_iter()
+            .map(TreeSpecification::name)
+            .collect::<std::collections::BTreeSet<_>>();
+        let actual = index
+            .persistent_tree_names()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            actual, expected,
+            "manifest preserves every deterministic root"
+        );
+        for root in &roots {
+            let mut seen = Vec::new();
+            let count = index
+                .visit_persistent_tree(&root.specification.name(), 2, |key, reference| {
+                    seen.push((key.to_owned(), reference.to_owned()));
+                    true
+                })
+                .expect("bounded root traversal");
+            assert!(count <= 2, "fixed visitor budget applies to every root");
+            assert!(seen.windows(2).all(|pair| pair[0] <= pair[1]));
+        }
+        let mut relationship_references = Vec::new();
+        let count = index
+            .visit_persistent_tree("relationship:session-output:oldest", 16, |_, reference| {
+                relationship_references.push(reference.to_owned());
+                true
+            })
+            .expect("session output relationship traversal");
+        assert_eq!(count, 5);
+        assert_eq!(relationship_references.len(), 5);
+    }
+
+    #[test]
+    fn external_merge_spans_more_than_fanout_without_directory_enumeration() {
+        let (_store, roots, index, meter) = published(129);
+        let output_root = roots
+            .iter()
+            .find(|root| root.specification.name() == "order:outputs:oldest")
+            .expect("output chronology root");
+        assert!(output_root.locator.is_some());
+        let mut references = Vec::new();
+        let count = index
+            .visit_persistent_tree("order:outputs:oldest", 32, |_, reference| {
+                references.push(reference.to_owned());
+                true
+            })
+            .expect("multi-level traversal");
+        assert_eq!(
+            count, 32,
+            "the visitor stops at its bounded candidate budget"
+        );
+        assert_eq!(references.len(), 32);
+        assert!(meter.snapshot().high_water_bytes <= 2 * limits().maximum_logical_chunk_bytes);
+    }
+
+    #[test]
+    fn tree_key_corruption_rejects_reopened_traversal() {
+        let (store, roots, index, _meter) = published(3);
+        let root = roots
+            .iter()
+            .find(|root| root.specification.name() == "relationship:subagent-output:reference")
+            .expect("relationship root");
+        let pointer = store
+            .read_current_pointer()
+            .expect("pointer")
+            .expect("published pointer");
+        let generation = pointer
+            .manifest_locator
+            .rsplit_once('/')
+            .expect("manifest parent")
+            .0;
+        let path = store
+            .data_root()
+            .join(generation)
+            .join(root.locator.as_ref().expect("root locator"));
+        let mut bytes = fs::read(&path).expect("node bytes");
+        let last = bytes.last_mut().expect("non-empty node");
+        *last ^= 0x01;
+        fs::write(path, bytes).expect("corrupt node");
+        assert!(
+            index
+                .visit_persistent_tree("relationship:subagent-output:reference", 1, |_, _| true)
+                .is_err()
+        );
     }
 }
