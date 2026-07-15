@@ -468,45 +468,58 @@ impl<'a> RuntimeConfigurationValidator<'a> {
     }
 
     pub fn validate_output_interface_limits(&mut self, limits: &OutputInterfaceLimitPolicy) {
-        for (name, accepted) in [
+        // The contract defaults are the runtime's absolute practical ceilings. Configuration may
+        // tighten a workload, but it cannot turn an input-controlled limit into an unbounded
+        // allocation, scan, or reply.
+        let ceiling = OutputInterfaceLimitPolicy::default();
+        for (name, value, maximum) in [
             (
                 "maximum_page_items",
-                limits.maximum_page_items.into_u64() > 0,
+                limits.maximum_page_items.into_u64(),
+                ceiling.maximum_page_items.into_u64(),
             ),
             (
                 "maximum_preview_bytes",
-                limits.maximum_preview_bytes.into_u64() > 0,
+                limits.maximum_preview_bytes.into_u64(),
+                ceiling.maximum_preview_bytes.into_u64(),
             ),
             (
                 "maximum_read_bytes",
-                limits.maximum_read_bytes.into_u64() > 0,
+                limits.maximum_read_bytes.into_u64(),
+                ceiling.maximum_read_bytes.into_u64(),
             ),
             (
                 "maximum_recovery_files_per_root",
-                limits.maximum_recovery_files_per_root.into_u64() > 0,
+                limits.maximum_recovery_files_per_root.into_u64(),
+                ceiling.maximum_recovery_files_per_root.into_u64(),
             ),
             (
                 "maximum_transcript_scan_entries",
-                limits.maximum_transcript_scan_entries.into_u64() > 0,
+                limits.maximum_transcript_scan_entries.into_u64(),
+                ceiling.maximum_transcript_scan_entries.into_u64(),
             ),
             (
                 "maximum_transcript_discovered_files",
-                limits.maximum_transcript_discovered_files.into_u64() > 0,
+                limits.maximum_transcript_discovered_files.into_u64(),
+                ceiling.maximum_transcript_discovered_files.into_u64(),
             ),
             (
                 "maximum_transcript_file_bytes",
-                limits.maximum_transcript_file_bytes.into_u64() > 0,
+                limits.maximum_transcript_file_bytes.into_u64(),
+                ceiling.maximum_transcript_file_bytes.into_u64(),
             ),
             (
                 "maximum_transcript_line_bytes",
-                limits.maximum_transcript_line_bytes.into_u64() > 0,
+                limits.maximum_transcript_line_bytes.into_u64(),
+                ceiling.maximum_transcript_line_bytes.into_u64(),
             ),
             (
                 "maximum_transcript_read_failures",
-                limits.maximum_transcript_read_failures.into_u64() > 0,
+                limits.maximum_transcript_read_failures.into_u64(),
+                ceiling.maximum_transcript_read_failures.into_u64(),
             ),
         ] {
-            if !accepted {
+            if value == 0 || value > maximum {
                 self.issues
                     .push(ConfigurationIssue::invalid_output_interface_limit(name));
             }

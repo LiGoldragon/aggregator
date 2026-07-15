@@ -536,6 +536,53 @@ fn runtime_configuration_validates_paths_and_maps_source_selection() {
 }
 
 #[test]
+fn runtime_configuration_rejects_output_limits_above_runtime_ceilings() {
+    let root = TempDir::new().expect("temporary root");
+    let mut configuration = accepted_configuration(&root);
+    let ceiling = OutputInterfaceLimitPolicy::default();
+    configuration.output_interfaces.limits = OutputInterfaceLimitPolicy {
+        maximum_page_items: PageLimit::new(ceiling.maximum_page_items.into_u64() + 1),
+        maximum_preview_bytes: ByteLimit::new(ceiling.maximum_preview_bytes.into_u64() + 1),
+        maximum_read_bytes: ByteLimit::new(ceiling.maximum_read_bytes.into_u64() + 1),
+        maximum_recovery_files_per_root: ItemCount::new(
+            ceiling.maximum_recovery_files_per_root.into_u64() + 1,
+        ),
+        maximum_transcript_scan_entries: ItemCount::new(
+            ceiling.maximum_transcript_scan_entries.into_u64() + 1,
+        ),
+        maximum_transcript_discovered_files: ItemCount::new(
+            ceiling.maximum_transcript_discovered_files.into_u64() + 1,
+        ),
+        maximum_transcript_file_bytes: ByteLimit::new(
+            ceiling.maximum_transcript_file_bytes.into_u64() + 1,
+        ),
+        maximum_transcript_line_bytes: ByteLimit::new(
+            ceiling.maximum_transcript_line_bytes.into_u64() + 1,
+        ),
+        maximum_transcript_read_failures: ItemCount::new(
+            ceiling.maximum_transcript_read_failures.into_u64() + 1,
+        ),
+    };
+
+    let report = match RuntimeConfiguration::validate_from_meta(&configuration) {
+        RuntimeConfigurationValidation::Accepted(_) => panic!("oversized limits were accepted"),
+        RuntimeConfigurationValidation::Rejected(report) => report,
+    };
+    let rejected_limit_count = report
+        .issues
+        .iter()
+        .filter(|issue| {
+            issue.kind
+                == meta_signal_aggregator::ConfigurationValidationIssueKind::InvalidOutputInterfaceLimit
+        })
+        .count();
+    assert_eq!(
+        rejected_limit_count, 9,
+        "every output, scan, discovery, and recovery collection has a hard runtime ceiling"
+    );
+}
+
+#[test]
 fn runtime_configuration_reports_missing_paths_as_validation_issues() {
     let root = TempDir::new().expect("temporary root");
     let mut configuration = accepted_configuration(&root);

@@ -152,6 +152,9 @@ impl BoundedIndexRefresher {
     }
 
     pub fn refresh(&self) -> Result<BoundedGenerationPublication> {
+        // Reclaim abandoned generations before allocating a new one. This also bounds the residue
+        // from a prior refresh that returned early with an error.
+        self.store.cleanup_orphans(&[])?;
         let staging = self.store.create_staging("bounded-build")?;
         self.migrate_v2_before_v3_publication(&staging)?;
         let mut source_runs = Vec::new();
@@ -182,6 +185,9 @@ impl BoundedIndexRefresher {
         if !complete {
             // A partially scanned first generation never becomes query truth. Existing complete
             // truth remains pointed to while the scan facts report the provisional coverage.
+            // Preserve this generation while enforcing the bounded stale-staging retention.
+            self.store
+                .cleanup_orphans(&[staging.generation().clone()])?;
             return Ok(BoundedGenerationPublication {
                 pointer: self.store.read_current_pointer()?,
                 source_runs,
@@ -202,6 +208,10 @@ impl BoundedIndexRefresher {
         if let Some(current) = self.store.read_current_pointer()?
             && current.snapshot_identity == snapshot_identity
         {
+            // This unpublished duplicate is still a staging generation and must not accumulate
+            // across ordinary refreshes.
+            self.store
+                .cleanup_orphans(&[staging.generation().clone()])?;
             return Ok(BoundedGenerationPublication {
                 pointer: Some(current),
                 source_runs,
@@ -215,6 +225,9 @@ impl BoundedIndexRefresher {
         let pointer = self
             .store
             .publish(&staging, &manifest_locator, snapshot_identity)?;
+        // Publication moves its generation out of staging, leaving every remaining directory
+        // stale. Reclaim them before reporting a successful refresh.
+        self.store.cleanup_orphans(&[])?;
         Ok(BoundedGenerationPublication {
             pointer: Some(pointer),
             source_runs,

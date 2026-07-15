@@ -259,18 +259,19 @@ impl IndexStore {
             .collect::<Result<BTreeSet<_>>>()?;
         let staging_root = self.data_root.join("staging");
         self.verify_directory(&staging_root)?;
-        let mut entries = fs::read_dir(&staging_root)
-            .map_err(|error| {
-                Error::index_store(IndexStoreError::io("reading staging root", error))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|error| {
+
+        // Select the newest names with a fixed-size set instead of materializing every stale
+        // generation. A crash loop must not turn reclamation itself into a corpus-sized allocation.
+        let retained = self.limits.staging_generations_retained as usize;
+        let mut retained_names = BTreeSet::new();
+        for entry in fs::read_dir(&staging_root).map_err(|error| {
+            Error::index_store(IndexStoreError::io("reading staging root", error))
+        })? {
+            let entry = entry.map_err(|error| {
                 Error::index_store(IndexStoreError::io("reading staging entry", error))
             })?;
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in &entries {
-            IndexLocator::new(entry.file_name().to_string_lossy().into_owned())
-                .validate_component()?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            IndexLocator::new(name.clone()).validate_component()?;
             let kind = entry.file_type().map_err(|error| {
                 Error::index_store(IndexStoreError::io("reading staging entry type", error))
             })?;
@@ -278,19 +279,32 @@ impl IndexStore {
                 return Err(Error::index_store(IndexStoreError::UnsafePath));
             }
             self.verify_tree_without_symlink(&entry.path())?;
-        }
-        let retained = self.limits.staging_generations_retained as usize;
-        let removable = entries.len().saturating_sub(retained);
-        for entry in entries.into_iter().take(removable) {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !active.contains(&name) {
-                fs::remove_dir_all(entry.path()).map_err(|error| {
-                    Error::index_store(IndexStoreError::io(
-                        "removing stale staging generation",
-                        error,
-                    ))
-                })?;
+            retained_names.insert(name);
+            if retained_names.len() > retained {
+                retained_names.pop_first();
             }
+        }
+
+        for entry in fs::read_dir(&staging_root).map_err(|error| {
+            Error::index_store(IndexStoreError::io("reading staging root", error))
+        })? {
+            let entry = entry.map_err(|error| {
+                Error::index_store(IndexStoreError::io("reading staging entry", error))
+            })?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            IndexLocator::new(name.clone()).validate_component()?;
+            if active.contains(&name) || retained_names.contains(&name) {
+                continue;
+            }
+            // Revalidate immediately before removal so a replacement cannot introduce a link
+            // after the first safety pass.
+            self.verify_tree_without_symlink(&entry.path())?;
+            fs::remove_dir_all(entry.path()).map_err(|error| {
+                Error::index_store(IndexStoreError::io(
+                    "removing stale staging generation",
+                    error,
+                ))
+            })?;
         }
         self.sync_directory(Some(&staging_root))
     }

@@ -250,6 +250,45 @@ fn stale_pointer_temporary_does_not_block_unique_publication() {
     assert!(store.pointer_path().is_file());
 }
 
+#[test]
+fn orphan_cleanup_reclaims_stale_generations_to_the_retention_bound() {
+    let directory = TempDir::new().expect("temporary directory");
+    let store = test_store(&directory);
+    let mut generations = Vec::new();
+    for ordinal in 0..5 {
+        generations.push(
+            store
+                .create_staging(&format!("stale-{ordinal}"))
+                .expect("create staging generation"),
+        );
+    }
+    let active = generations
+        .last()
+        .expect("active generation")
+        .generation()
+        .clone();
+
+    store
+        .cleanup_orphans(std::slice::from_ref(&active))
+        .expect("reclaim stale generations");
+
+    let retained = fs::read_dir(store.data_root().join("staging"))
+        .expect("read retained staging generations")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("read retained entries");
+    assert_eq!(
+        retained.len(),
+        store.limits().staging_generations_retained as usize,
+        "cleanup retains only the configured newest staging generations"
+    );
+    assert!(
+        retained
+            .iter()
+            .any(|entry| entry.file_name() == active.as_str()),
+        "the active generation remains available to its refresh"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn store_refuses_symlinked_parent_before_creating_typed_data() {
