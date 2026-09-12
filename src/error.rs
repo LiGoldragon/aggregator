@@ -71,8 +71,8 @@ pub enum Error {
     #[error("clock error: {detail}")]
     Clock { detail: String },
 
-    #[error("DOTOS {context} failed: {detail}")]
-    Dotos {
+    #[error("Datom {context} failed: {detail}")]
+    Datom {
         context: &'static str,
         detail: String,
     },
@@ -81,7 +81,13 @@ pub enum Error {
     Frame {
         context: &'static str,
         #[source]
-        source: signal_frame::FrameError,
+        source: signal::FrameError,
+    },
+
+    #[error("Signal archive {context} failed: {detail}")]
+    Archive {
+        context: &'static str,
+        detail: String,
     },
 
     #[error("protocol {context} failed: {detail}")]
@@ -114,15 +120,22 @@ impl Error {
         }
     }
 
-    pub fn dotos(context: &'static str, detail: impl Into<String>) -> Self {
-        Self::Dotos {
+    pub fn datom(context: &'static str, detail: impl Into<String>) -> Self {
+        Self::Datom {
             context,
             detail: detail.into(),
         }
     }
 
-    pub fn frame(context: &'static str, source: signal_frame::FrameError) -> Self {
+    pub fn frame(context: &'static str, source: signal::FrameError) -> Self {
         Self::Frame { context, source }
+    }
+
+    pub fn archive(context: &'static str, detail: impl Into<String>) -> Self {
+        Self::Archive {
+            context,
+            detail: detail.into(),
+        }
     }
 
     pub fn protocol(context: &'static str, detail: impl Into<String>) -> Self {

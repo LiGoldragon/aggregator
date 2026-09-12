@@ -1,12 +1,11 @@
 use signal_aggregator::{
     CommitIdentifier, FilesystemPath, ReadFailure, ReadFailureReason, RepositoryChange,
-    RepositoryIdentifier, RepositoryPath, RepositoryWorktreeState, SourceIdentifier, SourceKind,
-    Timestamp,
+    RepositoryIdentifier, RepositoryPath, RepositoryWorktreeState, SourceKind, Timestamp,
 };
 
 use crate::{AdapterKind, configuration::RepositoryAdapterConfiguration};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RepositoryAdapter {
     repositories: Vec<RepositoryAdapterConfiguration>,
     observation_mode: RepositoryObservationMode,
@@ -42,7 +41,7 @@ impl RepositoryAdapter {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RepositoryObservationMode {
     Fixture(RepositoryEvidenceFixture),
     CommandPolicy(RepositoryCommandPolicy),
@@ -77,7 +76,7 @@ pub enum RepositoryCommandAuthorization {
     ReadOnlyUnimplemented,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RepositoryEvidenceFixture {
     changes: Vec<RepositoryChangeFixture>,
 }
@@ -92,7 +91,7 @@ impl RepositoryEvidenceFixture {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RepositoryChangeFixture {
     repository: RepositoryIdentifier,
     path: FilesystemPath,
@@ -131,17 +130,17 @@ impl RepositoryChangeFixture {
 
     pub fn into_change(self) -> RepositoryChange {
         RepositoryChange {
-            repository: self.repository,
-            path: self.path,
-            commit_identifier: self.commit_identifier,
+            repository_identifier: self.repository,
+            filesystem_path: self.path,
+            commit_identifier_option: self.commit_identifier,
             commit_timestamp: self.commit_timestamp,
             changed_paths: self.changed_paths,
-            worktree_state: self.worktree_state,
+            repository_worktree_state: self.worktree_state,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RepositoryReadOutcome {
     pub repository_changes: Vec<RepositoryChange>,
     pub read_failures: Vec<ReadFailure>,
@@ -156,7 +155,7 @@ impl RepositoryReadOutcome {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RepositoryCollector {
     repositories: Vec<RepositoryAdapterConfiguration>,
     observation_mode: RepositoryObservationMode,
@@ -224,12 +223,10 @@ impl RepositoryCollector {
             RepositoryCommandAuthorization::ReadOnlyUnimplemented => ReadFailureReason::IoFailure,
         };
         ReadFailure {
-            source: SourceKind::Repository,
-            path: Some(FilesystemPath::new(repository.path().display().to_string())),
-            source_identifier: Some(SourceIdentifier::new(
-                repository.identifier().as_str().to_string(),
-            )),
-            reason,
+            source_kind: SourceKind::Repository,
+            filesystem_path_option: Some(repository.path().display().to_string()),
+            source_identifier_option: Some(repository.identifier().as_str().to_string()),
+            read_failure_reason: reason,
         }
     }
 }

@@ -8,7 +8,7 @@ use signal_aggregator::{FragilePageCursor, ListingOrder, PageLimit};
 
 use super::{ListingOrderName, PageCollectionKind};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct V3CursorBinding {
     pub collection: PageCollectionKind,
     pub order: ListingOrder,
@@ -17,7 +17,7 @@ pub struct V3CursorBinding {
     pub query_digest: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct V3PageCursor {
     pub collection: PageCollectionKind,
     pub order: ListingOrder,
@@ -52,15 +52,15 @@ impl V3PageCursor {
         let value = format!(
             "cursor:v3:{}:{}:{}:{}:{}:{}:{}:{}",
             self.collection.as_str(),
-            ListingOrderName::new(self.order).as_str(),
-            self.limit.into_u64(),
+            ListingOrderName::new(self.order.clone()).as_str(),
+            self.limit,
             self.snapshot_identity,
             self.query_digest,
             HexText::encode(&self.last_reference),
             self.sort_tuple_digest,
             HexText::encode(&self.last_candidate_reference),
         );
-        (value.len() as u64 <= maximum_bytes).then(|| FragilePageCursor::new(value))
+        (value.len() as u64 <= maximum_bytes).then_some(value)
     }
 
     pub fn parse(reference: &FragilePageCursor, maximum_bytes: u64) -> Option<Self> {
@@ -74,7 +74,7 @@ impl V3PageCursor {
         let cursor = Self {
             collection: PageCollectionKind::parse(fields.next()?)?,
             order: ListingOrderName::parse(fields.next()?)?,
-            limit: PageLimit::new(fields.next()?.parse().ok()?),
+            limit: fields.next()?.parse().ok()?,
             snapshot_identity: DigestText::parse(fields.next()?)?,
             query_digest: DigestText::parse(fields.next()?)?,
             last_reference: HexText::decode(fields.next()?)?,

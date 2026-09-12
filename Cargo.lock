@@ -4,18 +4,19 @@ version = 4
 
 [[package]]
 name = "aggregator"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "blake3",
- "dotos",
+ "datom-codec",
  "dotos-text-query",
  "fs2",
  "meta-signal-aggregator",
+ "protos",
  "rkyv",
  "serde",
  "serde_json",
+ "signal",
  "signal-aggregator",
- "signal-frame",
  "tempfile",
  "thiserror",
  "time",
@@ -113,24 +114,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "deranged"
-version = "0.5.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
-
-[[package]]
-name = "dotos"
-version = "0.10.0"
-source = "git+https://github.com/LiGoldragon/dotos.git?rev=80c7b17f7ad3cf547d2624c6a243e5de5f85c9f3#80c7b17f7ad3cf547d2624c6a243e5de5f85c9f3"
+name = "datom-codec"
+version = "0.26.3"
+source = "git+https://github.com/LiGoldragon/datom-codec?rev=627db67f2655efd9f786864009955005fd8ab2ad#627db67f2655efd9f786864009955005fd8ab2ad"
 dependencies = [
- "dotos-derive",
- "rkyv",
+ "datom-codec-derive",
+ "protos",
 ]
 
 [[package]]
-name = "dotos-derive"
-version = "0.5.0"
-source = "git+https://github.com/LiGoldragon/dotos.git?rev=80c7b17f7ad3cf547d2624c6a243e5de5f85c9f3#80c7b17f7ad3cf547d2624c6a243e5de5f85c9f3"
+name = "datom-codec-derive"
+version = "0.26.0"
+source = "git+https://github.com/LiGoldragon/datom-codec?rev=627db67f2655efd9f786864009955005fd8ab2ad#627db67f2655efd9f786864009955005fd8ab2ad"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -138,11 +133,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "deranged"
+version = "0.5.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
+
+[[package]]
 name = "dotos-text-query"
 version = "0.2.0"
 source = "git+https://github.com/LiGoldragon/dotos-text-query.git?rev=aee1a446bb3236858d7157bad88dd63550abc25b#aee1a446bb3236858d7157bad88dd63550abc25b"
 dependencies = [
- "dotos",
  "rkyv",
  "thiserror",
 ]
@@ -161,6 +161,20 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys",
+]
+
+[[package]]
+name = "ethos-zero"
+version = "8.0.1"
+source = "git+https://github.com/LiGoldragon/ethos-zero?rev=de3d9928b156f2e1a92d060b7817af201abfdbef#de3d9928b156f2e1a92d060b7817af201abfdbef"
+dependencies = [
+ "datom-codec",
+ "prettyplease",
+ "proc-macro2",
+ "protos",
+ "quote",
+ "rkyv",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -273,14 +287,15 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "meta-signal-aggregator"
-version = "0.4.0"
-source = "git+https://github.com/LiGoldragon/meta-signal-aggregator?rev=98cc36fc7cbf9d0ae18d976a19c5c1a626d165d5#98cc36fc7cbf9d0ae18d976a19c5c1a626d165d5"
+version = "0.5.0"
+source = "git+https://github.com/LiGoldragon/meta-signal-aggregator?rev=028979475775cc4d24357e93c853d1ea27dd5113#028979475775cc4d24357e93c853d1ea27dd5113"
 dependencies = [
- "dotos",
+ "datom-codec",
+ "ethos-zero",
+ "protos",
  "rkyv",
+ "signal",
  "signal-aggregator",
- "signal-frame",
- "thiserror",
 ]
 
 [[package]]
@@ -316,12 +331,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "paste"
-version = "1.0.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
-
-[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -334,6 +343,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
+name = "prettyplease"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bfe0f4c752e450fc2faf62654f1c134747922825d5b04ca717b8874f41a40c0"
+dependencies = [
+ "proc-macro2",
+ "syn 3.0.5",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -341,6 +360,11 @@ checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "protos"
+version = "0.30.1"
+source = "git+https://github.com/LiGoldragon/protos?rev=171b21f65337983ab624b7b906397a4f1f92c5a3#171b21f65337983ab624b7b906397a4f1f92c5a3"
 
 [[package]]
 name = "ptr_meta"
@@ -494,37 +518,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "signal"
+version = "3.0.2"
+source = "git+https://github.com/LiGoldragon/signal?rev=8f9a0deb701cebbea518679548df4a795affc918#8f9a0deb701cebbea518679548df4a795affc918"
+dependencies = [
+ "datom-codec",
+ "ethos-zero",
+ "protos",
+ "rkyv",
+ "thiserror",
+]
+
+[[package]]
 name = "signal-aggregator"
-version = "0.6.0"
-source = "git+https://github.com/LiGoldragon/signal-aggregator?rev=5d2b80e21f1a79b1025731d269ceb03c64f26d5b#5d2b80e21f1a79b1025731d269ceb03c64f26d5b"
+version = "0.7.0"
+source = "git+https://github.com/LiGoldragon/signal-aggregator?rev=234ed6420867b431323603f78f984c0fe997a7f3#234ed6420867b431323603f78f984c0fe997a7f3"
 dependencies = [
- "dotos",
- "dotos-text-query",
+ "datom-codec",
+ "ethos-zero",
+ "protos",
  "rkyv",
- "signal-frame",
- "thiserror",
-]
-
-[[package]]
-name = "signal-frame"
-version = "0.3.1"
-source = "git+https://github.com/LiGoldragon/signal-frame.git?rev=8aa0bcaeb29fe9e461a11706a469638d2fd109ac#8aa0bcaeb29fe9e461a11706a469638d2fd109ac"
-dependencies = [
- "dotos",
- "paste",
- "rkyv",
- "signal-frame-macros",
- "thiserror",
-]
-
-[[package]]
-name = "signal-frame-macros"
-version = "0.1.2"
-source = "git+https://github.com/LiGoldragon/signal-frame.git?rev=8aa0bcaeb29fe9e461a11706a469638d2fd109ac#8aa0bcaeb29fe9e461a11706a469638d2fd109ac"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
+ "signal",
 ]
 
 [[package]]

@@ -2,25 +2,32 @@
 
 Runtime component for collecting and normalizing recent work evidence from configured transcript and repository sources. Review and synthesis remain agent work outside this binary.
 
+## Text and wire
+
+Every query a person writes and every response printed is Datom text over the
+generated `signal-aggregator` and `meta-signal-aggregator` contracts. Between
+the CLI and the daemon each carries as one `signal` frame: a four-byte
+big-endian length prefix and the rkyv archive of one `Query` or one `Response`.
+Nothing sits above the archive: no exchange identifiers, no lanes, no
+sub-replies.
+
 ## Examples
 
-- `examples/collect.dotos` is the coarse evidence collection request.
-- `examples/configuration.dotos` shows the current meta configuration shape, including configured source roots, the daemon-local fragile output index policy, and read/preview/page limits. Replace the sample `/srv/aggregator/...` paths with local readable roots before validation.
-- `examples/output-interface-requests.dotos` is a signal/client sequence for metadata-first discovery followed by explicit bounded output reads. Submit one DOTOS form at a time, replacing each `fragile-*` placeholder with the opaque reference returned by the previous listing.
-- `examples/output-interface-replies.dotos` shows schema-faithful reply and rejection shapes a UI or agent should handle.
-- `examples/transcript-block-search-requests.dotos` demonstrates local session and subagent scraping with metadata-first `TranscriptBlock` discovery, `dotos-text-query` searches, and explicit bounded whole-block reads.
-- `examples/transcript-block-search-replies.dotos` shows transcript-block reply, search-evidence, read, and stale-reference shapes.
+- `examples/collect.datom` is the coarse evidence collection query.
+- `examples/configuration.datom` is the current configuration shape, including configured source roots, the daemon-local fragile output index policy, and read/preview/page limits. Replace the sample `/srv/aggregator/...` paths with local readable roots before validation.
+- `examples/transcript-block-search.datom` is a transcript block search carrying its text query as a flat node arena.
+- `examples/transcript-block-read.datom` is a bounded transcript block read response.
 
-After substituting real references from earlier replies, run one request per CLI invocation:
+One query per CLI invocation:
 
 ```sh
-while IFS= read -r request; do
-  [ -z "$request" ] && continue
-  cargo run --bin aggregator -- --configuration /path/to/configuration.dotos --request "$request"
-done < examples/output-interface-requests.dotos
+cargo run --bin aggregator -- \
+  --configuration /path/to/configuration.datom \
+  --request "$(cat examples/collect.datom)"
 ```
 
-Use the same loop with `examples/transcript-block-search-requests.dotos` after replacing placeholder fragile references with values from earlier replies.
+Replace each `fragile-*` placeholder with the opaque reference an earlier
+response returned.
 
 ## Metadata-first bounded output workflow
 
@@ -49,7 +56,7 @@ Transcript block search is for scraping configured local harness, session, and s
 2. `ListSessions` with source and time filters.
 2. `ListSubagents` for the selected session when subagent drill-down matters.
 3. `ListTranscriptBlocks` with `MetadataOnly` or a small `BoundedPreview` and a grounded kind filter.
-4. `SearchTranscriptBlocks` with canonical `dotos-text-query` forms such as `(Contains (Word (quota)))`, `(Contains (Phrase ([rate limit])))`, or `(Near ((Word (quota)) (Word (reset)) 6))`.
+4. `SearchTranscriptBlocks` with a flat text-query arena: a vector of `TextQueryNode` values and the index of its root. A node is `Contains.Word.quota`, `Contains.Phrase.{ [ rate limit ] }`, `Near.{ Word.quota Word.reset 6 }`, or an `AllOf`, `AnyOf`, or `Not` naming its children by index into the same vector. An index outside the vector, or a node that reaches itself, is rejected as `InvalidQuery`.
 5. `EstimateTranscriptBlock` for the selected fragile block reference.
 6. `ReadTranscriptBlock` only with an explicit `maximum_bytes`; there is no unbounded whole-block text fetch.
 

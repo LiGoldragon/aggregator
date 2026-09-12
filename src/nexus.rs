@@ -1,15 +1,14 @@
 use signal_aggregator::{
     EvidencePackage, EvidenceRequest, OperationKind, OperationRejectionReason,
     OutputEstimateRequest, OutputEstimated, OutputListRequest, OutputRead, OutputReadRequest,
-    OutputSegmentListRequest, OutputSegmentsListed, OutputsListed, PackageIdentifier,
-    RequestIdentifier, RuntimeHealthObserved, RuntimeHealthRequest, SessionArchiveQueried,
-    SessionArchiveQueryRequest, SessionArchiveRead, SessionArchiveReadRequest,
-    SessionArchiveWriteRequest, SessionArchiveWritten, SessionInventoryRequest, SessionListRequest,
-    SessionLookedUp, SessionLookupRequest, SessionsInventoried, SessionsListed, SourceKind,
-    SubagentListRequest, SubagentsListed, TimeWindow, TranscriptBlockEstimateRequest,
-    TranscriptBlockEstimated, TranscriptBlockListRequest, TranscriptBlockRead,
-    TranscriptBlockReadRequest, TranscriptBlockSearchRequest, TranscriptBlocksListed,
-    TranscriptBlocksSearched,
+    OutputSegmentListRequest, OutputSegmentsListed, OutputsListed, RequestIdentifier,
+    RuntimeHealthObserved, RuntimeHealthRequest, SessionArchiveQueried, SessionArchiveQueryRequest,
+    SessionArchiveRead, SessionArchiveReadRequest, SessionArchiveWriteRequest,
+    SessionArchiveWritten, SessionInventoryRequest, SessionListRequest, SessionLookedUp,
+    SessionLookupRequest, SessionsInventoried, SessionsListed, SourceKind, SubagentListRequest,
+    SubagentsListed, TimeWindow, TranscriptBlockEstimateRequest, TranscriptBlockEstimated,
+    TranscriptBlockListRequest, TranscriptBlockRead, TranscriptBlockReadRequest,
+    TranscriptBlockSearchRequest, TranscriptBlocksListed, TranscriptBlocksSearched,
 };
 
 use crate::{
@@ -28,7 +27,7 @@ use crate::{
     output_index::{OperationRejectedFactory, OutputInterfaceRuntime, OutputOperationResult},
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NexusPlane {
     adapters: Vec<AdapterKind>,
     runtime_configuration: Option<RuntimeConfiguration>,
@@ -344,7 +343,7 @@ impl NexusPlane {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EvidencePackageBuilder<'a> {
     request: &'a EvidenceRequest,
     clock: &'a CollectionClock,
@@ -382,10 +381,7 @@ impl<'a> EvidencePackageBuilder<'a> {
 
     pub fn finish(self) -> EvidencePackage {
         EvidencePackage {
-            package_identifier: PackageIdentifier::new(format!(
-                "package-{}",
-                self.request.request_identifier.as_str()
-            )),
+            package_identifier: format!("package-{}", self.request.request_identifier.as_str()),
             request_identifier: self.request.request_identifier.clone(),
             time_window: self.request.time_window.clone(),
             collected_at: self.clock.reference_timestamp(),
@@ -398,7 +394,7 @@ impl<'a> EvidencePackageBuilder<'a> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LoweredTimeWindow {
     original: TimeWindow,
     adapter_window: TimeWindow,

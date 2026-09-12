@@ -4,7 +4,7 @@ use aggregator::adapter::{
     TranscriptFileAction, TranscriptFileCoverage, TranscriptFileDescriptor, TranscriptFileSync,
     TranscriptRecord, TranscriptRecordSink, TranscriptScanRequest, claude::ClaudeJsonlRootReader,
 };
-use signal_aggregator::{SourceIdentifier, SourceKind};
+use signal_aggregator::SourceKind;
 use tempfile::TempDir;
 
 #[derive(Debug, Default)]
@@ -102,6 +102,6 @@ fn changed_completed_prefix_restarts_the_claude_scan() {
     assert_eq!(restarted.cursor.source, SourceKind::Claude);
     assert_eq!(
         restarted.cursor.source_identifier,
-        SourceIdentifier::new(format!("claude:{}", root.path().display()))
+        format!("claude:{}", root.path().display())
     );
 }

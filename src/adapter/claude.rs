@@ -2,9 +2,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 use signal_aggregator::{
-    FilesystemPath, ReadFailure, ReadFailureReason, SessionIdentifier, SourceHealthStatus,
-    SourceIdentifier, SourceKind, SourceLocator, SubagentTaskMetadata, TaskIdentifier, Timestamp,
-    TranscriptBlockKind,
+    ReadFailure, ReadFailureReason, SessionIdentifier, SourceHealthStatus, SourceIdentifier,
+    SourceKind, SourceLocator, SubagentTaskMetadata, TranscriptBlockKind,
 };
 
 use crate::{
@@ -99,7 +98,7 @@ impl ClaudeTranscriptFileShape {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ClaudeJsonlRootReader {
     root: PathBuf,
     limits: TranscriptScanLimits,
@@ -144,15 +143,15 @@ impl ClaudeJsonlRootReader {
         Self {
             root,
             limits,
-            source,
+            source: source.clone(),
             file_shape: ClaudeTranscriptFileShape::new(source),
         }
     }
 
     pub fn collect(&self, request: &TranscriptReadRequest) -> TranscriptReadOutcome {
         let source_identifier = self.source_identifier();
-        if let Some(outcome) =
-            request.unsupported_relative_window_outcome(self.source, source_identifier.clone())
+        if let Some(outcome) = request
+            .unsupported_relative_window_outcome(self.source.clone(), source_identifier.clone())
         {
             return outcome;
         }
@@ -175,7 +174,7 @@ impl ClaudeJsonlRootReader {
         sink: &mut S,
     ) -> TranscriptResumableScanOutcome {
         let source_identifier = self.source_identifier();
-        sink.begin_source(self.source, request.configured_occurrence);
+        sink.begin_source(self.source.clone(), request.configured_occurrence);
         let discovery = TranscriptFileDiscovery::with_limits_and_file_shape(
             self.root.clone(),
             self.limits.clone(),
@@ -187,7 +186,7 @@ impl ClaudeJsonlRootReader {
             let outcome = self.scan_records(sink);
             return TranscriptResumableScanOutcome {
                 cursor: TranscriptScanCursor::new(
-                    self.source,
+                    self.source.clone(),
                     source_identifier,
                     request.configured_occurrence,
                     request.configuration_signature,
@@ -209,7 +208,7 @@ impl ClaudeJsonlRootReader {
             let outcome = self.scan_records(sink);
             return TranscriptResumableScanOutcome {
                 cursor: TranscriptScanCursor::new(
-                    self.source,
+                    self.source.clone(),
                     source_identifier,
                     request.configured_occurrence,
                     request.configuration_signature,
@@ -225,7 +224,7 @@ impl ClaudeJsonlRootReader {
             .resume_cursor
             .as_ref()
             .map_or(0, |cursor| cursor.next_discovery_ordinal);
-        let resumed = request.accepts(self.source, &source_identifier)
+        let resumed = request.accepts(self.source.clone(), &source_identifier)
             && resume_files <= descriptors.len() as u64
             && request.resume_cursor.as_ref().is_some_and(|cursor| {
                 TranscriptFileDescriptor::prefix_digest(&descriptors[..resume_files as usize])
@@ -234,7 +233,7 @@ impl ClaudeJsonlRootReader {
         let mut record_count = 0_u64;
         let mut counted = CountingTranscriptRecordSink::new(sink, &mut record_count);
         let mut failures = TranscriptFailureAccumulator::new(
-            self.source,
+            self.source.clone(),
             Some(self.root.clone()),
             self.limits.maximum_failures(),
         );
@@ -245,7 +244,7 @@ impl ClaudeJsonlRootReader {
         let mut truncations = discovery
             .truncations
             .into_iter()
-            .map(|truncation| truncation.into_truncation(self.source))
+            .map(|truncation| truncation.into_truncation(self.source.clone()))
             .collect::<Vec<_>>();
         let mut completed_files = 0_u64;
         let mut next_ordinal = 0_u64;
@@ -290,7 +289,7 @@ impl ClaudeJsonlRootReader {
         truncations.extend(failure_outcome.truncations);
         scan_limits.extend(failure_outcome.scan_limits);
         let outcome = TranscriptRawReadOutcome::with_discovered_file_count(
-            self.source,
+            self.source.clone(),
             source_identifier.clone(),
             Vec::new(),
             truncations,
@@ -303,7 +302,7 @@ impl ClaudeJsonlRootReader {
         TranscriptResumableScanOutcome {
             outcome,
             cursor: TranscriptScanCursor::new(
-                self.source,
+                self.source.clone(),
                 source_identifier,
                 request.configured_occurrence,
                 request.configuration_signature,
@@ -329,7 +328,7 @@ impl ClaudeJsonlRootReader {
         let source_identifier = self.source_identifier();
         if !self.root.exists() {
             return TranscriptRawReadOutcome::with_discovered_file_count(
-                self.source,
+                self.source.clone(),
                 source_identifier.clone(),
                 Vec::new(),
                 Vec::new(),
@@ -348,7 +347,7 @@ impl ClaudeJsonlRootReader {
             Ok(discovery) => discovery,
             Err(error) => {
                 return TranscriptRawReadOutcome::with_discovered_file_count(
-                    self.source,
+                    self.source.clone(),
                     source_identifier.clone(),
                     Vec::new(),
                     Vec::new(),
@@ -360,7 +359,7 @@ impl ClaudeJsonlRootReader {
 
         let mut scan_limits = discovery.scan_limits;
         let mut failures = TranscriptFailureAccumulator::new(
-            self.source,
+            self.source.clone(),
             Some(self.root.clone()),
             self.limits.maximum_failures(),
         );
@@ -370,7 +369,7 @@ impl ClaudeJsonlRootReader {
         let mut truncations = discovery
             .truncations
             .into_iter()
-            .map(|truncation| truncation.into_truncation(self.source))
+            .map(|truncation| truncation.into_truncation(self.source.clone()))
             .collect::<Vec<_>>();
         let discovered_files = discovery.files.len() as u64;
         for file in discovery.files {
@@ -386,7 +385,7 @@ impl ClaudeJsonlRootReader {
         truncations.extend(failure_outcome.truncations);
         scan_limits.extend(failure_outcome.scan_limits);
         TranscriptRawReadOutcome::with_discovered_file_count(
-            self.source,
+            self.source.clone(),
             source_identifier,
             Vec::new(),
             truncations,
@@ -407,7 +406,7 @@ impl ClaudeJsonlRootReader {
         let mut receive = |bounded_line| match bounded_line {
             TranscriptBoundedLine::Text { line_number, text } => {
                 match ClaudeJsonlRecord::new(&text).into_transcript_record(
-                    self.source,
+                    self.source.clone(),
                     file.to_path_buf(),
                     line_number,
                     self.source_identifier(),
@@ -421,7 +420,7 @@ impl ClaudeJsonlRootReader {
             }
             TranscriptBoundedLine::Truncated(truncation) => {
                 scan_limits.push(truncation.scan_limit_report());
-                truncations.push(truncation.clone().into_truncation(self.source));
+                truncations.push(truncation.clone().into_truncation(self.source.clone()));
                 failures.push(self.failure(ReadFailureReason::Malformed, truncation.path.clone()));
             }
         };
@@ -431,7 +430,7 @@ impl ClaudeJsonlRootReader {
             Ok(TranscriptBoundedFileRead::Complete) => {}
             Ok(TranscriptBoundedFileRead::Truncated(truncation)) => {
                 scan_limits.push(truncation.scan_limit_report());
-                truncations.push(truncation.into_truncation(self.source));
+                truncations.push(truncation.into_truncation(self.source.clone()));
             }
             Err(error) => failures.push(self.failure_from_io(error, Some(file.to_path_buf()))),
         }
@@ -445,19 +444,19 @@ impl ClaudeJsonlRootReader {
     }
 
     pub fn source_identifier(&self) -> SourceIdentifier {
-        SourceIdentifier::new(format!(
+        format!(
             "{}:{}",
-            ClaudeSourceName::new(self.source).as_str(),
+            ClaudeSourceName::new(self.source.clone()).as_str(),
             self.root.display()
-        ))
+        )
     }
 
     pub fn failure(&self, reason: ReadFailureReason, path: Option<PathBuf>) -> ReadFailure {
         ReadFailure {
-            source: self.source,
-            path: path.map(|value| FilesystemPath::new(value.display().to_string())),
-            source_identifier: Some(self.source_identifier()),
-            reason,
+            source_kind: self.source.clone(),
+            filesystem_path_option: path.map(|value| value.display().to_string()),
+            source_identifier_option: Some(self.source_identifier()),
+            read_failure_reason: reason,
         }
     }
 
@@ -494,7 +493,7 @@ impl<'a> ClaudeJsonlRecord<'a> {
         };
         let timestamp = match ClaudeJsonValue::new(&value).timestamp() {
             Some(value) => {
-                let timestamp = Timestamp::new(value.to_string());
+                let timestamp = value.to_string();
                 if CanonicalTimestamp::parse(&timestamp).is_err() {
                     return ClaudeJsonlRecordResult::Malformed;
                 }
@@ -504,7 +503,7 @@ impl<'a> ClaudeJsonlRecord<'a> {
         };
         let metadata = TranscriptJsonMetadata::new(&value);
         let context = TranscriptBlockSourceContext::new(
-            source,
+            source.clone(),
             source_identifier.clone(),
             path.clone(),
             line_number,
@@ -541,7 +540,7 @@ impl<'a> ClaudeJsonlRecord<'a> {
 }
 
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ClaudeJsonlRecordResult {
     Record(TranscriptRecord),
     Malformed,
@@ -827,7 +826,7 @@ impl<'a> ClaudeContentItem<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ClaudeSourceName {
     source: SourceKind,
 }
@@ -872,7 +871,7 @@ impl<'a> ClaudeSessionIdentifier<'a> {
         } else {
             self.path.file_stem().and_then(|value| value.to_str())
         }?;
-        Some(SessionIdentifier::new(
+        Some(String::from(
             source.strip_prefix("claude-").unwrap_or(source),
         ))
     }
@@ -904,17 +903,17 @@ impl<'a> ClaudeOutputTaskIdentifier<'a> {
             return None;
         }
         Some(SubagentTaskMetadata {
-            task_identifier: TaskIdentifier::new(task_identifier),
-            title: None,
-            tool_use_identifier: None,
-            output_locator: Some(SourceLocator {
-                root: FilesystemPath::new(self.path.display().to_string()),
-                relative_path: None,
+            task_identifier: String::from(task_identifier),
+            task_title_option: None,
+            tool_use_identifier_option: None,
+            source_locator_option: Some(SourceLocator {
+                filesystem_path: self.path.display().to_string(),
+                root_relative_path_option: None,
             }),
-            source_status: SourceHealthStatus::ReadableIndexed,
-            result: None,
-            usage: None,
-            duration: None,
+            source_health_status: SourceHealthStatus::ReadableIndexed,
+            task_result_option: None,
+            usage_summary_option: None,
+            task_duration: None,
         })
     }
 }

@@ -6,8 +6,8 @@ use std::{
 };
 
 use signal_aggregator::{
-    ArchivePath, ArchiveRecordIdentifier, ArchiveSummaryText, ArchiveTextCompleteness, ByteCount,
-    ByteLimit, OperationKind, OperationRejected, OperationRejectionReason, RequestIdentifier,
+    ArchivePath, ArchiveRecordIdentifier, ArchiveTextCompleteness, ByteLimit, OperationKind,
+    OperationRejected, OperationRejectionReason, RequestIdentifier,
     SessionArchiveProvenanceProjection, SessionArchiveQueried, SessionArchiveQueryRequest,
     SessionArchiveRead, SessionArchiveReadRequest, SessionArchiveRecordCard,
     SessionArchiveRecordDraft, SessionArchiveRecordProjection, SessionArchiveTextProjection,
@@ -18,7 +18,7 @@ use crate::output_index::{OperationRejectedFactory, OutputOperationResult};
 
 pub const MAXIMUM_ARCHIVE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 pub struct SessionArchiveFile {
     version: u32,
     records: Vec<SessionArchiveStoredRecord>,
@@ -43,7 +43,7 @@ impl SessionArchiveFile {
     pub fn next_record_identifier(&self) -> ArchiveRecordIdentifier {
         let mut sequence = self.records.len() as u64 + 1;
         loop {
-            let candidate = ArchiveRecordIdentifier::new(format!("archive-record-{sequence:016}"));
+            let candidate = format!("archive-record-{sequence:016}");
             if !self.contains_record_identifier(&candidate) {
                 return candidate;
             }
@@ -65,7 +65,7 @@ impl SessionArchiveFile {
     }
 }
 
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 pub struct SessionArchiveStoredRecord {
     record_identifier: ArchiveRecordIdentifier,
     draft: SessionArchiveRecordDraft,
@@ -84,14 +84,26 @@ impl SessionArchiveStoredRecord {
 
     pub fn card(&self) -> SessionArchiveRecordCard {
         SessionArchiveRecordCard {
-            record_identifier: self.record_identifier.clone(),
-            session_reference: self.draft.session.reference.clone(),
-            source: self.draft.session.source,
-            source_identifier: self.draft.session.source_identifier.clone(),
-            producer_session_identifier: self.draft.session.producer_session_identifier.clone(),
+            archive_record_identifier: self.record_identifier.clone(),
+            fragile_session_reference: self
+                .draft
+                .session_inventory_card
+                .fragile_session_reference
+                .clone(),
+            source_kind: self.draft.session_inventory_card.source_kind.clone(),
+            source_identifier: self.draft.session_inventory_card.source_identifier.clone(),
+            session_identifier_option: self
+                .draft
+                .session_inventory_card
+                .session_identifier_option
+                .clone(),
             created_at: self.draft.created_at.clone(),
-            summary_bytes: ByteCount::new(self.draft.summary.as_str().len() as u64),
-            provenance_bytes: ByteCount::new(self.draft.provenance.as_str().len() as u64),
+            summary_bytes: crate::MeasuredCount::contract_count(
+                self.draft.archive_summary_text.as_str().len() as u64,
+            ),
+            provenance_bytes: crate::MeasuredCount::contract_count(
+                self.draft.archive_provenance_text.as_str().len() as u64,
+            ),
         }
     }
 
@@ -103,7 +115,7 @@ impl SessionArchiveStoredRecord {
         &self,
         reference: &signal_aggregator::FragileSessionReference,
     ) -> bool {
-        &self.draft.session.reference == reference
+        &self.draft.session_inventory_card.fragile_session_reference == reference
     }
 
     pub fn projection(
@@ -111,26 +123,30 @@ impl SessionArchiveStoredRecord {
         summary_limit: ByteLimit,
         provenance_limit: ByteLimit,
     ) -> SessionArchiveRecordProjection {
-        let summary = BoundedArchiveText::new(self.draft.summary.as_str(), summary_limit);
-        let provenance = BoundedArchiveText::new(self.draft.provenance.as_str(), provenance_limit);
+        let summary =
+            BoundedArchiveText::new(self.draft.archive_summary_text.as_str(), summary_limit);
+        let provenance = BoundedArchiveText::new(
+            self.draft.archive_provenance_text.as_str(),
+            provenance_limit,
+        );
         SessionArchiveRecordProjection {
-            card: self.card(),
-            session: self.draft.session.clone(),
-            summary: SessionArchiveTextProjection {
-                text: ArchiveSummaryText::new(summary.text),
-                byte_count: ByteCount::new(summary.byte_count),
-                completeness: summary.completeness,
+            session_archive_record_card: self.card(),
+            session_inventory_card: self.draft.session_inventory_card.clone(),
+            session_archive_text_projection: SessionArchiveTextProjection {
+                archive_summary_text: summary.text,
+                byte_count: crate::MeasuredCount::contract_count(summary.byte_count),
+                archive_text_completeness: summary.completeness,
             },
-            provenance: SessionArchiveProvenanceProjection {
-                text: signal_aggregator::ArchiveProvenanceText::new(provenance.text),
-                byte_count: ByteCount::new(provenance.byte_count),
-                completeness: provenance.completeness,
+            session_archive_provenance_projection: SessionArchiveProvenanceProjection {
+                archive_provenance_text: provenance.text,
+                byte_count: crate::MeasuredCount::contract_count(provenance.byte_count),
+                archive_text_completeness: provenance.completeness,
             },
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BoundedArchiveText {
     text: String,
     byte_count: u64,
@@ -139,7 +155,7 @@ pub struct BoundedArchiveText {
 
 impl BoundedArchiveText {
     pub fn new(text: &str, limit: ByteLimit) -> Self {
-        let limit = limit.into_u64() as usize;
+        let limit = limit as usize;
         if text.len() <= limit {
             return Self {
                 text: text.to_string(),
@@ -187,7 +203,10 @@ impl SessionArchiveStore {
             OperationKind::WriteSessionArchive,
         )?;
         let record_identifier = file.next_record_identifier();
-        let stored = SessionArchiveStoredRecord::new(record_identifier, request.record);
+        let stored = SessionArchiveStoredRecord::new(
+            record_identifier,
+            request.session_archive_record_draft,
+        );
         let card = stored.card();
         file.push(stored);
         path.write_file(
@@ -198,7 +217,7 @@ impl SessionArchiveStore {
         Ok(SessionArchiveWritten {
             request_identifier: request.request_identifier,
             archive_path: request.archive_path,
-            card,
+            session_archive_record_card: card,
         })
     }
 
@@ -220,7 +239,7 @@ impl SessionArchiveStore {
             .iter()
             .filter(|record| {
                 request
-                    .session_reference
+                    .fragile_session_reference_option
                     .as_ref()
                     .is_none_or(|reference| record.matches_session_reference(reference))
             })
@@ -229,7 +248,7 @@ impl SessionArchiveStore {
         Ok(SessionArchiveQueried {
             request_identifier: request.request_identifier,
             archive_path: request.archive_path,
-            records,
+            session_archive_record_cards: records,
         })
     }
 
@@ -249,7 +268,7 @@ impl SessionArchiveStore {
         let Some(record) = file
             .records()
             .iter()
-            .find(|record| record.matches_record_identifier(&request.record_identifier))
+            .find(|record| record.matches_record_identifier(&request.archive_record_identifier))
         else {
             return Err(OperationRejectedFactory::new(
                 request.request_identifier.clone(),
@@ -260,7 +279,7 @@ impl SessionArchiveStore {
         Ok(SessionArchiveRead {
             request_identifier: request.request_identifier,
             archive_path: request.archive_path,
-            record: record.projection(
+            session_archive_record_projection: record.projection(
                 request.maximum_summary_bytes,
                 request.maximum_provenance_bytes,
             ),
@@ -317,7 +336,7 @@ impl ArchivePathBoundary {
             ));
         }
 
-        let root = self.canonical_root(request_identifier, operation, access)?;
+        let root = self.canonical_root(request_identifier, operation.clone(), access)?;
         let candidate = root.join(requested);
         let Some(parent) = candidate.parent() else {
             return Err(self.rejection(
@@ -344,13 +363,13 @@ impl ArchivePathBoundary {
             fs::create_dir_all(parent).map_err(|_| {
                 self.rejection(
                     request_identifier,
-                    operation,
+                    operation.clone(),
                     OperationRejectionReason::Unsupported,
                 )
             })?;
         }
         let parent = parent.canonicalize().map_err(|error| {
-            self.filesystem_rejection(request_identifier, operation, error.kind())
+            self.filesystem_rejection(request_identifier, operation.clone(), error.kind())
         })?;
         if !parent.starts_with(&root) {
             return Err(self.rejection(
@@ -383,7 +402,7 @@ impl ArchivePathBoundary {
                 ));
             }
             let canonical = path.canonicalize().map_err(|error| {
-                self.filesystem_rejection(request_identifier, operation, error.kind())
+                self.filesystem_rejection(request_identifier, operation.clone(), error.kind())
             })?;
             if !canonical.starts_with(&root) {
                 return Err(self.rejection(
@@ -407,7 +426,7 @@ impl ArchivePathBoundary {
             fs::create_dir_all(&self.root).map_err(|_| {
                 self.rejection(
                     request_identifier,
-                    operation,
+                    operation.clone(),
                     OperationRejectionReason::Unsupported,
                 )
             })?;
@@ -485,15 +504,15 @@ impl ArchiveFilePath {
         request_identifier: &RequestIdentifier,
         operation: OperationKind,
     ) -> OutputOperationResult<SessionArchiveFile> {
-        self.reject_oversized(request_identifier, operation)?;
+        self.reject_oversized(request_identifier, operation.clone())?;
         let bytes = fs::read(&self.path).map_err(|error| {
-            self.filesystem_rejection(request_identifier, operation, error.kind())
+            self.filesystem_rejection(request_identifier, operation.clone(), error.kind())
         })?;
         let file =
             rkyv::from_bytes::<SessionArchiveFile, rkyv::rancor::Error>(&bytes).map_err(|_| {
                 self.rejection(
                     request_identifier,
-                    operation,
+                    operation.clone(),
                     OperationRejectionReason::InvalidRequest,
                 )
             })?;
@@ -516,7 +535,7 @@ impl ArchiveFilePath {
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(file).map_err(|_| {
             self.rejection(
                 request_identifier,
-                operation,
+                operation.clone(),
                 OperationRejectionReason::Unsupported,
             )
         })?;
@@ -540,7 +559,7 @@ impl ArchiveFilePath {
         operation: OperationKind,
     ) -> OutputOperationResult<()> {
         let metadata = fs::metadata(&self.path).map_err(|error| {
-            self.filesystem_rejection(request_identifier, operation, error.kind())
+            self.filesystem_rejection(request_identifier, operation.clone(), error.kind())
         })?;
         if metadata.len() > MAXIMUM_ARCHIVE_FILE_BYTES {
             return Err(self.rejection(
@@ -604,19 +623,19 @@ impl ArchiveTemporaryPath {
         operation: OperationKind,
     ) -> OutputOperationResult<()> {
         let temporary_path = self.path();
-        self.validate(request_identifier, operation, &temporary_path)?;
+        self.validate(request_identifier, operation.clone(), &temporary_path)?;
         let mut temporary_file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temporary_path)
             .map_err(|error| {
-                self.filesystem_rejection(request_identifier, operation, error.kind())
+                self.filesystem_rejection(request_identifier, operation.clone(), error.kind())
             })?;
         temporary_file.write_all(bytes).map_err(|error| {
-            self.filesystem_rejection(request_identifier, operation, error.kind())
+            self.filesystem_rejection(request_identifier, operation.clone(), error.kind())
         })?;
         temporary_file.sync_all().map_err(|error| {
-            self.filesystem_rejection(request_identifier, operation, error.kind())
+            self.filesystem_rejection(request_identifier, operation.clone(), error.kind())
         })?;
         fs::rename(&temporary_path, &self.path).map_err(|error| {
             self.filesystem_rejection(request_identifier, operation, error.kind())
@@ -638,7 +657,7 @@ impl ArchiveTemporaryPath {
             ));
         };
         let parent = parent.canonicalize().map_err(|error| {
-            self.filesystem_rejection(request_identifier, operation, error.kind())
+            self.filesystem_rejection(request_identifier, operation.clone(), error.kind())
         })?;
         if !parent.starts_with(&self.root) || !temporary_path.starts_with(&parent) {
             return Err(self.rejection(
@@ -695,40 +714,38 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use signal_aggregator::{
-        ArchiveProvenanceText, FilesystemPath, FragileSessionReference, ItemCount,
-        RootRelativePath, SessionArchiveStatus, SessionIdentifier, SessionInventoryCard,
-        SessionLifecycleStatus, SessionRole, SourceHealthStatus, SourceIdentifier, SourceKind,
-        SourceLocator,
+        SessionArchiveStatus, SessionInventoryCard, SessionLifecycleStatus, SessionRole,
+        SourceHealthStatus, SourceKind, SourceLocator,
     };
     use tempfile::TempDir;
 
     fn archive_draft(session_reference: &str) -> SessionArchiveRecordDraft {
         SessionArchiveRecordDraft {
-            session: SessionInventoryCard {
-                reference: FragileSessionReference::new(session_reference),
-                role: SessionRole::MainSession,
-                source: SourceKind::Claude,
-                source_identifier: SourceIdentifier::new("claude-fixture"),
-                producer_session_identifier: Some(SessionIdentifier::new("producer-session")),
-                locator: SourceLocator {
-                    root: FilesystemPath::new("/tmp/archive-test"),
-                    relative_path: Some(RootRelativePath::new("session.jsonl")),
+            session_inventory_card: SessionInventoryCard {
+                fragile_session_reference: String::from(session_reference),
+                session_role: SessionRole::MainSession,
+                source_kind: SourceKind::Claude,
+                source_identifier: String::from("claude-fixture"),
+                session_identifier_option: Some(String::from("producer-session")),
+                source_locator: SourceLocator {
+                    filesystem_path: String::from("/tmp/archive-test"),
+                    root_relative_path_option: Some(String::from("session.jsonl")),
                 },
-                file_count: ItemCount::new(1),
-                byte_count: ByteCount::new(12),
+                file_count: 1,
+                byte_count: 12,
                 earliest_modified_at: None,
                 latest_modified_at: None,
                 started_at: None,
                 last_observed_at: None,
                 subagent_count: None,
                 output_count: None,
-                lifecycle_status: SessionLifecycleStatus::Current,
-                source_status: SourceHealthStatus::ReadableIndexed,
-                archive_status: SessionArchiveStatus::ArchiveUnknown,
+                session_lifecycle_status: SessionLifecycleStatus::Current,
+                source_health_status: SourceHealthStatus::ReadableIndexed,
+                session_archive_status: SessionArchiveStatus::ArchiveUnknown,
             },
-            summary: ArchiveSummaryText::new("summary"),
-            provenance: ArchiveProvenanceText::new("provenance"),
-            created_at: signal_aggregator::Timestamp::new("2026-01-02T01:10:00Z"),
+            archive_summary_text: String::from("summary"),
+            archive_provenance_text: String::from("provenance"),
+            created_at: String::from("2026-01-02T01:10:00Z"),
         }
     }
 
@@ -756,20 +773,20 @@ mod tests {
         let archive_root = temporary_root.path().join("session-archive");
         let outside_parent = temporary_root.path().join("outside-parent");
         let outside_path = outside_parent.join("archive.rkyv");
-        let store = SessionArchiveStore::new(
-            archive_root,
-            ArchivePath::new(outside_path.display().to_string()),
-        );
+        let store = SessionArchiveStore::new(archive_root, outside_path.display().to_string());
 
         let rejected = store
             .write_record(SessionArchiveWriteRequest {
-                request_identifier: RequestIdentifier::new("write-outside-archive-root"),
-                archive_path: ArchivePath::new(outside_path.display().to_string()),
-                record: archive_draft("session-ref"),
+                request_identifier: String::from("write-outside-archive-root"),
+                archive_path: outside_path.display().to_string(),
+                session_archive_record_draft: archive_draft("session-ref"),
             })
             .expect_err("absolute outside archive path must be rejected");
 
-        assert_eq!(rejected.reason, OperationRejectionReason::Unauthorized);
+        assert_eq!(
+            rejected.operation_rejection_reason,
+            OperationRejectionReason::Unauthorized
+        );
         assert!(
             !outside_parent.exists(),
             "outside archive parent directory must not be created before rejection"
@@ -790,17 +807,20 @@ mod tests {
         let victim_path = temporary_root.path().join("victim.txt");
         fs::write(&victim_path, "victim").expect("victim content");
         symlink(&victim_path, &temporary_path).expect("temporary symlink");
-        let store = SessionArchiveStore::new(archive_root, ArchivePath::new("archive.rkyv"));
+        let store = SessionArchiveStore::new(archive_root, String::from("archive.rkyv"));
 
         let rejected = store
             .write_record(SessionArchiveWriteRequest {
-                request_identifier: RequestIdentifier::new("write-temp-symlink-archive"),
-                archive_path: ArchivePath::new("archive.rkyv"),
-                record: archive_draft("session-ref"),
+                request_identifier: String::from("write-temp-symlink-archive"),
+                archive_path: String::from("archive.rkyv"),
+                session_archive_record_draft: archive_draft("session-ref"),
             })
             .expect_err("temporary symlink must be rejected");
 
-        assert_eq!(rejected.reason, OperationRejectionReason::Unauthorized);
+        assert_eq!(
+            rejected.operation_rejection_reason,
+            OperationRejectionReason::Unauthorized
+        );
         assert_eq!(
             fs::read_to_string(&victim_path).expect("victim unchanged"),
             "victim"
@@ -817,48 +837,48 @@ mod tests {
         let archive_root = temporary_root.path().join("session-archive");
         fs::create_dir_all(&archive_root).expect("archive root");
         let archive_path = archive_root.join("archive.rkyv");
-        let duplicate_identifier = ArchiveRecordIdentifier::new("duplicate-record");
+        let duplicate_identifier = String::from("duplicate-record");
         write_archive_file(
             &archive_path,
             &duplicate_archive_file(duplicate_identifier.clone()),
         );
-        let store = SessionArchiveStore::new(archive_root, ArchivePath::new("archive.rkyv"));
+        let store = SessionArchiveStore::new(archive_root, String::from("archive.rkyv"));
 
         let query_rejected = store
             .query(SessionArchiveQueryRequest {
-                request_identifier: RequestIdentifier::new("query-duplicate-archive"),
-                archive_path: ArchivePath::new("archive.rkyv"),
-                session_reference: None,
+                request_identifier: String::from("query-duplicate-archive"),
+                archive_path: String::from("archive.rkyv"),
+                fragile_session_reference_option: None,
             })
             .expect_err("duplicate identifiers must reject query");
         assert_eq!(
-            query_rejected.reason,
+            query_rejected.operation_rejection_reason,
             OperationRejectionReason::InvalidRequest
         );
 
         let read_rejected = store
             .read(SessionArchiveReadRequest {
-                request_identifier: RequestIdentifier::new("read-duplicate-archive"),
-                archive_path: ArchivePath::new("archive.rkyv"),
-                record_identifier: duplicate_identifier,
-                maximum_summary_bytes: ByteLimit::new(64),
-                maximum_provenance_bytes: ByteLimit::new(64),
+                request_identifier: String::from("read-duplicate-archive"),
+                archive_path: String::from("archive.rkyv"),
+                archive_record_identifier: duplicate_identifier,
+                maximum_summary_bytes: 64,
+                maximum_provenance_bytes: 64,
             })
             .expect_err("duplicate identifiers must reject read");
         assert_eq!(
-            read_rejected.reason,
+            read_rejected.operation_rejection_reason,
             OperationRejectionReason::InvalidRequest
         );
 
         let write_rejected = store
             .write_record(SessionArchiveWriteRequest {
-                request_identifier: RequestIdentifier::new("write-duplicate-archive"),
-                archive_path: ArchivePath::new("archive.rkyv"),
-                record: archive_draft("session-ref-3"),
+                request_identifier: String::from("write-duplicate-archive"),
+                archive_path: String::from("archive.rkyv"),
+                session_archive_record_draft: archive_draft("session-ref-3"),
             })
             .expect_err("duplicate identifiers must reject write");
         assert_eq!(
-            write_rejected.reason,
+            write_rejected.operation_rejection_reason,
             OperationRejectionReason::InvalidRequest
         );
     }

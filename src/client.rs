@@ -1,23 +1,14 @@
-use std::{
-    io::{Read, Write},
-    os::unix::net::UnixStream,
-    path::PathBuf,
-};
+use std::{io::Read, path::PathBuf};
 
-use dotos::{DotosEncode, DotosSource};
 use meta_signal_aggregator::{
-    AggregatorConfiguration, MetaAggregatorFrame, MetaAggregatorFrameBody, MetaAggregatorReply,
-    MetaAggregatorRequest,
+    AggregatorConfiguration, Query as MetaQuery, Response as MetaResponse,
 };
-use signal_aggregator::{AggregatorFrame, AggregatorFrameBody, AggregatorReply, AggregatorRequest};
-use signal_frame::{
-    AcceptedOutcome, ExchangeIdentifier, ExchangeLane, LaneSequence, Reply as FrameReply, Request,
-    SessionEpoch, SubReply,
-};
+use signal_aggregator::{Query, Response};
 
 use crate::{
     ConfigurationStore, Error, HomeDirectory, LocalDefaultConfigurationRequest, Result,
     TemporaryDirectory, UserIdentifier, WorkspacePath,
+    wire::{DatomText, UnixSocketClient},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,14 +35,11 @@ impl AggregatorClientCommand {
 
     pub fn run(&self) -> Result<()> {
         let configuration = self.arguments.configuration_store()?.read_configuration()?;
-        let request_text = self.arguments.input_text()?;
-        let request = DotosSource::new(&request_text)
-            .parse::<AggregatorRequest>()
-            .map_err(|error| Error::dotos("ordinary request decode", error.to_string()))?;
-        let reply =
+        let query: Query = DatomText::read("ordinary query", &self.arguments.input_text()?)?;
+        let response: Response =
             UnixSocketClient::new(PathBuf::from(configuration.ordinary_socket_path.as_str()))
-                .exchange_ordinary(request)?;
-        print!("{}", reply.to_dotos());
+                .exchange(&query)?;
+        println!("{}", DatomText::print(&response));
         Ok(())
     }
 }
@@ -65,13 +53,11 @@ impl MetaAggregatorClientCommand {
 
     pub fn run(&self) -> Result<()> {
         let configuration = self.arguments.configuration_store()?.read_configuration()?;
-        let request_text = self.arguments.input_text()?;
-        let request = DotosSource::new(&request_text)
-            .parse::<MetaAggregatorRequest>()
-            .map_err(|error| Error::dotos("meta request decode", error.to_string()))?;
-        let reply = UnixSocketClient::new(PathBuf::from(configuration.meta_socket_path.as_str()))
-            .exchange_meta(request)?;
-        print!("{}", reply.to_dotos());
+        let query: MetaQuery = DatomText::read("meta query", &self.arguments.input_text()?)?;
+        let response: MetaResponse =
+            UnixSocketClient::new(PathBuf::from(configuration.meta_socket_path.as_str()))
+                .exchange(&query)?;
+        println!("{}", DatomText::print(&response));
         Ok(())
     }
 }
@@ -100,15 +86,15 @@ impl ConfigurationWriterCommand {
             }
             request.configuration()
         } else {
-            let text = self.arguments.input_text()?;
-            DotosSource::new(&text)
-                .parse::<AggregatorConfiguration>()
-                .map_err(|error| Error::dotos("configuration decode", error.to_string()))?
+            DatomText::read::<AggregatorConfiguration>(
+                "configuration",
+                &self.arguments.input_text()?,
+            )?
         };
         self.arguments
             .configuration_store()?
             .write_configuration(&configuration)?;
-        println!("{}", configuration.to_dotos());
+        println!("{}", DatomText::print(&configuration));
         Ok(())
     }
 }
@@ -148,7 +134,7 @@ impl ClientCommandArguments {
             .map_err(|error| Error::io("reading standard input", error))?;
         if text.trim().is_empty() {
             Err(Error::argument(
-                "request/configuration DOTOS is required on stdin",
+                "request or configuration Datom text is required on stdin",
             ))
         } else {
             Ok(text)
@@ -258,183 +244,5 @@ impl<'a> UserIdentifierText<'a> {
         self.text
             .parse::<u32>()
             .map_err(|error| Error::argument(format!("invalid user identifier: {error}")))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnixSocketClient {
-    path: PathBuf,
-}
-
-impl UnixSocketClient {
-    pub fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-
-    pub fn exchange_ordinary(&self, request: AggregatorRequest) -> Result<AggregatorReply> {
-        let route = request.wire_route();
-        let frame = AggregatorFrame::new(
-            route,
-            AggregatorFrameBody::Request {
-                exchange: SocketExchangeIdentity::first().connector_exchange(),
-                request: Request::from_payload(request),
-            },
-        );
-        let reply_frame = AggregatorFrame::decode_length_prefixed(
-            &self.exchange_bytes(
-                &frame
-                    .encode_length_prefixed()
-                    .map_err(|error| Error::frame("ordinary request encode", error))?,
-            )?,
-        )
-        .map_err(|error| Error::frame("ordinary reply decode", error))?;
-        OrdinaryReplyEnvelope::new(reply_frame).single_reply()
-    }
-
-    pub fn exchange_meta(&self, request: MetaAggregatorRequest) -> Result<MetaAggregatorReply> {
-        let route = request.wire_route();
-        let frame = MetaAggregatorFrame::new(
-            route,
-            MetaAggregatorFrameBody::Request {
-                exchange: SocketExchangeIdentity::first().connector_exchange(),
-                request: Request::from_payload(request),
-            },
-        );
-        let reply_frame = MetaAggregatorFrame::decode_length_prefixed(
-            &self.exchange_bytes(
-                &frame
-                    .encode_length_prefixed()
-                    .map_err(|error| Error::frame("meta request encode", error))?,
-            )?,
-        )
-        .map_err(|error| Error::frame("meta reply decode", error))?;
-        MetaReplyEnvelope::new(reply_frame).single_reply()
-    }
-
-    pub fn exchange_bytes(&self, request_bytes: &[u8]) -> Result<Vec<u8>> {
-        let mut stream = UnixStream::connect(&self.path)
-            .map_err(|error| Error::io("connecting unix socket", error))?;
-        stream
-            .write_all(request_bytes)
-            .map_err(|error| Error::io("writing socket request", error))?;
-        stream
-            .shutdown(std::net::Shutdown::Write)
-            .map_err(|error| Error::io("shutting down socket write", error))?;
-        let mut reply = Vec::new();
-        stream
-            .read_to_end(&mut reply)
-            .map_err(|error| Error::io("reading socket reply", error))?;
-        Ok(reply)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SocketExchangeIdentity {
-    session_epoch: SessionEpoch,
-}
-
-impl SocketExchangeIdentity {
-    pub fn first() -> Self {
-        Self {
-            session_epoch: SessionEpoch::new(1),
-        }
-    }
-
-    pub fn connector_exchange(&self) -> ExchangeIdentifier {
-        ExchangeIdentifier::new(
-            self.session_epoch,
-            ExchangeLane::Connector,
-            LaneSequence::first(),
-        )
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OrdinaryReplyEnvelope {
-    frame: AggregatorFrame,
-}
-
-impl OrdinaryReplyEnvelope {
-    pub fn new(frame: AggregatorFrame) -> Self {
-        Self { frame }
-    }
-
-    pub fn single_reply(self) -> Result<AggregatorReply> {
-        match self.frame.into_body() {
-            AggregatorFrameBody::Reply { reply, .. } => Self::single_committed_reply(reply),
-            other => Err(Error::protocol(
-                "ordinary reply shape",
-                format!("expected reply frame, got {other:?}"),
-            )),
-        }
-    }
-
-    pub fn single_committed_reply(reply: FrameReply<AggregatorReply>) -> Result<AggregatorReply> {
-        match reply {
-            FrameReply::Accepted {
-                outcome: AcceptedOutcome::Committed,
-                per_operation,
-            } if per_operation.len() == 1 => match per_operation.into_head() {
-                SubReply::Ok(reply) => Ok(reply),
-                other => Err(Error::protocol(
-                    "ordinary reply shape",
-                    format!("expected successful sub-reply, got {other:?}"),
-                )),
-            },
-            FrameReply::Rejected { reason } => Err(Error::protocol(
-                "ordinary reply rejection",
-                format!("request rejected before execution: {reason}"),
-            )),
-            other => Err(Error::protocol(
-                "ordinary reply shape",
-                format!("expected committed single-operation reply, got {other:?}"),
-            )),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MetaReplyEnvelope {
-    frame: MetaAggregatorFrame,
-}
-
-impl MetaReplyEnvelope {
-    pub fn new(frame: MetaAggregatorFrame) -> Self {
-        Self { frame }
-    }
-
-    pub fn single_reply(self) -> Result<MetaAggregatorReply> {
-        match self.frame.into_body() {
-            MetaAggregatorFrameBody::Reply { reply, .. } => Self::single_committed_reply(reply),
-            other => Err(Error::protocol(
-                "meta reply shape",
-                format!("expected reply frame, got {other:?}"),
-            )),
-        }
-    }
-
-    pub fn single_committed_reply(
-        reply: FrameReply<MetaAggregatorReply>,
-    ) -> Result<MetaAggregatorReply> {
-        match reply {
-            FrameReply::Accepted {
-                outcome: AcceptedOutcome::Committed,
-                per_operation,
-            } if per_operation.len() == 1 => match per_operation.into_head() {
-                SubReply::Ok(reply) => Ok(reply),
-                other => Err(Error::protocol(
-                    "meta reply shape",
-                    format!("expected successful sub-reply, got {other:?}"),
-                )),
-            },
-            FrameReply::Rejected { reason } => Err(Error::protocol(
-                "meta reply rejection",
-                format!("request rejected before execution: {reason}"),
-            )),
-            other => Err(Error::protocol(
-                "meta reply shape",
-                format!("expected committed single-operation reply, got {other:?}"),
-            )),
-        }
     }
 }

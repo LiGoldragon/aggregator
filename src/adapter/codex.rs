@@ -2,8 +2,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
 use signal_aggregator::{
-    FilesystemPath, ReadFailure, ReadFailureReason, SourceIdentifier, SourceKind, Timestamp,
-    TranscriptBlockKind,
+    ReadFailure, ReadFailureReason, SourceIdentifier, SourceKind, TranscriptBlockKind,
 };
 
 use crate::{
@@ -270,15 +269,15 @@ impl CodexSessionRootReader {
     }
 
     pub fn source_identifier(&self) -> SourceIdentifier {
-        SourceIdentifier::new(format!("codex:{}", self.root.display()))
+        format!("codex:{}", self.root.display())
     }
 
     pub fn failure(&self, reason: ReadFailureReason, path: Option<PathBuf>) -> ReadFailure {
         ReadFailure {
-            source: SourceKind::Codex,
-            path: path.map(|value| FilesystemPath::new(value.display().to_string())),
-            source_identifier: Some(self.source_identifier()),
-            reason,
+            source_kind: SourceKind::Codex,
+            filesystem_path_option: path.map(|value| value.display().to_string()),
+            source_identifier_option: Some(self.source_identifier()),
+            read_failure_reason: reason,
         }
     }
 
@@ -292,7 +291,7 @@ impl CodexSessionRootReader {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CodexSessionFiles {
     pub files: Vec<PathBuf>,
     pub read_failures: Vec<ReadFailure>,
@@ -398,15 +397,15 @@ impl CodexIndex {
             source_identifier.push_str(&locator);
         }
         ReadFailure {
-            source: SourceKind::Codex,
-            path: Some(FilesystemPath::new(
+            source_kind: SourceKind::Codex,
+            filesystem_path_option: Some(
                 TranscriptLineLocator::new(self.path.clone(), line_number)
                     .path()
                     .display()
                     .to_string(),
-            )),
-            source_identifier: Some(SourceIdentifier::new(source_identifier)),
-            reason,
+            ),
+            source_identifier_option: Some(source_identifier),
+            read_failure_reason: reason,
         }
     }
 }
@@ -518,7 +517,7 @@ impl<'a> CodexJsonlRecord<'a> {
         };
         let timestamp = match CodexJsonValue::new(&value).timestamp() {
             Some(value) => {
-                let timestamp = Timestamp::new(value.to_string());
+                let timestamp = value.to_string();
                 if CanonicalTimestamp::parse(&timestamp).is_err() {
                     return CodexJsonlRecordResult::Malformed;
                 }
@@ -559,7 +558,7 @@ impl<'a> CodexJsonlRecord<'a> {
 }
 
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CodexJsonlRecordResult {
     Record(TranscriptRecord),
     Malformed,

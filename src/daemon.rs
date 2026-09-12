@@ -1,5 +1,4 @@
 use std::{
-    io::{Read, Write},
     os::unix::{
         fs::{FileTypeExt, PermissionsExt},
         net::{UnixListener, UnixStream},
@@ -10,18 +9,15 @@ use std::{
 };
 
 use meta_signal_aggregator::{
-    MetaAggregatorFrame, MetaAggregatorFrameBody, MetaAggregatorOperationKind, MetaAggregatorReply,
-    MetaAggregatorRequest, SocketMode,
+    OperationKind as MetaOperationKind, Query as MetaQuery, Response as MetaResponse, SocketMode,
 };
 use signal_aggregator::{
-    AggregatorFrame, AggregatorFrameBody, AggregatorReply, AggregatorRequest, OperationKind,
-    OperationRejectionReason, RejectionReason,
+    OperationKind, OperationRejectionReason, Query, RejectionReason, Response,
 };
-use signal_frame::{NonEmpty, Reply as FrameReply, RequestRejectionReason, SubReply};
 
 use crate::{
     CollectionClock, ConfigurationStore, Error, NexusPlane, Result, RuntimeConfiguration,
-    RuntimeConfigurationValidation, SemaPlane, SignalPlane,
+    RuntimeConfigurationValidation, SemaPlane, SignalPlane, wire::SignalFrame,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,20 +163,13 @@ impl OrdinarySocketService {
         Ok(())
     }
 
-    pub fn handle_stream(&self, stream: UnixStream) -> Result<()> {
-        let mut exchange = SocketExchange::new(stream);
-        let request_bytes = exchange.read_bytes()?;
-        let frame = match AggregatorFrame::decode_length_prefixed(&request_bytes) {
-            Ok(frame) => frame,
-            Err(_) => return Ok(()),
+    pub fn handle_stream(&self, mut stream: UnixStream) -> Result<()> {
+        let Ok(query) = SignalFrame::read::<Query>("ordinary query", &mut stream) else {
+            return Ok(());
         };
-        let reply_frame =
-            OrdinarySocketFrame::new(frame, self.sema.clone(), self.clock.clone()).reply_frame()?;
-        exchange.write_bytes(
-            &reply_frame
-                .encode_length_prefixed()
-                .map_err(|error| Error::frame("ordinary reply encode", error))?,
-        )
+        let response =
+            OrdinaryRequestHandler::new(self.sema.clone(), self.clock.clone()).handle(query);
+        SignalFrame::write("ordinary response", &mut stream, &response)
     }
 }
 
@@ -217,19 +206,12 @@ impl MetaSocketService {
         Ok(())
     }
 
-    pub fn handle_stream(&self, stream: UnixStream) -> Result<()> {
-        let mut exchange = SocketExchange::new(stream);
-        let request_bytes = exchange.read_bytes()?;
-        let frame = match MetaAggregatorFrame::decode_length_prefixed(&request_bytes) {
-            Ok(frame) => frame,
-            Err(_) => return Ok(()),
+    pub fn handle_stream(&self, mut stream: UnixStream) -> Result<()> {
+        let Ok(query) = SignalFrame::read::<MetaQuery>("meta query", &mut stream) else {
+            return Ok(());
         };
-        let reply_frame = MetaSocketFrame::new(frame, self.sema.clone()).reply_frame()?;
-        exchange.write_bytes(
-            &reply_frame
-                .encode_length_prefixed()
-                .map_err(|error| Error::frame("meta reply encode", error))?,
-        )
+        let response = MetaRequestHandler::new(self.sema.clone()).handle(query);
+        SignalFrame::write("meta response", &mut stream, &response)
     }
 }
 
@@ -276,7 +258,12 @@ impl PrototypeSocket {
     }
 
     pub fn apply_mode(&self) -> Result<()> {
-        let mode = self.mode.into_u32();
+        let mode = u32::try_from(self.mode).map_err(|_| {
+            Error::startup_configuration(format!(
+                "configured socket mode {} is not a permission value",
+                self.mode
+            ))
+        })?;
         if mode > 0o777 {
             return Err(Error::startup_configuration(format!(
                 "configured socket mode {mode:#o} is outside permission bits"
@@ -284,129 +271,6 @@ impl PrototypeSocket {
         }
         std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(mode))
             .map_err(|error| Error::io("setting unix socket mode", error))
-    }
-}
-
-#[derive(Debug)]
-pub struct SocketExchange {
-    stream: UnixStream,
-}
-
-impl SocketExchange {
-    pub fn new(stream: UnixStream) -> Self {
-        Self { stream }
-    }
-
-    pub fn read_bytes(&mut self) -> Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        self.stream
-            .read_to_end(&mut bytes)
-            .map_err(|error| Error::io("reading socket request", error))?;
-        Ok(bytes)
-    }
-
-    pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        self.stream
-            .write_all(bytes)
-            .map_err(|error| Error::io("writing socket reply", error))
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct OrdinarySocketFrame {
-    frame: AggregatorFrame,
-    sema: Arc<Mutex<SemaPlane>>,
-    clock: CollectionClock,
-}
-
-impl OrdinarySocketFrame {
-    pub fn new(
-        frame: AggregatorFrame,
-        sema: Arc<Mutex<SemaPlane>>,
-        clock: CollectionClock,
-    ) -> Self {
-        Self { frame, sema, clock }
-    }
-
-    pub fn reply_frame(self) -> Result<AggregatorFrame> {
-        let route = self.frame.short_header().route();
-        match self.frame.into_body() {
-            AggregatorFrameBody::Request { exchange, request } => {
-                let handler = OrdinaryRequestHandler::new(self.sema, self.clock);
-                let replies = request
-                    .payloads
-                    .into_iter()
-                    .map(|request| SubReply::Ok(handler.handle(request)))
-                    .collect::<Vec<_>>();
-                let per_operation = NonEmpty::try_from_vec(replies).map_err(|error| {
-                    Error::protocol("ordinary request shape", error.to_string())
-                })?;
-                Ok(AggregatorFrame::new(
-                    route,
-                    AggregatorFrameBody::Reply {
-                        exchange,
-                        reply: FrameReply::committed(per_operation),
-                    },
-                ))
-            }
-            AggregatorFrameBody::Reply { exchange, .. } => Ok(AggregatorFrame::new(
-                route,
-                AggregatorFrameBody::Reply {
-                    exchange,
-                    reply: FrameReply::rejected(RequestRejectionReason::Internal),
-                },
-            )),
-            other => Err(Error::protocol(
-                "ordinary request shape",
-                format!("expected request frame, got {other:?}"),
-            )),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct MetaSocketFrame {
-    frame: MetaAggregatorFrame,
-    sema: Arc<Mutex<SemaPlane>>,
-}
-
-impl MetaSocketFrame {
-    pub fn new(frame: MetaAggregatorFrame, sema: Arc<Mutex<SemaPlane>>) -> Self {
-        Self { frame, sema }
-    }
-
-    pub fn reply_frame(self) -> Result<MetaAggregatorFrame> {
-        let route = self.frame.short_header().route();
-        match self.frame.into_body() {
-            MetaAggregatorFrameBody::Request { exchange, request } => {
-                let handler = MetaRequestHandler::new(self.sema);
-                let replies = request
-                    .payloads
-                    .into_iter()
-                    .map(|request| SubReply::Ok(handler.handle(request)))
-                    .collect::<Vec<_>>();
-                let per_operation = NonEmpty::try_from_vec(replies)
-                    .map_err(|error| Error::protocol("meta request shape", error.to_string()))?;
-                Ok(MetaAggregatorFrame::new(
-                    route,
-                    MetaAggregatorFrameBody::Reply {
-                        exchange,
-                        reply: FrameReply::committed(per_operation),
-                    },
-                ))
-            }
-            MetaAggregatorFrameBody::Reply { exchange, .. } => Ok(MetaAggregatorFrame::new(
-                route,
-                MetaAggregatorFrameBody::Reply {
-                    exchange,
-                    reply: FrameReply::rejected(RequestRejectionReason::Internal),
-                },
-            )),
-            other => Err(Error::protocol(
-                "meta request shape",
-                format!("expected request frame, got {other:?}"),
-            )),
-        }
     }
 }
 
@@ -426,199 +290,199 @@ impl OrdinaryRequestHandler {
         }
     }
 
-    pub fn handle(&self, request: AggregatorRequest) -> AggregatorReply {
+    pub fn handle(&self, request: Query) -> Response {
         match request {
-            AggregatorRequest::Version(_) => self.signal.version_report(),
-            AggregatorRequest::ObserveHealth(request) => {
+            Query::Version(_) => self.signal.version_report(),
+            Query::ObserveHealth(request) => {
                 match self
                     .nexus_for_operation(&request.request_identifier, OperationKind::ObserveHealth)
                 {
                     Ok(nexus) => match nexus.observe_health(request) {
-                        Ok(reply) => AggregatorReply::RuntimeHealthObserved(reply),
-                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                        Ok(reply) => Response::RuntimeHealthObserved(reply),
+                        Err(rejection) => Response::OperationRejected(rejection),
                     },
-                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    Err(rejection) => Response::OperationRejected(rejection),
                 }
             }
-            AggregatorRequest::Collect(request) => self.handle_collect(request),
-            AggregatorRequest::InventorySessions(request) => {
+            Query::Collect(request) => self.handle_collect(request),
+            Query::InventorySessions(request) => {
                 match self.nexus_for_operation(
                     &request.request_identifier,
                     OperationKind::InventorySessions,
                 ) {
                     Ok(nexus) => match nexus.inventory_sessions(request) {
-                        Ok(reply) => AggregatorReply::SessionsInventoried(reply),
-                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                        Ok(reply) => Response::SessionsInventoried(reply),
+                        Err(rejection) => Response::OperationRejected(rejection),
                     },
-                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    Err(rejection) => Response::OperationRejected(rejection),
                 }
             }
-            AggregatorRequest::LookupSession(request) => {
+            Query::LookupSession(request) => {
                 match self
                     .nexus_for_operation(&request.request_identifier, OperationKind::LookupSession)
                 {
                     Ok(nexus) => match nexus.lookup_session(request) {
-                        Ok(reply) => AggregatorReply::SessionLookedUp(reply),
-                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                        Ok(reply) => Response::SessionLookedUp(reply),
+                        Err(rejection) => Response::OperationRejected(rejection),
                     },
-                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    Err(rejection) => Response::OperationRejected(rejection),
                 }
             }
-            AggregatorRequest::WriteSessionArchive(request) => {
+            Query::WriteSessionArchive(request) => {
                 match self.nexus_for_operation(
                     &request.request_identifier,
                     OperationKind::WriteSessionArchive,
                 ) {
                     Ok(nexus) => match nexus.write_session_archive(request) {
-                        Ok(reply) => AggregatorReply::SessionArchiveWritten(reply),
-                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                        Ok(reply) => Response::SessionArchiveWritten(reply),
+                        Err(rejection) => Response::OperationRejected(rejection),
                     },
-                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    Err(rejection) => Response::OperationRejected(rejection),
                 }
             }
-            AggregatorRequest::QuerySessionArchive(request) => {
+            Query::QuerySessionArchive(request) => {
                 match self.nexus_for_operation(
                     &request.request_identifier,
                     OperationKind::QuerySessionArchive,
                 ) {
                     Ok(nexus) => match nexus.query_session_archive(request) {
-                        Ok(reply) => AggregatorReply::SessionArchiveQueried(reply),
-                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                        Ok(reply) => Response::SessionArchiveQueried(reply),
+                        Err(rejection) => Response::OperationRejected(rejection),
                     },
-                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    Err(rejection) => Response::OperationRejected(rejection),
                 }
             }
-            AggregatorRequest::ReadSessionArchive(request) => {
+            Query::ReadSessionArchive(request) => {
                 match self.nexus_for_operation(
                     &request.request_identifier,
                     OperationKind::ReadSessionArchive,
                 ) {
                     Ok(nexus) => match nexus.read_session_archive(request) {
-                        Ok(reply) => AggregatorReply::SessionArchiveRead(reply),
-                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                        Ok(reply) => Response::SessionArchiveRead(reply),
+                        Err(rejection) => Response::OperationRejected(rejection),
                     },
-                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    Err(rejection) => Response::OperationRejected(rejection),
                 }
             }
-            AggregatorRequest::ListSessions(request) => {
+            Query::ListSessions(request) => {
                 match self
                     .nexus_for_operation(&request.request_identifier, OperationKind::ListSessions)
                 {
                     Ok(nexus) => match nexus.list_sessions(request) {
-                        Ok(reply) => AggregatorReply::SessionsListed(reply),
-                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                        Ok(reply) => Response::SessionsListed(reply),
+                        Err(rejection) => Response::OperationRejected(rejection),
                     },
-                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    Err(rejection) => Response::OperationRejected(rejection),
                 }
             }
-            AggregatorRequest::ListSubagents(request) => {
+            Query::ListSubagents(request) => {
                 match self
                     .nexus_for_operation(&request.request_identifier, OperationKind::ListSubagents)
                 {
                     Ok(nexus) => match nexus.list_subagents(request) {
-                        Ok(reply) => AggregatorReply::SubagentsListed(reply),
-                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                        Ok(reply) => Response::SubagentsListed(reply),
+                        Err(rejection) => Response::OperationRejected(rejection),
                     },
-                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    Err(rejection) => Response::OperationRejected(rejection),
                 }
             }
-            AggregatorRequest::ListOutputs(request) => {
+            Query::ListOutputs(request) => {
                 match self
                     .nexus_for_operation(&request.request_identifier, OperationKind::ListOutputs)
                 {
                     Ok(nexus) => match nexus.list_outputs(request) {
-                        Ok(reply) => AggregatorReply::OutputsListed(reply),
-                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                        Ok(reply) => Response::OutputsListed(reply),
+                        Err(rejection) => Response::OperationRejected(rejection),
                     },
-                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    Err(rejection) => Response::OperationRejected(rejection),
                 }
             }
-            AggregatorRequest::ListOutputSegments(request) => {
+            Query::ListOutputSegments(request) => {
                 match self.nexus_for_operation(
                     &request.request_identifier,
                     OperationKind::ListOutputSegments,
                 ) {
                     Ok(nexus) => match nexus.list_output_segments(request) {
-                        Ok(reply) => AggregatorReply::OutputSegmentsListed(reply),
-                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                        Ok(reply) => Response::OutputSegmentsListed(reply),
+                        Err(rejection) => Response::OperationRejected(rejection),
                     },
-                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    Err(rejection) => Response::OperationRejected(rejection),
                 }
             }
-            AggregatorRequest::EstimateOutput(request) => {
+            Query::EstimateOutput(request) => {
                 match self
                     .nexus_for_operation(&request.request_identifier, OperationKind::EstimateOutput)
                 {
                     Ok(nexus) => match nexus.estimate_output(request) {
-                        Ok(reply) => AggregatorReply::OutputEstimated(reply),
-                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                        Ok(reply) => Response::OutputEstimated(reply),
+                        Err(rejection) => Response::OperationRejected(rejection),
                     },
-                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    Err(rejection) => Response::OperationRejected(rejection),
                 }
             }
-            AggregatorRequest::ReadOutput(request) => {
+            Query::ReadOutput(request) => {
                 match self
                     .nexus_for_operation(&request.request_identifier, OperationKind::ReadOutput)
                 {
                     Ok(nexus) => match nexus.read_output(request) {
-                        Ok(reply) => AggregatorReply::OutputRead(reply),
-                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                        Ok(reply) => Response::OutputRead(reply),
+                        Err(rejection) => Response::OperationRejected(rejection),
                     },
-                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    Err(rejection) => Response::OperationRejected(rejection),
                 }
             }
-            AggregatorRequest::ListTranscriptBlocks(request) => {
+            Query::ListTranscriptBlocks(request) => {
                 match self.nexus_for_operation(
                     &request.request_identifier,
                     OperationKind::ListTranscriptBlocks,
                 ) {
                     Ok(nexus) => match nexus.list_transcript_blocks(request) {
-                        Ok(reply) => AggregatorReply::TranscriptBlocksListed(reply),
-                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                        Ok(reply) => Response::TranscriptBlocksListed(reply),
+                        Err(rejection) => Response::OperationRejected(rejection),
                     },
-                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    Err(rejection) => Response::OperationRejected(rejection),
                 }
             }
-            AggregatorRequest::SearchTranscriptBlocks(request) => {
+            Query::SearchTranscriptBlocks(request) => {
                 match self.nexus_for_operation(
                     &request.request_identifier,
                     OperationKind::SearchTranscriptBlocks,
                 ) {
                     Ok(nexus) => match nexus.search_transcript_blocks(request) {
-                        Ok(reply) => AggregatorReply::TranscriptBlocksSearched(reply),
-                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                        Ok(reply) => Response::TranscriptBlocksSearched(reply),
+                        Err(rejection) => Response::OperationRejected(rejection),
                     },
-                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    Err(rejection) => Response::OperationRejected(rejection),
                 }
             }
-            AggregatorRequest::EstimateTranscriptBlock(request) => {
+            Query::EstimateTranscriptBlock(request) => {
                 match self.nexus_for_operation(
                     &request.request_identifier,
                     OperationKind::EstimateTranscriptBlock,
                 ) {
                     Ok(nexus) => match nexus.estimate_transcript_block(request) {
-                        Ok(reply) => AggregatorReply::TranscriptBlockEstimated(reply),
-                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                        Ok(reply) => Response::TranscriptBlockEstimated(reply),
+                        Err(rejection) => Response::OperationRejected(rejection),
                     },
-                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    Err(rejection) => Response::OperationRejected(rejection),
                 }
             }
-            AggregatorRequest::ReadTranscriptBlock(request) => {
+            Query::ReadTranscriptBlock(request) => {
                 match self.nexus_for_operation(
                     &request.request_identifier,
                     OperationKind::ReadTranscriptBlock,
                 ) {
                     Ok(nexus) => match nexus.read_transcript_block(request) {
-                        Ok(reply) => AggregatorReply::TranscriptBlockRead(reply),
-                        Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                        Ok(reply) => Response::TranscriptBlockRead(reply),
+                        Err(rejection) => Response::OperationRejected(rejection),
                     },
-                    Err(rejection) => AggregatorReply::OperationRejected(rejection),
+                    Err(rejection) => Response::OperationRejected(rejection),
                 }
             }
         }
     }
 
-    pub fn handle_collect(&self, request: signal_aggregator::EvidenceRequest) -> AggregatorReply {
+    pub fn handle_collect(&self, request: signal_aggregator::EvidenceRequest) -> Response {
         if let Some(rejection) = self.signal.collect_rejection(&request) {
             return rejection;
         }
@@ -635,7 +499,7 @@ impl OrdinaryRequestHandler {
         match NexusPlane::with_runtime_configuration(runtime_configuration, self.clock.clone())
             .collect(request)
         {
-            Ok(package) => AggregatorReply::EvidenceCollected(package),
+            Ok(package) => Response::EvidenceCollected(package),
             Err(_) => self
                 .signal
                 .reject_collect(request_identifier, RejectionReason::CollectionUnavailable),
@@ -650,9 +514,9 @@ impl OrdinaryRequestHandler {
         let Some(runtime_configuration) = self.runtime_configuration() else {
             return Err(signal_aggregator::OperationRejected {
                 request_identifier: request_identifier.clone(),
-                operation,
-                reason: OperationRejectionReason::Unsupported,
-                reference: None,
+                operation_kind: operation,
+                operation_rejection_reason: OperationRejectionReason::Unsupported,
+                rejected_fragile_reference_option: None,
             });
         };
         Ok(NexusPlane::with_runtime_configuration(
@@ -684,21 +548,20 @@ impl MetaRequestHandler {
         Self { sema }
     }
 
-    pub fn handle(&self, request: MetaAggregatorRequest) -> MetaAggregatorReply {
+    pub fn handle(&self, query: MetaQuery) -> MetaResponse {
         let Ok(mut sema) = self.sema.lock() else {
-            return MetaAggregatorReply::ConfigurationRejected(
+            return MetaResponse::ConfigurationRejected(
                 meta_signal_aggregator::ConfigurationRejected {
-                    operation: MetaAggregatorOperationKind::ObserveConfiguration,
-                    reason: meta_signal_aggregator::ConfigurationRejectionReason::StoreUnavailable,
+                    operation_kind: MetaOperationKind::ObserveConfiguration,
+                    configuration_rejection_reason:
+                        meta_signal_aggregator::ConfigurationRejectionReason::StoreUnavailable,
                 },
             );
         };
-        match request {
-            MetaAggregatorRequest::Configure(change) => sema.configure(change),
-            MetaAggregatorRequest::ObserveConfiguration(_) => sema.observe_configuration(),
-            MetaAggregatorRequest::ValidateConfiguration(candidate) => {
-                sema.validate_candidate(candidate)
-            }
+        match query {
+            MetaQuery::Configure(change) => sema.configure(change),
+            MetaQuery::ObserveConfiguration(_) => sema.observe_configuration(),
+            MetaQuery::ValidateConfiguration(candidate) => sema.validate_candidate(candidate),
         }
     }
 }

@@ -1,19 +1,17 @@
 use std::path::{Path, PathBuf};
 
-use dotos::{DotosDecode, DotosEncode, DotosSource};
 use meta_signal_aggregator::{
     ActiveRepository, AggregatorConfiguration, ConfigurationValidationIssue,
     ConfigurationValidationIssueKind, ConfigurationValidationOutcome,
-    ConfigurationValidationReport, FilesystemPath, LegacyRecoveryRoot, LegacyRecoverySource,
-    OutputInterfaceConfiguration, OutputInterfaceLimitPolicy, RepositoryName, SocketMode,
-    TranscriptRoot, TranscriptSource, ValidationIssueDetail,
+    ConfigurationValidationReport, DefaultingPolicy, FilesystemPath, LegacyRecoveryRoot,
+    LegacyRecoverySource, OutputInterfaceConfiguration, OutputInterfaceLimitPolicy, RepositoryName,
+    SocketMode, TranscriptRoot, TranscriptSource,
 };
 use signal_aggregator::{
-    ByteLimit, LimitPolicy, Projection, RepositoryIdentifier, SegmentLimit, SelectedSources,
-    SourceKind, SourceSelection,
+    LimitPolicy, Projection, RepositoryIdentifier, SelectedSources, SourceKind, SourceSelection,
 };
 
-use crate::{Error, Result, adapter::TranscriptScanLimits};
+use crate::{Error, Result, adapter::TranscriptScanLimits, wire::DatomText};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigurationStore {
@@ -42,20 +40,7 @@ impl ConfigurationStore {
             .ok_or(Error::ConfigurationStorageNotImplemented)?;
         let text = std::fs::read_to_string(path)
             .map_err(|error| Error::io("reading configuration", error))?;
-        match DotosSource::new(&text).parse::<AggregatorConfiguration>() {
-            Ok(configuration) => Ok(configuration),
-            Err(current_error) => DotosSource::new(&text)
-                .parse::<LegacyAggregatorConfiguration>()
-                .map(LegacyAggregatorConfiguration::into_current)
-                .map_err(|legacy_error| {
-                    Error::dotos(
-                        "configuration decode",
-                        format!(
-                            "current shape failed: {current_error}; legacy 0.1 migration failed: {legacy_error}"
-                        ),
-                    )
-                }),
-        }
+        DatomText::read("configuration", &text)
     }
 
     pub fn write_configuration(&self, configuration: &AggregatorConfiguration) -> Result<()> {
@@ -68,7 +53,7 @@ impl ConfigurationStore {
                 .map_err(|error| Error::io("creating configuration directory", error))?;
         }
         let temporary_path = self.temporary_path(path);
-        std::fs::write(&temporary_path, configuration.to_dotos())
+        std::fs::write(&temporary_path, DatomText::print(configuration))
             .map_err(|error| Error::io("writing temporary configuration", error))?;
         std::fs::rename(&temporary_path, path)
             .map_err(|error| Error::io("committing configuration", error))
@@ -78,38 +63,8 @@ impl ConfigurationStore {
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("configuration.dotos");
+            .unwrap_or("configuration.datom");
         path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()))
-    }
-}
-
-#[derive(DotosEncode, DotosDecode, Debug, Clone, PartialEq, Eq)]
-pub struct LegacyAggregatorConfiguration {
-    pub ordinary_socket_path: FilesystemPath,
-    pub ordinary_socket_mode: SocketMode,
-    pub meta_socket_path: FilesystemPath,
-    pub meta_socket_mode: SocketMode,
-    pub store_path: FilesystemPath,
-    pub active_repositories: Vec<ActiveRepository>,
-    pub transcript_sources: Vec<TranscriptSource>,
-    pub default_projection: Projection,
-    pub default_limit_policy: LimitPolicy,
-}
-
-impl LegacyAggregatorConfiguration {
-    pub fn into_current(self) -> AggregatorConfiguration {
-        AggregatorConfiguration {
-            ordinary_socket_path: self.ordinary_socket_path,
-            ordinary_socket_mode: self.ordinary_socket_mode,
-            meta_socket_path: self.meta_socket_path,
-            meta_socket_mode: self.meta_socket_mode,
-            store_path: self.store_path,
-            active_repositories: self.active_repositories,
-            transcript_sources: self.transcript_sources,
-            default_projection: self.default_projection,
-            default_limit_policy: self.default_limit_policy,
-            output_interfaces: OutputInterfaceConfiguration::default(),
-        }
     }
 }
 
@@ -119,29 +74,29 @@ pub struct ConfigurationFixture;
 impl ConfigurationFixture {
     pub fn minimal() -> AggregatorConfiguration {
         AggregatorConfiguration {
-            ordinary_socket_path: FilesystemPath::new("/run/aggregator/aggregator.sock"),
-            ordinary_socket_mode: SocketMode::new(0o660),
-            meta_socket_path: FilesystemPath::new("/run/aggregator/aggregator-meta.sock"),
-            meta_socket_mode: SocketMode::new(0o600),
-            store_path: FilesystemPath::new("/var/lib/aggregator/aggregator.sema"),
+            ordinary_socket_path: String::from("/run/aggregator/aggregator.sock"),
+            ordinary_socket_mode: 0o660,
+            meta_socket_path: String::from("/run/aggregator/aggregator-meta.sock"),
+            meta_socket_mode: 0o600,
+            store_path: String::from("/var/lib/aggregator/aggregator.sema"),
             active_repositories: vec![ActiveRepository {
-                name: RepositoryName::new("example-repository"),
-                path: FilesystemPath::new("/srv/aggregator/repositories/example"),
+                repository_name: String::from("example-repository"),
+                filesystem_path: String::from("/srv/aggregator/repositories/example"),
             }],
             transcript_sources: vec![TranscriptSource::Claude(TranscriptRoot {
-                path: FilesystemPath::new("/srv/aggregator/transcripts/claude"),
+                filesystem_path: String::from("/srv/aggregator/transcripts/claude"),
             })],
             default_projection: Projection::MetadataOnly,
             default_limit_policy: LimitPolicy {
-                maximum_segments: SegmentLimit::new(32),
-                maximum_bytes: ByteLimit::new(4096),
+                maximum_segments: 32,
+                maximum_bytes: 4096,
             },
-            output_interfaces: OutputInterfaceConfiguration::default(),
+            output_interface_configuration: OutputInterfaceConfiguration::default_policy(),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeConfigurationValidation {
     Accepted(RuntimeConfiguration),
     Rejected(ConfigurationValidationReport),
@@ -163,7 +118,7 @@ impl RuntimeConfigurationValidation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfiguration {
     store_path: PathBuf,
     transcript_sources: Vec<TranscriptAdapterConfiguration>,
@@ -216,7 +171,7 @@ impl RuntimeConfiguration {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeOutputInterfaceConfiguration {
     limits: OutputInterfaceLimitPolicy,
     legacy_recovery_roots: Vec<RuntimeLegacyRecoveryRoot>,
@@ -343,7 +298,7 @@ impl RepositoryAdapterConfiguration {
     }
 
     pub fn identifier(&self) -> RepositoryIdentifier {
-        RepositoryIdentifier::new(self.name.as_str().to_string())
+        self.name.as_str().to_string()
     }
 
     pub fn path(&self) -> &Path {
@@ -366,7 +321,7 @@ impl RuntimeSourceSelection {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeSourceSelector<'a> {
     configuration: &'a RuntimeConfiguration,
 }
@@ -382,7 +337,9 @@ impl<'a> RuntimeSourceSelector<'a> {
                 transcript_sources: self.configuration.transcript_sources.clone(),
                 repositories: self.configuration.repositories.clone(),
             },
-            SourceSelection::Only(SelectedSources { sources }) => self.select_only(sources),
+            SourceSelection::Only(SelectedSources { source_kinds }) => {
+                self.select_only(source_kinds)
+            }
         }
     }
 
@@ -404,7 +361,7 @@ impl<'a> RuntimeSourceSelector<'a> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfigurationValidator<'a> {
     configuration: &'a AggregatorConfiguration,
     issues: Vec<ConfigurationValidationIssue>,
@@ -420,7 +377,12 @@ impl<'a> RuntimeConfigurationValidator<'a> {
 
     pub fn validate(mut self) -> RuntimeConfigurationValidation {
         self.validate_socket_modes();
-        self.validate_output_interface_limits(&self.configuration.output_interfaces.limits);
+        self.validate_output_interface_limits(
+            &self
+                .configuration
+                .output_interface_configuration
+                .output_interface_limit_policy,
+        );
         self.validate_fragile_index_storage_parent();
         let transcript_sources = self.transcript_sources();
         let repositories = self.repositories();
@@ -438,13 +400,16 @@ impl<'a> RuntimeConfigurationValidator<'a> {
                 default_projection: self.configuration.default_projection.clone(),
                 default_limit_policy: self.configuration.default_limit_policy.clone(),
                 output_interfaces: RuntimeOutputInterfaceConfiguration::new(
-                    self.configuration.output_interfaces.limits.clone(),
+                    self.configuration
+                        .output_interface_configuration
+                        .output_interface_limit_policy
+                        .clone(),
                     legacy_recovery_roots,
                 ),
             })
         } else {
             RuntimeConfigurationValidation::Rejected(ConfigurationValidationReport {
-                issues: self.issues,
+                configuration_validation_issues: self.issues,
             })
         }
     }
@@ -460,7 +425,7 @@ impl<'a> RuntimeConfigurationValidator<'a> {
                 self.configuration.meta_socket_mode,
             ),
         ] {
-            if mode.into_u32() > 0o777 {
+            if mode > 0o777 {
                 self.issues
                     .push(ConfigurationIssue::invalid_socket_mode(path.clone(), mode));
             }
@@ -471,52 +436,52 @@ impl<'a> RuntimeConfigurationValidator<'a> {
         // The contract defaults are the runtime's absolute practical ceilings. Configuration may
         // tighten a workload, but it cannot turn an input-controlled limit into an unbounded
         // allocation, scan, or reply.
-        let ceiling = OutputInterfaceLimitPolicy::default();
+        let ceiling = OutputInterfaceLimitPolicy::default_policy();
         for (name, value, maximum) in [
             (
                 "maximum_page_items",
-                limits.maximum_page_items.into_u64(),
-                ceiling.maximum_page_items.into_u64(),
+                limits.maximum_page_items,
+                ceiling.maximum_page_items,
             ),
             (
                 "maximum_preview_bytes",
-                limits.maximum_preview_bytes.into_u64(),
-                ceiling.maximum_preview_bytes.into_u64(),
+                limits.maximum_preview_bytes,
+                ceiling.maximum_preview_bytes,
             ),
             (
                 "maximum_read_bytes",
-                limits.maximum_read_bytes.into_u64(),
-                ceiling.maximum_read_bytes.into_u64(),
+                limits.maximum_read_bytes,
+                ceiling.maximum_read_bytes,
             ),
             (
                 "maximum_recovery_files_per_root",
-                limits.maximum_recovery_files_per_root.into_u64(),
-                ceiling.maximum_recovery_files_per_root.into_u64(),
+                limits.maximum_recovery_files_per_root,
+                ceiling.maximum_recovery_files_per_root,
             ),
             (
                 "maximum_transcript_scan_entries",
-                limits.maximum_transcript_scan_entries.into_u64(),
-                ceiling.maximum_transcript_scan_entries.into_u64(),
+                limits.maximum_transcript_scan_entries,
+                ceiling.maximum_transcript_scan_entries,
             ),
             (
                 "maximum_transcript_discovered_files",
-                limits.maximum_transcript_discovered_files.into_u64(),
-                ceiling.maximum_transcript_discovered_files.into_u64(),
+                limits.maximum_transcript_discovered_files,
+                ceiling.maximum_transcript_discovered_files,
             ),
             (
                 "maximum_transcript_file_bytes",
-                limits.maximum_transcript_file_bytes.into_u64(),
-                ceiling.maximum_transcript_file_bytes.into_u64(),
+                limits.maximum_transcript_file_bytes,
+                ceiling.maximum_transcript_file_bytes,
             ),
             (
                 "maximum_transcript_line_bytes",
-                limits.maximum_transcript_line_bytes.into_u64(),
-                ceiling.maximum_transcript_line_bytes.into_u64(),
+                limits.maximum_transcript_line_bytes,
+                ceiling.maximum_transcript_line_bytes,
             ),
             (
                 "maximum_transcript_read_failures",
-                limits.maximum_transcript_read_failures.into_u64(),
-                ceiling.maximum_transcript_read_failures.into_u64(),
+                limits.maximum_transcript_read_failures,
+                ceiling.maximum_transcript_read_failures,
             ),
         ] {
             if value == 0 || value > maximum {
@@ -608,16 +573,21 @@ impl<'a> RuntimeConfigurationValidator<'a> {
         &mut self,
         root: &TranscriptRoot,
     ) -> Option<TranscriptRootConfiguration> {
-        let path = PathBuf::from(root.path.as_str());
+        let path = PathBuf::from(root.filesystem_path.as_str());
         if path.is_dir() {
-            Some(TranscriptRootConfiguration::new(path).with_scan_limits(
-                TranscriptScanLimits::from_output_interface_limits(
-                    &self.configuration.output_interfaces.limits,
+            Some(
+                TranscriptRootConfiguration::new(path).with_scan_limits(
+                    TranscriptScanLimits::from_output_interface_limits(
+                        &self
+                            .configuration
+                            .output_interface_configuration
+                            .output_interface_limit_policy,
+                    ),
                 ),
-            ))
+            )
         } else {
             self.issues.push(ConfigurationIssue::unreadable_path(
-                root.path.clone(),
+                root.filesystem_path.clone(),
                 "transcript root must exist and be a directory",
             ));
             None
@@ -636,15 +606,15 @@ impl<'a> RuntimeConfigurationValidator<'a> {
         &mut self,
         repository: &ActiveRepository,
     ) -> Option<RepositoryAdapterConfiguration> {
-        let path = PathBuf::from(repository.path.as_str());
+        let path = PathBuf::from(repository.filesystem_path.as_str());
         if path.is_dir() {
             Some(RepositoryAdapterConfiguration::new(
-                repository.name.clone(),
+                repository.repository_name.clone(),
                 path,
             ))
         } else {
             self.issues.push(ConfigurationIssue::unreadable_path(
-                repository.path.clone(),
+                repository.filesystem_path.clone(),
                 "repository root must exist and be a directory",
             ));
             None
@@ -653,7 +623,7 @@ impl<'a> RuntimeConfigurationValidator<'a> {
 
     pub fn legacy_recovery_roots(&mut self) -> Vec<RuntimeLegacyRecoveryRoot> {
         self.configuration
-            .output_interfaces
+            .output_interface_configuration
             .legacy_recovery_sources
             .iter()
             .filter_map(|source| self.legacy_recovery_source(source))
@@ -679,13 +649,13 @@ impl<'a> RuntimeConfigurationValidator<'a> {
         root: &LegacyRecoveryRoot,
         kind: LegacyRecoveryKind,
     ) -> Option<RuntimeLegacyRecoveryRoot> {
-        let path = PathBuf::from(root.path.as_str());
+        let path = PathBuf::from(root.filesystem_path.as_str());
         if path.is_dir() {
             Some(RuntimeLegacyRecoveryRoot::new(kind, path))
         } else {
             self.issues
                 .push(ConfigurationIssue::invalid_legacy_recovery_root(
-                    root.path.clone(),
+                    root.filesystem_path.clone(),
                     "legacy recovery root must exist and be a directory",
                 ));
             None
@@ -762,9 +732,10 @@ pub struct ConfigurationIssue;
 impl ConfigurationIssue {
     pub fn missing_transcript_source() -> ConfigurationValidationIssue {
         ConfigurationValidationIssue {
-            path: None,
-            kind: ConfigurationValidationIssueKind::MissingTranscriptSource,
-            detail: Some(ValidationIssueDetail::new(
+            filesystem_path_option: None,
+            configuration_validation_issue_kind:
+                ConfigurationValidationIssueKind::MissingTranscriptSource,
+            validation_issue_detail_option: Some(String::from(
                 "no readable transcript source configured",
             )),
         }
@@ -772,9 +743,10 @@ impl ConfigurationIssue {
 
     pub fn missing_repository() -> ConfigurationValidationIssue {
         ConfigurationValidationIssue {
-            path: None,
-            kind: ConfigurationValidationIssueKind::MissingRepository,
-            detail: Some(ValidationIssueDetail::new(
+            filesystem_path_option: None,
+            configuration_validation_issue_kind:
+                ConfigurationValidationIssueKind::MissingRepository,
+            validation_issue_detail_option: Some(String::from(
                 "no readable active repository configured",
             )),
         }
@@ -785,9 +757,9 @@ impl ConfigurationIssue {
         detail: impl Into<String>,
     ) -> ConfigurationValidationIssue {
         ConfigurationValidationIssue {
-            path: Some(path),
-            kind: ConfigurationValidationIssueKind::UnreadablePath,
-            detail: Some(ValidationIssueDetail::new(detail.into())),
+            filesystem_path_option: Some(path),
+            configuration_validation_issue_kind: ConfigurationValidationIssueKind::UnreadablePath,
+            validation_issue_detail_option: Some(detail.into()),
         }
     }
 
@@ -796,22 +768,22 @@ impl ConfigurationIssue {
         mode: SocketMode,
     ) -> ConfigurationValidationIssue {
         ConfigurationValidationIssue {
-            path: Some(path),
-            kind: ConfigurationValidationIssueKind::InvalidSocketMode,
-            detail: Some(ValidationIssueDetail::new(format!(
+            filesystem_path_option: Some(path),
+            configuration_validation_issue_kind:
+                ConfigurationValidationIssueKind::InvalidSocketMode,
+            validation_issue_detail_option: Some(format!(
                 "socket mode {:#o} is outside permission bits",
-                mode.into_u32()
-            ))),
+                mode
+            )),
         }
     }
 
     pub fn invalid_output_interface_limit(name: &'static str) -> ConfigurationValidationIssue {
         ConfigurationValidationIssue {
-            path: None,
-            kind: ConfigurationValidationIssueKind::InvalidOutputInterfaceLimit,
-            detail: Some(ValidationIssueDetail::new(format!(
-                "{name} must be greater than zero"
-            ))),
+            filesystem_path_option: None,
+            configuration_validation_issue_kind:
+                ConfigurationValidationIssueKind::InvalidOutputInterfaceLimit,
+            validation_issue_detail_option: Some(format!("{name} must be greater than zero")),
         }
     }
 
@@ -820,9 +792,10 @@ impl ConfigurationIssue {
         detail: impl Into<String>,
     ) -> ConfigurationValidationIssue {
         ConfigurationValidationIssue {
-            path: Some(path),
-            kind: ConfigurationValidationIssueKind::InvalidLegacyRecoveryRoot,
-            detail: Some(ValidationIssueDetail::new(detail.into())),
+            filesystem_path_option: Some(path),
+            configuration_validation_issue_kind:
+                ConfigurationValidationIssueKind::InvalidLegacyRecoveryRoot,
+            validation_issue_detail_option: Some(detail.into()),
         }
     }
 
@@ -831,9 +804,10 @@ impl ConfigurationIssue {
         detail: impl Into<String>,
     ) -> ConfigurationValidationIssue {
         ConfigurationValidationIssue {
-            path: Some(path),
-            kind: ConfigurationValidationIssueKind::InvalidFragileIndexConfiguration,
-            detail: Some(ValidationIssueDetail::new(detail.into())),
+            filesystem_path_option: Some(path),
+            configuration_validation_issue_kind:
+                ConfigurationValidationIssueKind::InvalidFragileIndexConfiguration,
+            validation_issue_detail_option: Some(detail.into()),
         }
     }
 
@@ -842,9 +816,10 @@ impl ConfigurationIssue {
         detail: impl Into<String>,
     ) -> ConfigurationValidationIssue {
         ConfigurationValidationIssue {
-            path: Some(path),
-            kind: ConfigurationValidationIssueKind::UnwritableFragileIndexStorage,
-            detail: Some(ValidationIssueDetail::new(detail.into())),
+            filesystem_path_option: Some(path),
+            configuration_validation_issue_kind:
+                ConfigurationValidationIssueKind::UnwritableFragileIndexStorage,
+            validation_issue_detail_option: Some(detail.into()),
         }
     }
 }

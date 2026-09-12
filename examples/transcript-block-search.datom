@@ -1,0 +1,1 @@
+SearchTranscriptBlocks.{ req-block-search-quota-near-reset { Only.{ [ Claude Codex ] } Some.fragile-session-from-sessions None None OnlyTranscriptBlockKinds.{ [ AgentResponse ToolResult ] } AnyAuthoredStatus Some.Since.2026-07-05T12:00:00Z } { [ Near.{ Word.quota Word.reset 6 } Contains.Phrase.{ [ rate limit ] } AllOf.[ 0 1 ] ] 2 } { 10 None NewestFirst } BoundedPreview.{ 160 } }

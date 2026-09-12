@@ -21,31 +21,32 @@ use self::{
     store::IndexStore,
 };
 use dotos_text_query::{Query, QueryTerm, SearchText};
+
+use crate::text_query::{ContractQueryProjection, EngineEvidenceProjection};
 use signal_aggregator::{
-    AuthoredStatus, AuthoredStatusFilter, ByteCount, ByteLimit, ByteRange, CardProjection,
-    DurationUnit, FilesystemPath, FragileOutputReference, FragileOutputSegmentReference,
-    FragileSessionReference, FragileSubagentReference, FragileTranscriptBlockReference,
-    IndexHealth, ItemCount, LineCount, LineNumber, LineRange, ListingOrder, OperationKind,
-    OperationRejected, OperationRejectionReason, OutputCard, OutputEstimateRequest,
-    OutputEstimated, OutputListFilter, OutputListRequest, OutputProvenance, OutputRead,
-    OutputReadRange, OutputReadRequest, OutputSegmentCard, OutputSegmentListFilter,
-    OutputSegmentListRequest, OutputSegmentsListed, OutputText, OutputTextExcerpt, OutputsListed,
-    PageLimit, PageMetadata, PageRequest, RejectedFragileReference, RequestIdentifier,
-    RootRelativePath, RuntimeCapabilities, RuntimeCapabilityStatus, RuntimeHealthObserved,
-    RuntimeHealthRequest, SegmentIndex, SessionArchiveStatus, SessionCard, SessionIdentifier,
-    SessionInventoryCard, SessionInventoryCompleteness, SessionInventoryRequest,
-    SessionInventoryScanReport, SessionInventorySourceReport, SessionLifecycleStatus,
-    SessionListFilter, SessionListRequest, SessionLookedUp, SessionLookupRequest,
-    SessionLookupSelector, SessionRole, SessionsInventoried, SessionsListed, SizeCertainty,
-    SizeMetadata, SourceHealthCard, SourceHealthStatus, SourceKind, SourceLocator, SourceSelection,
-    SubagentCard, SubagentListFilter, SubagentListRequest, SubagentTaskMetadata, SubagentsListed,
-    TaskIdentifier, TimeWindow, Timestamp, TranscriptBlockCard, TranscriptBlockEstimateRequest,
-    TranscriptBlockEstimated, TranscriptBlockFilter, TranscriptBlockKind,
-    TranscriptBlockKindSelection, TranscriptBlockListRequest, TranscriptBlockProvenance,
-    TranscriptBlockRead, TranscriptBlockReadRequest, TranscriptBlockSearchEvidence,
-    TranscriptBlockSearchMatch, TranscriptBlockSearchRequest, TranscriptBlockTextAvailability,
-    TranscriptBlockTextQuery, TranscriptBlocksListed, TranscriptBlocksSearched, TranscriptText,
-    TranscriptTextExcerpt, Truncation, TruncationReason,
+    AuthoredStatus, AuthoredStatusFilter, ByteLimit, ByteRange, CardProjection, DurationUnit,
+    FragileOutputReference, FragileOutputSegmentReference, FragileSessionReference,
+    FragileSubagentReference, FragileTranscriptBlockReference, IndexHealth, LineRange,
+    ListingOrder, OperationKind, OperationRejected, OperationRejectionReason, OutputCard,
+    OutputEstimateRequest, OutputEstimated, OutputListFilter, OutputListRequest, OutputProvenance,
+    OutputRead, OutputReadRange, OutputReadRequest, OutputSegmentCard, OutputSegmentListFilter,
+    OutputSegmentListRequest, OutputSegmentsListed, OutputTextExcerpt, OutputsListed, PageLimit,
+    PageMetadata, PageRequest, RejectedFragileReference, RequestIdentifier, RuntimeCapabilities,
+    RuntimeCapabilityStatus, RuntimeHealthObserved, RuntimeHealthRequest, SegmentIndex,
+    SessionArchiveStatus, SessionCard, SessionIdentifier, SessionInventoryCard,
+    SessionInventoryCompleteness, SessionInventoryRequest, SessionInventoryScanReport,
+    SessionInventorySourceReport, SessionLifecycleStatus, SessionListFilter, SessionListRequest,
+    SessionLookedUp, SessionLookupRequest, SessionLookupSelector, SessionRole, SessionsInventoried,
+    SessionsListed, SizeCertainty, SizeMetadata, SourceHealthCard, SourceHealthStatus, SourceKind,
+    SourceLocator, SourceSelection, SubagentCard, SubagentListFilter, SubagentListRequest,
+    SubagentTaskMetadata, SubagentsListed, TaskIdentifier, TimeWindow, Timestamp,
+    TranscriptBlockCard, TranscriptBlockEstimateRequest, TranscriptBlockEstimated,
+    TranscriptBlockFilter, TranscriptBlockKind, TranscriptBlockKindSelection,
+    TranscriptBlockListRequest, TranscriptBlockProvenance, TranscriptBlockRead,
+    TranscriptBlockReadRequest, TranscriptBlockSearchEvidence, TranscriptBlockSearchMatch,
+    TranscriptBlockSearchRequest, TranscriptBlockTextAvailability, TranscriptBlockTextQuery,
+    TranscriptBlocksListed, TranscriptBlocksSearched, TranscriptTextExcerpt, Truncation,
+    TruncationReason,
 };
 
 use crate::{
@@ -60,7 +61,7 @@ use crate::{
 
 pub type OutputOperationResult<T> = std::result::Result<T, OperationRejected>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OutputInterfaceRuntime {
     configuration: RuntimeConfiguration,
     clock: CollectionClock,
@@ -103,19 +104,19 @@ impl OutputInterfaceRuntime {
         );
         RuntimeHealthObserved {
             request_identifier: request.request_identifier,
-            capabilities: RuntimeCapabilities {
-                health_observation: RuntimeCapabilityStatus::Supported,
-                transcript_only_configuration: RuntimeCapabilityStatus::Supported,
-                claude_subagent_output_sources: RuntimeCapabilityStatus::Supported,
-                pi_subagent_output_sources: RuntimeCapabilityStatus::Supported,
+            runtime_capabilities: RuntimeCapabilities {
+                health_observation_capability: RuntimeCapabilityStatus::Supported,
+                transcript_only_configuration_capability: RuntimeCapabilityStatus::Supported,
+                claude_subagent_output_sources_capability: RuntimeCapabilityStatus::Supported,
+                pi_subagent_output_sources_capability: RuntimeCapabilityStatus::Supported,
             },
-            sources,
-            index: IndexHealth {
-                status: index_status,
-                session_count: ItemCount::new(counts.0),
-                subagent_count: ItemCount::new(counts.1),
-                output_count: ItemCount::new(counts.2),
-                transcript_block_count: ItemCount::new(counts.3),
+            source_health_cards: sources,
+            index_health: IndexHealth {
+                source_health_status: index_status,
+                session_count: crate::MeasuredCount::contract_count(counts.0),
+                index_subagent_count: crate::MeasuredCount::contract_count(counts.1),
+                index_output_count: crate::MeasuredCount::contract_count(counts.2),
+                transcript_block_count: crate::MeasuredCount::contract_count(counts.3),
             },
         }
     }
@@ -128,7 +129,7 @@ impl OutputInterfaceRuntime {
             &request.request_identifier,
             OperationKind::InventorySessions,
         )?;
-        let archive_references = self.archive_references(request.archive_path.as_ref());
+        let archive_references = self.archive_references(request.archive_path_option.as_ref());
         let inventory = SessionInventoryBuilder::new(
             self.configuration.clone(),
             refreshed.index,
@@ -143,7 +144,8 @@ impl OutputInterfaceRuntime {
                 .output_interfaces()
                 .limits()
                 .maximum_page_items
-                .into_u64()
+                .try_into()
+                .unwrap()
         {
             return Err(OperationRejectedFactory::new(
                 request.request_identifier,
@@ -153,8 +155,8 @@ impl OutputInterfaceRuntime {
         }
         Ok(SessionsInventoried {
             request_identifier: request.request_identifier,
-            sessions: inventory.sessions,
-            scan_report: inventory.scan_report,
+            session_inventory_cards: inventory.sessions,
+            session_inventory_scan_report: inventory.scan_report,
         })
     }
 
@@ -164,7 +166,7 @@ impl OutputInterfaceRuntime {
     ) -> OutputOperationResult<SessionLookedUp> {
         let refreshed = self
             .refreshed_index_with_scan(&request.request_identifier, OperationKind::LookupSession)?;
-        let archive_references = self.archive_references(request.archive_path.as_ref());
+        let archive_references = self.archive_references(request.archive_path_option.as_ref());
         let inventory = SessionInventoryBuilder::new(
             self.configuration.clone(),
             refreshed.index,
@@ -176,7 +178,9 @@ impl OutputInterfaceRuntime {
         let sessions = inventory
             .sessions
             .into_iter()
-            .filter(|session| SessionLookupMatcher::new(&request.selector).accepts(session))
+            .filter(|session| {
+                SessionLookupMatcher::new(&request.session_lookup_selector).accepts(session)
+            })
             .collect::<Vec<_>>();
         if sessions.len() as u64
             > self
@@ -184,7 +188,8 @@ impl OutputInterfaceRuntime {
                 .output_interfaces()
                 .limits()
                 .maximum_page_items
-                .into_u64()
+                .try_into()
+                .unwrap()
         {
             return Err(OperationRejectedFactory::new(
                 request.request_identifier,
@@ -194,8 +199,8 @@ impl OutputInterfaceRuntime {
         }
         Ok(SessionLookedUp {
             request_identifier: request.request_identifier,
-            sessions,
-            scan_report: inventory.scan_report,
+            session_inventory_cards: sessions,
+            session_inventory_scan_report: inventory.scan_report,
         })
     }
 
@@ -207,9 +212,9 @@ impl OutputInterfaceRuntime {
             return BTreeSet::new();
         };
         let request = signal_aggregator::SessionArchiveQueryRequest {
-            request_identifier: RequestIdentifier::new("archive-status-probe"),
+            request_identifier: String::from("archive-status-probe"),
             archive_path: archive_path.clone(),
-            session_reference: None,
+            fragile_session_reference_option: None,
         };
         match crate::SessionArchiveStore::new(
             self.configuration.archive_root_path(),
@@ -218,9 +223,9 @@ impl OutputInterfaceRuntime {
         .query(request)
         {
             Ok(reply) => reply
-                .records
+                .session_archive_record_cards
                 .into_iter()
-                .map(|record| record.session_reference.as_str().to_string())
+                .map(|record| record.fragile_session_reference.as_str().to_string())
                 .collect(),
             Err(_) => BTreeSet::new(),
         }
@@ -240,35 +245,39 @@ impl OutputInterfaceRuntime {
                 .limits()
                 .maximum_page_items,
         );
-        validator.validate(&request.page)?;
+        validator.validate(&request.page_request)?;
         let lowered_time_window = self.lower_optional_time_window(
-            request.filter.time_window.as_ref(),
+            request.session_list_filter.time_window_option.as_ref(),
             &request.request_identifier,
             OperationKind::ListSessions,
         )?;
         let mut sessions = index
             .session_records()
             .filter(|session| {
-                SourceSelectionFilter::new(&request.filter.source_selection).accepts(session.source)
+                SourceSelectionFilter::new(&request.session_list_filter.source_selection)
+                    .accepts(session.source.clone())
             })
             .filter(|session| {
                 OptionalTimeWindowFilter::new(lowered_time_window.as_ref())
                     .accepts(session.chronology_timestamp())
             })
             .collect::<Vec<_>>();
-        IndexedSessionSorter::new(request.page.order).sort(&mut sessions);
+        IndexedSessionSorter::new(request.page_request.listing_order.clone()).sort(&mut sessions);
         let page = PaginationWindow::new(
             request.request_identifier.clone(),
             OperationKind::ListSessions,
             PageCollectionKind::Sessions,
-            request.page.clone(),
-            PaginationQueryShape::sessions(&request.filter, lowered_time_window.as_ref()),
+            request.page_request.clone(),
+            PaginationQueryShape::sessions(
+                &request.session_list_filter,
+                lowered_time_window.as_ref(),
+            ),
         )
         .select(&sessions)?;
         Ok(SessionsListed {
             request_identifier: request.request_identifier,
-            sessions: page.items.iter().map(IndexedSession::card).collect(),
-            page: page.metadata,
+            session_cards: page.items.iter().map(IndexedSession::card).collect(),
+            page_metadata: page.metadata,
         })
     }
 
@@ -286,37 +295,43 @@ impl OutputInterfaceRuntime {
                 .limits()
                 .maximum_page_items,
         );
-        validator.validate(&request.page)?;
+        validator.validate(&request.page_request)?;
         ReferenceResolver::new(&index).resolve_session(
-            &request.filter.session_reference,
+            &request.subagent_list_filter.fragile_session_reference,
             &request.request_identifier,
             OperationKind::ListSubagents,
         )?;
         let mut subagents = index
             .subagent_records()
-            .filter(|subagent| subagent.session_reference == request.filter.session_reference)
             .filter(|subagent| {
-                AuthoredStatusFilterMatcher::new(&request.filter.authored_status)
-                    .accepts(subagent.authored_status)
+                subagent.session_reference == request.subagent_list_filter.fragile_session_reference
             })
             .filter(|subagent| {
-                TaskIdentifierFilter::new(request.filter.task_identifier.as_ref())
-                    .accepts(subagent.task.as_ref())
+                AuthoredStatusFilterMatcher::new(
+                    &request.subagent_list_filter.authored_status_filter,
+                )
+                .accepts(subagent.authored_status.clone())
+            })
+            .filter(|subagent| {
+                TaskIdentifierFilter::new(
+                    request.subagent_list_filter.task_identifier_option.as_ref(),
+                )
+                .accepts(subagent.task.as_ref())
             })
             .collect::<Vec<_>>();
-        IndexedSubagentSorter::new(request.page.order).sort(&mut subagents);
+        IndexedSubagentSorter::new(request.page_request.listing_order.clone()).sort(&mut subagents);
         let page = PaginationWindow::new(
             request.request_identifier.clone(),
             OperationKind::ListSubagents,
             PageCollectionKind::Subagents,
-            request.page.clone(),
-            PaginationQueryShape::subagents(&request.filter),
+            request.page_request.clone(),
+            PaginationQueryShape::subagents(&request.subagent_list_filter),
         )
         .select(&subagents)?;
         Ok(SubagentsListed {
             request_identifier: request.request_identifier,
-            subagents: page.items.iter().map(IndexedSubagent::card).collect(),
-            page: page.metadata,
+            subagent_cards: page.items.iter().map(IndexedSubagent::card).collect(),
+            page_metadata: page.metadata,
         })
     }
 
@@ -331,7 +346,7 @@ impl OutputInterfaceRuntime {
                 .limits()
                 .maximum_page_items,
         );
-        validator.validate(&request.page)?;
+        validator.validate(&request.page_request)?;
         ProjectionRequestValidator::new(
             request.request_identifier.clone(),
             OperationKind::ListOutputs,
@@ -340,15 +355,15 @@ impl OutputInterfaceRuntime {
                 .limits()
                 .maximum_preview_bytes,
         )
-        .validate(&request.projection)?;
-        if let Some(reference) = &request.filter.session_reference {
+        .validate(&request.card_projection)?;
+        if let Some(reference) = &request.output_list_filter.fragile_session_reference_option {
             ReferenceResolver::new(&index).resolve_session(
                 reference,
                 &request.request_identifier,
                 OperationKind::ListOutputs,
             )?;
         }
-        if let Some(reference) = &request.filter.subagent_reference {
+        if let Some(reference) = &request.output_list_filter.fragile_subagent_reference_option {
             ReferenceResolver::new(&index).resolve_subagent(
                 reference,
                 &request.request_identifier,
@@ -356,60 +371,65 @@ impl OutputInterfaceRuntime {
             )?;
         }
         let lowered_time_window = self.lower_optional_time_window(
-            request.filter.time_window.as_ref(),
+            request.output_list_filter.time_window_option.as_ref(),
             &request.request_identifier,
             OperationKind::ListOutputs,
         )?;
         let mut outputs = index
             .output_records()
             .filter(|output| {
-                SourceSelectionFilter::new(&request.filter.source_selection)
-                    .accepts(output.provenance.source)
+                SourceSelectionFilter::new(&request.output_list_filter.source_selection)
+                    .accepts(output.provenance.source_kind.clone())
             })
             .filter(|output| {
                 request
-                    .filter
-                    .session_reference
+                    .output_list_filter
+                    .fragile_session_reference_option
                     .as_ref()
                     .is_none_or(|reference| output.session_reference == *reference)
             })
             .filter(|output| {
                 request
-                    .filter
-                    .subagent_reference
+                    .output_list_filter
+                    .fragile_subagent_reference_option
                     .as_ref()
                     .is_none_or(|reference| output.subagent_reference.as_ref() == Some(reference))
             })
             .filter(|output| {
-                AuthoredStatusFilterMatcher::new(&request.filter.authored_status)
-                    .accepts(output.provenance.authored_status)
+                AuthoredStatusFilterMatcher::new(&request.output_list_filter.authored_status_filter)
+                    .accepts(output.provenance.authored_status.clone())
             })
             .filter(|output| {
-                TaskIdentifierFilter::new(request.filter.task_identifier.as_ref())
-                    .accepts(output.task.as_ref())
+                TaskIdentifierFilter::new(
+                    request.output_list_filter.task_identifier_option.as_ref(),
+                )
+                .accepts(output.task.as_ref())
             })
             .filter(|output| {
                 OptionalTimeWindowFilter::new(lowered_time_window.as_ref())
                     .accepts(output.provenance.produced_at.as_ref())
             })
             .collect::<Vec<_>>();
-        IndexedOutputSorter::new(request.page.order).sort(&mut outputs);
+        IndexedOutputSorter::new(request.page_request.listing_order.clone()).sort(&mut outputs);
         let page = PaginationWindow::new(
             request.request_identifier.clone(),
             OperationKind::ListOutputs,
             PageCollectionKind::Outputs,
-            request.page.clone(),
-            PaginationQueryShape::outputs(&request.filter, lowered_time_window.as_ref()),
+            request.page_request.clone(),
+            PaginationQueryShape::outputs(
+                &request.output_list_filter,
+                lowered_time_window.as_ref(),
+            ),
         )
         .select(&outputs)?;
         Ok(OutputsListed {
             request_identifier: request.request_identifier,
-            outputs: page
+            output_cards: page
                 .items
                 .iter()
-                .map(|output| output.card(&request.projection))
+                .map(|output| output.card(&request.card_projection))
                 .collect(),
-            page: page.metadata,
+            page_metadata: page.metadata,
         })
     }
 
@@ -429,7 +449,7 @@ impl OutputInterfaceRuntime {
                 .limits()
                 .maximum_page_items,
         );
-        validator.validate(&request.page)?;
+        validator.validate(&request.page_request)?;
         ProjectionRequestValidator::new(
             request.request_identifier.clone(),
             OperationKind::ListOutputSegments,
@@ -438,33 +458,36 @@ impl OutputInterfaceRuntime {
                 .limits()
                 .maximum_preview_bytes,
         )
-        .validate(&request.projection)?;
+        .validate(&request.card_projection)?;
         ReferenceResolver::new(&index).resolve_output(
-            &request.filter.output_reference,
+            &request.output_segment_list_filter.fragile_output_reference,
             &request.request_identifier,
             OperationKind::ListOutputSegments,
         )?;
         let mut segments = index
             .segment_records()
-            .filter(|segment| segment.output_reference == request.filter.output_reference)
+            .filter(|segment| {
+                segment.output_reference
+                    == request.output_segment_list_filter.fragile_output_reference
+            })
             .collect::<Vec<_>>();
-        IndexedSegmentSorter::new(request.page.order).sort(&mut segments);
+        IndexedSegmentSorter::new(request.page_request.listing_order.clone()).sort(&mut segments);
         let page = PaginationWindow::new(
             request.request_identifier.clone(),
             OperationKind::ListOutputSegments,
             PageCollectionKind::Segments,
-            request.page.clone(),
-            PaginationQueryShape::segments(&request.filter),
+            request.page_request.clone(),
+            PaginationQueryShape::segments(&request.output_segment_list_filter),
         )
         .select(&segments)?;
         Ok(OutputSegmentsListed {
             request_identifier: request.request_identifier,
-            segments: page
+            output_segment_cards: page
                 .items
                 .iter()
-                .map(|segment| segment.card(&request.projection))
+                .map(|segment| segment.card(&request.card_projection))
                 .collect(),
-            page: page.metadata,
+            page_metadata: page.metadata,
         })
     }
 
@@ -477,20 +500,20 @@ impl OutputInterfaceRuntime {
             OperationKind::EstimateOutput,
         )?;
         let output = ReferenceResolver::new(&index).resolve_output(
-            &request.output_reference,
+            &request.fragile_output_reference,
             &request.request_identifier,
             OperationKind::EstimateOutput,
         )?;
         let size = OutputRangeEstimator::new(&index, &output).estimate(
-            &request.range,
+            &request.output_read_range,
             &request.request_identifier,
             OperationKind::EstimateOutput,
         )?;
         Ok(OutputEstimated {
             request_identifier: request.request_identifier,
-            output_reference: request.output_reference,
-            range: request.range,
-            size,
+            fragile_output_reference: request.fragile_output_reference,
+            output_read_range: request.output_read_range,
+            size_metadata: size,
         })
     }
 
@@ -509,7 +532,7 @@ impl OutputInterfaceRuntime {
         )
         .validate(request.maximum_bytes)?;
         let output = ReferenceResolver::new(&index).resolve_output(
-            &request.output_reference,
+            &request.fragile_output_reference,
             &request.request_identifier,
             OperationKind::ReadOutput,
         )?;
@@ -522,17 +545,17 @@ impl OutputInterfaceRuntime {
         )
         .read_text(&request.request_identifier, OperationKind::ReadOutput)?;
         let selected = OutputRangeReader::new(&index, output.clone(), text).read(
-            &request.range,
+            &request.output_read_range,
             request.maximum_bytes,
             &request.request_identifier,
             OperationKind::ReadOutput,
         )?;
         Ok(OutputRead {
             request_identifier: request.request_identifier,
-            output_reference: request.output_reference,
-            range: request.range,
-            size: selected.size,
-            excerpt: selected.excerpt,
+            fragile_output_reference: request.fragile_output_reference,
+            output_read_range: request.output_read_range,
+            size_metadata: selected.size,
+            output_text_excerpt: selected.excerpt,
         })
     }
 
@@ -557,39 +580,45 @@ impl OutputInterfaceRuntime {
         .validate_listing(
             &request.request_identifier,
             OperationKind::ListTranscriptBlocks,
-            &request.page,
-            &request.projection,
+            &request.page_request,
+            &request.card_projection,
         )?;
         TranscriptBlockReferenceFilterResolver::new(&index).resolve_filter_references(
-            &request.filter,
+            &request.transcript_block_filter,
             &request.request_identifier,
             OperationKind::ListTranscriptBlocks,
         )?;
         let lowered_time_window = self.lower_optional_time_window(
-            request.filter.time_window.as_ref(),
+            request.transcript_block_filter.time_window_option.as_ref(),
             &request.request_identifier,
             OperationKind::ListTranscriptBlocks,
         )?;
-        let mut blocks =
-            TranscriptBlockFilterMatcher::new(&request.filter, lowered_time_window.as_ref())
-                .matching_blocks(index.transcript_block_records());
-        IndexedTranscriptBlockSorter::new(request.page.order).sort(&mut blocks);
+        let mut blocks = TranscriptBlockFilterMatcher::new(
+            &request.transcript_block_filter,
+            lowered_time_window.as_ref(),
+        )
+        .matching_blocks(index.transcript_block_records());
+        IndexedTranscriptBlockSorter::new(request.page_request.listing_order.clone())
+            .sort(&mut blocks);
         let page = PaginationWindow::new(
             request.request_identifier.clone(),
             OperationKind::ListTranscriptBlocks,
             PageCollectionKind::TranscriptBlocks,
-            request.page.clone(),
-            PaginationQueryShape::transcript_blocks(&request.filter, lowered_time_window.as_ref()),
+            request.page_request.clone(),
+            PaginationQueryShape::transcript_blocks(
+                &request.transcript_block_filter,
+                lowered_time_window.as_ref(),
+            ),
         )
         .select(&blocks)?;
         Ok(TranscriptBlocksListed {
             request_identifier: request.request_identifier,
-            blocks: page
+            transcript_block_cards: page
                 .items
                 .iter()
-                .map(|block| block.card(&request.projection))
+                .map(|block| block.card(&request.card_projection))
                 .collect(),
-            page: page.metadata,
+            page_metadata: page.metadata,
         })
     }
 
@@ -614,34 +643,38 @@ impl OutputInterfaceRuntime {
         .validate_listing(
             &request.request_identifier,
             OperationKind::SearchTranscriptBlocks,
-            &request.page,
-            &request.projection,
+            &request.page_request,
+            &request.card_projection,
         )?;
-        TranscriptBlockQueryValidator::new(&request.query).validate(
+        let text_query = TranscriptBlockQueryValidator::new(&request.transcript_block_text_query)
+            .validate(
             &request.request_identifier,
             OperationKind::SearchTranscriptBlocks,
         )?;
         TranscriptBlockReferenceFilterResolver::new(&index).resolve_filter_references(
-            &request.filter,
+            &request.transcript_block_filter,
             &request.request_identifier,
             OperationKind::SearchTranscriptBlocks,
         )?;
         let lowered_time_window = self.lower_optional_time_window(
-            request.filter.time_window.as_ref(),
+            request.transcript_block_filter.time_window_option.as_ref(),
             &request.request_identifier,
             OperationKind::SearchTranscriptBlocks,
         )?;
-        let mut blocks =
-            TranscriptBlockFilterMatcher::new(&request.filter, lowered_time_window.as_ref())
-                .matching_blocks(index.transcript_block_records());
-        IndexedTranscriptBlockSorter::new(request.page.order).sort(&mut blocks);
+        let mut blocks = TranscriptBlockFilterMatcher::new(
+            &request.transcript_block_filter,
+            lowered_time_window.as_ref(),
+        )
+        .matching_blocks(index.transcript_block_records());
+        IndexedTranscriptBlockSorter::new(request.page_request.listing_order.clone())
+            .sort(&mut blocks);
         let matches = StreamingTranscriptBlockSearch::new(
-            request.query.clone(),
+            text_query.clone(),
             self.configuration
                 .output_interfaces()
                 .limits()
                 .maximum_read_bytes,
-            request.page.limit.into_u64(),
+            request.page_request.page_limit.try_into().unwrap(),
             limits::IndexStoreLimits::default().maximum_query_candidates,
         )
         .search(
@@ -653,22 +686,22 @@ impl OutputInterfaceRuntime {
             request.request_identifier.clone(),
             OperationKind::SearchTranscriptBlocks,
             PageCollectionKind::TranscriptBlocks,
-            request.page.clone(),
+            request.page_request.clone(),
             PaginationQueryShape::transcript_block_search(
-                &request.filter,
+                &request.transcript_block_filter,
                 lowered_time_window.as_ref(),
-                &request.query,
+                &text_query,
             ),
         )
         .select(&matches)?;
         Ok(TranscriptBlocksSearched {
             request_identifier: request.request_identifier,
-            matches: page
+            transcript_block_search_matches: page
                 .items
                 .iter()
-                .map(|match_record| match_record.reply_match(&request.projection))
+                .map(|match_record| match_record.reply_match(&request.card_projection))
                 .collect(),
-            page: page.metadata,
+            page_metadata: page.metadata,
         })
     }
 
@@ -681,14 +714,14 @@ impl OutputInterfaceRuntime {
             OperationKind::EstimateTranscriptBlock,
         )?;
         let block = ReferenceResolver::new(&index).resolve_transcript_block(
-            &request.block_reference,
+            &request.fragile_transcript_block_reference,
             &request.request_identifier,
             OperationKind::EstimateTranscriptBlock,
         )?;
         Ok(TranscriptBlockEstimated {
             request_identifier: request.request_identifier,
-            block_reference: request.block_reference,
-            size: block.size,
+            fragile_transcript_block_reference: request.fragile_transcript_block_reference,
+            size_metadata: block.size,
         })
     }
 
@@ -710,7 +743,7 @@ impl OutputInterfaceRuntime {
         )
         .validate(request.maximum_bytes)?;
         let block = ReferenceResolver::new(&index).resolve_transcript_block(
-            &request.block_reference,
+            &request.fragile_transcript_block_reference,
             &request.request_identifier,
             OperationKind::ReadTranscriptBlock,
         )?;
@@ -727,15 +760,15 @@ impl OutputInterfaceRuntime {
         )?;
         let selected = SelectedTranscriptBlockText::new(
             text,
-            block.provenance.source,
+            block.provenance.source_kind,
             block.path.clone(),
             request.maximum_bytes,
         );
         Ok(TranscriptBlockRead {
             request_identifier: request.request_identifier,
-            block_reference: request.block_reference,
-            size: selected.size,
-            excerpt: selected.excerpt,
+            fragile_transcript_block_reference: request.fragile_transcript_block_reference,
+            size_metadata: selected.size,
+            transcript_text_excerpt: selected.excerpt,
         })
     }
 
@@ -811,7 +844,7 @@ impl OutputInterfaceRuntime {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RefreshedPersistentIndex {
     index: PersistentIndex,
     scans: Vec<TranscriptRawReadOutcome>,
@@ -830,7 +863,7 @@ impl RefreshedPersistentIndex {
 /// Canonical persisted sort material. Its tuple order is deliberately identical to the existing
 /// listing comparators: descending affects only the primary chronology/index component, while
 /// every contract tie-breaker remains ascending.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ProjectionTreeOrdering {
     order: ListingOrder,
 }
@@ -883,7 +916,7 @@ impl ProjectionTreeOrdering {
     fn segment_key(&self, value: &schema::ProjectionSegmentDto, reference: &str) -> String {
         format!(
             "{}\u{1f}{}",
-            Self::segment_index_material(self.order, value.segment_index),
+            Self::segment_index_material(self.order.clone(), value.segment_index),
             Self::component(reference)
         )
     }
@@ -2189,22 +2222,20 @@ impl IndexedSession {
             return None;
         };
         Some(Self {
-            reference: FragileSessionReference::new(dto.reference),
+            reference: dto.reference,
             source: TypedProjectionValue::source(dto.source).ok()?,
-            source_identifier: signal_aggregator::SourceIdentifier::new(dto.source_identifier),
+            source_identifier: dto.source_identifier,
             path: PathBuf::from(dto.path.display),
             fingerprint: SourceFingerprint {
                 byte_count: dto.fingerprint_bytes,
                 modified_seconds: dto.fingerprint_seconds,
                 modified_nanoseconds: dto.fingerprint_nanoseconds,
             },
-            started_at: dto.started_at.map(Timestamp::new),
-            last_observed_at: dto.last_observed_at.map(Timestamp::new),
+            started_at: dto.started_at,
+            last_observed_at: dto.last_observed_at,
             subagent_count: 0,
             output_count: 0,
-            producer_session_identifier: dto
-                .producer_session_identifier
-                .map(SessionIdentifier::new),
+            producer_session_identifier: dto.producer_session_identifier,
             size: TypedProjectionValue::size(dto.size).ok()?,
         })
     }
@@ -2215,15 +2246,15 @@ impl IndexedSubagent {
             return None;
         };
         Some(Self {
-            reference: FragileSubagentReference::new(dto.reference),
-            session_reference: FragileSessionReference::new(dto.session_reference),
-            name: signal_aggregator::SubagentName::new(dto.name),
+            reference: dto.reference,
+            session_reference: dto.session_reference,
+            name: dto.name,
             authored_status: TypedProjectionValue::authored_status(dto.authored_status).ok()?,
             output_count: 0,
             task: TypedProjectionValue::task(dto.task),
             size: TypedProjectionValue::size(dto.size).ok()?,
-            first_observed_at: dto.first_observed_at.map(Timestamp::new),
-            last_observed_at: dto.last_observed_at.map(Timestamp::new),
+            first_observed_at: dto.first_observed_at,
+            last_observed_at: dto.last_observed_at,
         })
     }
 }
@@ -2233,15 +2264,15 @@ impl IndexedOutput {
             return None;
         };
         Some(Self {
-            reference: FragileOutputReference::new(dto.reference),
-            session_reference: FragileSessionReference::new(dto.session_reference),
-            subagent_reference: dto.subagent_reference.map(FragileSubagentReference::new),
-            title: dto.title.map(signal_aggregator::OutputTitle::new),
+            reference: dto.reference,
+            session_reference: dto.session_reference,
+            subagent_reference: dto.subagent_reference,
+            title: dto.title,
             provenance: OutputProvenance {
-                source: TypedProjectionValue::source(dto.source).ok()?,
-                source_identifier: signal_aggregator::SourceIdentifier::new(dto.source_identifier),
+                source_kind: TypedProjectionValue::source(dto.source).ok()?,
+                source_identifier: dto.source_identifier,
                 authored_status: TypedProjectionValue::authored_status(dto.authored_status).ok()?,
-                produced_at: dto.produced_at.map(Timestamp::new),
+                produced_at: dto.produced_at,
             },
             task: TypedProjectionValue::task(dto.task),
             path: PathBuf::from(dto.path.display),
@@ -2264,16 +2295,16 @@ impl IndexedOutputSegment {
             return None;
         };
         Some(Self {
-            reference: FragileOutputSegmentReference::new(dto.reference),
-            output_reference: FragileOutputReference::new(dto.output_reference),
-            segment_index: SegmentIndex::new(dto.segment_index),
+            reference: dto.reference,
+            output_reference: dto.output_reference,
+            segment_index: crate::MeasuredCount::contract_count(dto.segment_index),
             byte_range: dto.byte_range.map(|(start, end)| ByteRange {
-                start: ByteCount::new(start),
-                end: ByteCount::new(end),
+                start_byte_count: crate::MeasuredCount::contract_count(start),
+                end_byte_count: crate::MeasuredCount::contract_count(end),
             }),
             line_range: dto.line_range.map(|(start, end)| LineRange {
-                start: LineNumber::new(start),
-                end: LineNumber::new(end),
+                start_line_number: crate::MeasuredCount::contract_count(start),
+                end_line_number: crate::MeasuredCount::contract_count(end),
             }),
             size: TypedProjectionValue::size(dto.size).ok()?,
             preview_text: dto.preview_text,
@@ -2289,16 +2320,16 @@ impl IndexedTranscriptBlock {
             return None;
         };
         Some(Self {
-            reference: FragileTranscriptBlockReference::new(dto.reference),
-            session_reference: FragileSessionReference::new(dto.session_reference),
-            subagent_reference: dto.subagent_reference.map(FragileSubagentReference::new),
+            reference: dto.reference,
+            session_reference: dto.session_reference,
+            subagent_reference: dto.subagent_reference,
             kind: TypedProjectionValue::block_kind(dto.kind).ok()?,
-            block_index: signal_aggregator::TranscriptBlockIndex::new(dto.block_index),
+            block_index: crate::MeasuredCount::contract_count(dto.block_index),
             provenance: TranscriptBlockProvenance {
-                source: TypedProjectionValue::source(dto.source).ok()?,
-                source_identifier: signal_aggregator::SourceIdentifier::new(dto.source_identifier),
+                source_kind: TypedProjectionValue::source(dto.source).ok()?,
+                source_identifier: dto.source_identifier,
                 authored_status: TypedProjectionValue::authored_status(dto.authored_status).ok()?,
-                observed_at: dto.observed_at.map(Timestamp::new),
+                observed_at: dto.observed_at,
             },
             task: TypedProjectionValue::task(dto.task),
             path: PathBuf::from(dto.path.display),
@@ -2389,23 +2420,23 @@ impl TypedProjectionValue {
             }
         };
         Ok(SizeMetadata {
-            byte_count: dto.byte_count.map(ByteCount::new),
-            line_count: dto.line_count.map(LineCount::new),
-            segment_count: dto.segment_count.map(ItemCount::new),
-            certainty,
+            byte_count_option: dto.byte_count.map(crate::MeasuredCount::contract_count),
+            line_count_option: dto.line_count.map(crate::MeasuredCount::contract_count),
+            segment_count: dto.segment_count.map(crate::MeasuredCount::contract_count),
+            size_certainty: certainty,
         })
     }
 
     fn task(dto: Option<ProjectionTaskDto>) -> Option<SubagentTaskMetadata> {
         dto.map(|task| SubagentTaskMetadata {
-            task_identifier: TaskIdentifier::new(task.task_identifier),
-            title: None,
-            tool_use_identifier: None,
-            output_locator: None,
-            source_status: SourceHealthStatus::ReadableIndexed,
-            result: None,
-            usage: None,
-            duration: None,
+            task_identifier: task.task_identifier,
+            task_title_option: None,
+            tool_use_identifier_option: None,
+            source_locator_option: None,
+            source_health_status: SourceHealthStatus::ReadableIndexed,
+            task_result_option: None,
+            usage_summary_option: None,
+            task_duration: None,
         })
     }
 }
@@ -2468,7 +2499,9 @@ impl SourceHealthObserver {
         let malformed = outcome
             .read_failures
             .iter()
-            .filter(|failure| failure.reason == signal_aggregator::ReadFailureReason::Malformed)
+            .filter(|failure| {
+                failure.read_failure_reason == signal_aggregator::ReadFailureReason::Malformed
+            })
             .count() as u64;
         let unreadable = outcome.read_failures.len() as u64 - malformed;
         let status = if unreadable > 0 {
@@ -2476,36 +2509,39 @@ impl SourceHealthObserver {
         } else if !outcome.truncations.is_empty() {
             SourceHealthStatus::DiscoveryTruncated
         } else if malformed > 0 {
-            SourceHealthStatus::MalformedRecords
+            // The declared contract names this variant bare; its generated form
+            // carries the malformed count, because a declared type shares the
+            // name. The count is the one this scan observed.
+            SourceHealthStatus::MalformedRecords(crate::MeasuredCount::contract_count(malformed))
         } else if outcome.record_count == 0 {
             SourceHealthStatus::ReadableEmpty
         } else {
             SourceHealthStatus::ReadableIndexed
         };
         SourceHealthCard {
-            source: self.source.kind(),
+            source_kind: self.source.kind(),
             source_identifier: outcome.source_identifier.clone(),
-            locator: SourceLocator {
-                root: FilesystemPath::new(self.source.root().path().display().to_string()),
-                relative_path: None,
+            source_locator: SourceLocator {
+                filesystem_path: self.source.root().path().display().to_string(),
+                root_relative_path_option: None,
             },
-            status,
+            source_health_status: status,
             scan_limits: outcome.scan_limits.clone(),
-            discovered_files: ItemCount::new(outcome.discovered_files),
-            indexed_records: ItemCount::new(outcome.record_count),
-            malformed_records: ItemCount::new(malformed),
-            unreadable_records: ItemCount::new(unreadable),
+            discovered_files: crate::MeasuredCount::contract_count(outcome.discovered_files),
+            indexed_records: crate::MeasuredCount::contract_count(outcome.record_count),
+            malformed_records: crate::MeasuredCount::contract_count(malformed),
+            unreadable_records: crate::MeasuredCount::contract_count(unreadable),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SessionInventory {
     sessions: Vec<SessionInventoryCard>,
     scan_report: SessionInventoryScanReport,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SessionInventoryBuilder {
     configuration: RuntimeConfiguration,
     index: PersistentIndex,
@@ -2538,7 +2574,8 @@ impl SessionInventoryBuilder {
             .map(|report| {
                 (
                     report.source_identifier.as_str().to_string(),
-                    SourceCompletenessStatus::new(report.completeness).status(),
+                    SourceCompletenessStatus::new(report.session_inventory_completeness.clone())
+                        .status(),
                 )
             })
             .collect::<BTreeMap<_, _>>();
@@ -2546,7 +2583,7 @@ impl SessionInventoryBuilder {
             .index
             .session_records()
             .filter(|session| {
-                SourceSelectionFilter::new(&self.source_selection).accepts(session.source)
+                SourceSelectionFilter::new(&self.source_selection).accepts(session.source.clone())
             })
             .map(|session| {
                 let source = self
@@ -2560,7 +2597,7 @@ impl SessionInventoryBuilder {
                     });
                 let source_status = source_statuses
                     .get(session.source_identifier.as_str())
-                    .copied()
+                    .cloned()
                     .unwrap_or(SourceHealthStatus::IndexStoreUnreadable);
                 session.inventory_card(
                     source,
@@ -2569,13 +2606,17 @@ impl SessionInventoryBuilder {
                 )
             })
             .collect::<Vec<_>>();
-        sessions.sort_by(|left, right| left.reference.as_str().cmp(right.reference.as_str()));
+        sessions.sort_by(|left, right| {
+            left.fragile_session_reference
+                .as_str()
+                .cmp(right.fragile_session_reference.as_str())
+        });
         let completeness = InventoryCompletenessAggregator::new(&source_reports).completeness();
         SessionInventory {
             scan_report: SessionInventoryScanReport {
-                sources: source_reports,
-                total_sessions: ItemCount::new(sessions.len() as u64),
-                completeness,
+                session_inventory_source_reports: source_reports,
+                total_sessions: crate::MeasuredCount::contract_count(sessions.len() as u64),
+                session_inventory_completeness: completeness,
             },
             sessions,
         }
@@ -2603,18 +2644,18 @@ impl SessionInventoryBuilder {
             .find(|outcome| outcome.source_identifier == identifier)
             .map(|outcome| SourceHealthObserver::new(source.clone()).from_scan(outcome))
             .unwrap_or_else(|| SourceHealthCard {
-                source: source.kind(),
+                source_kind: source.kind(),
                 source_identifier: identifier.clone(),
-                locator: SourceLocator {
-                    root: FilesystemPath::new(source.root().path().display().to_string()),
-                    relative_path: None,
+                source_locator: SourceLocator {
+                    filesystem_path: source.root().path().display().to_string(),
+                    root_relative_path_option: None,
                 },
-                status: SourceHealthStatus::IndexStoreUnreadable,
+                source_health_status: SourceHealthStatus::IndexStoreUnreadable,
                 scan_limits: Vec::new(),
-                discovered_files: ItemCount::new(0),
-                indexed_records: ItemCount::new(0),
-                malformed_records: ItemCount::new(0),
-                unreadable_records: ItemCount::new(0),
+                discovered_files: 0,
+                indexed_records: 0,
+                malformed_records: 0,
+                unreadable_records: 0,
             });
         let sessions = self
             .index
@@ -2642,17 +2683,20 @@ impl SessionInventoryBuilder {
             }
         }
         SessionInventorySourceReport {
-            source: source.kind(),
+            source_kind: source.kind(),
             source_identifier: TranscriptSourceIdentifier::new(source).identifier(),
-            locator: SourceLocator {
-                root: FilesystemPath::new(source.root().path().display().to_string()),
-                relative_path: None,
+            source_locator: SourceLocator {
+                filesystem_path: source.root().path().display().to_string(),
+                root_relative_path_option: None,
             },
-            completeness: SourceHealthCompleteness::new(health.status).completeness(),
+            session_inventory_completeness: SourceHealthCompleteness::new(
+                health.source_health_status,
+            )
+            .completeness(),
             scan_limits: health.scan_limits,
             discovered_files: health.discovered_files,
-            indexed_sessions: ItemCount::new(sessions.len() as u64),
-            byte_count: ByteCount::new(byte_count),
+            indexed_sessions: crate::MeasuredCount::contract_count(sessions.len() as u64),
+            byte_count: crate::MeasuredCount::contract_count(byte_count),
             earliest_modified_at: earliest,
             latest_modified_at: latest,
         }
@@ -2714,7 +2758,7 @@ impl<'a> TranscriptSourceIdentifier<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SourceHealthCompleteness {
     status: SourceHealthStatus,
 }
@@ -2730,7 +2774,7 @@ impl SourceHealthCompleteness {
             SourceHealthStatus::UnreadableRoot | SourceHealthStatus::IndexStoreUnreadable => {
                 SessionInventoryCompleteness::Failed
             }
-            SourceHealthStatus::MalformedRecords => SessionInventoryCompleteness::Resumable,
+            SourceHealthStatus::MalformedRecords(_) => SessionInventoryCompleteness::Resumable,
             SourceHealthStatus::ReadableEmpty | SourceHealthStatus::ReadableIndexed => {
                 SessionInventoryCompleteness::Complete
             }
@@ -2738,7 +2782,7 @@ impl SourceHealthCompleteness {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SourceCompletenessStatus {
     completeness: SessionInventoryCompleteness,
 }
@@ -2751,14 +2795,14 @@ impl SourceCompletenessStatus {
     pub fn status(self) -> SourceHealthStatus {
         match self.completeness {
             SessionInventoryCompleteness::Complete => SourceHealthStatus::ReadableIndexed,
-            SessionInventoryCompleteness::Resumable => SourceHealthStatus::MalformedRecords,
+            SessionInventoryCompleteness::Resumable => SourceHealthStatus::MalformedRecords(0),
             SessionInventoryCompleteness::Truncated => SourceHealthStatus::DiscoveryTruncated,
             SessionInventoryCompleteness::Failed => SourceHealthStatus::UnreadableRoot,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct InventoryCompletenessAggregator<'a> {
     reports: &'a [SessionInventorySourceReport],
 }
@@ -2769,23 +2813,17 @@ impl<'a> InventoryCompletenessAggregator<'a> {
     }
 
     pub fn completeness(self) -> SessionInventoryCompleteness {
-        if self
-            .reports
-            .iter()
-            .any(|report| report.completeness == SessionInventoryCompleteness::Failed)
-        {
+        if self.reports.iter().any(|report| {
+            report.session_inventory_completeness == SessionInventoryCompleteness::Failed
+        }) {
             SessionInventoryCompleteness::Failed
-        } else if self
-            .reports
-            .iter()
-            .any(|report| report.completeness == SessionInventoryCompleteness::Truncated)
-        {
+        } else if self.reports.iter().any(|report| {
+            report.session_inventory_completeness == SessionInventoryCompleteness::Truncated
+        }) {
             SessionInventoryCompleteness::Truncated
-        } else if self
-            .reports
-            .iter()
-            .any(|report| report.completeness == SessionInventoryCompleteness::Resumable)
-        {
+        } else if self.reports.iter().any(|report| {
+            report.session_inventory_completeness == SessionInventoryCompleteness::Resumable
+        }) {
             SessionInventoryCompleteness::Resumable
         } else {
             SessionInventoryCompleteness::Complete
@@ -2793,7 +2831,7 @@ impl<'a> InventoryCompletenessAggregator<'a> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SessionLookupMatcher<'a> {
     selector: &'a SessionLookupSelector,
 }
@@ -2805,11 +2843,13 @@ impl<'a> SessionLookupMatcher<'a> {
 
     pub fn accepts(&self, session: &SessionInventoryCard) -> bool {
         match self.selector {
-            SessionLookupSelector::ByReference(reference) => &session.reference == reference,
-            SessionLookupSelector::ByProducerSession(identifier) => {
-                session.producer_session_identifier.as_ref() == Some(identifier)
+            SessionLookupSelector::ByReference(reference) => {
+                &session.fragile_session_reference == reference
             }
-            SessionLookupSelector::BySourceLocator(locator) => &session.locator == locator,
+            SessionLookupSelector::ByProducerSession(identifier) => {
+                session.session_identifier_option.as_ref() == Some(identifier)
+            }
+            SessionLookupSelector::BySourceLocator(locator) => &session.source_locator == locator,
         }
     }
 }
@@ -2839,7 +2879,7 @@ impl<'a> TimestampOrderingOption<'a> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexedSession {
     reference: FragileSessionReference,
     source: SourceKind,
@@ -2862,41 +2902,41 @@ impl IndexedSession {
         archive_status: SessionArchiveStatus,
     ) -> SessionInventoryCard {
         SessionInventoryCard {
-            reference: self.reference.clone(),
-            role: self.role(),
-            source: self.source,
+            fragile_session_reference: self.reference.clone(),
+            session_role: self.role(),
+            source_kind: self.source.clone(),
             source_identifier: self.source_identifier.clone(),
-            producer_session_identifier: self.producer_session_identifier.clone(),
-            locator: self.source_locator(source),
-            file_count: ItemCount::new(1),
-            byte_count: ByteCount::new(self.file_byte_count()),
+            session_identifier_option: self.producer_session_identifier.clone(),
+            source_locator: self.source_locator(source),
+            file_count: 1,
+            byte_count: crate::MeasuredCount::contract_count(self.file_byte_count()),
             earliest_modified_at: self.modified_timestamp(),
             latest_modified_at: self.modified_timestamp(),
             started_at: self.started_at.clone(),
             last_observed_at: self.last_observed_at.clone(),
-            subagent_count: Some(ItemCount::new(self.subagent_count)),
-            output_count: Some(ItemCount::new(self.output_count)),
-            lifecycle_status: self.lifecycle_status(),
-            source_status,
-            archive_status,
+            subagent_count: Some(self.subagent_count.try_into().unwrap()),
+            output_count: Some(self.output_count.try_into().unwrap()),
+            session_lifecycle_status: self.lifecycle_status(),
+            source_health_status: source_status,
+            session_archive_status: archive_status,
         }
     }
 
     pub fn source_locator(&self, source: Option<&TranscriptAdapterConfiguration>) -> SourceLocator {
         let Some(source) = source else {
             return SourceLocator {
-                root: FilesystemPath::new(self.path.display().to_string()),
-                relative_path: None,
+                filesystem_path: self.path.display().to_string(),
+                root_relative_path_option: None,
             };
         };
         let relative_path = self
             .path
             .strip_prefix(source.root().path())
             .ok()
-            .map(|path| RootRelativePath::new(path.display().to_string()));
+            .map(|path| path.display().to_string());
         SourceLocator {
-            root: FilesystemPath::new(source.root().path().display().to_string()),
-            relative_path,
+            filesystem_path: source.root().path().display().to_string(),
+            root_relative_path_option: relative_path,
         }
     }
 
@@ -2922,7 +2962,9 @@ impl IndexedSession {
         if self.fingerprint.byte_count > 0 {
             self.fingerprint.byte_count
         } else {
-            self.size.byte_count.map_or(0, ByteCount::into_u64)
+            self.size
+                .byte_count_option
+                .map_or(0, crate::MeasuredCount::measured_count)
         }
     }
 
@@ -2932,20 +2974,20 @@ impl IndexedSession {
 
     pub fn card(&self) -> SessionCard {
         SessionCard {
-            reference: self.reference.clone(),
-            role: self.role(),
-            source: self.source,
+            fragile_session_reference: self.reference.clone(),
+            session_role: self.role(),
+            source_kind: self.source.clone(),
             source_identifier: self.source_identifier.clone(),
-            producer_session_identifier: self.producer_session_identifier.clone(),
-            transcript_locator: Some(SourceLocator {
-                root: FilesystemPath::new(self.path.display().to_string()),
-                relative_path: None,
+            session_identifier_option: self.producer_session_identifier.clone(),
+            source_locator_option: Some(SourceLocator {
+                filesystem_path: self.path.display().to_string(),
+                root_relative_path_option: None,
             }),
             started_at: self.started_at.clone(),
             last_observed_at: self.last_observed_at.clone(),
-            subagent_count: Some(ItemCount::new(self.subagent_count)),
-            output_count: Some(ItemCount::new(self.output_count)),
-            size: self.size.clone(),
+            subagent_count: Some(self.subagent_count.try_into().unwrap()),
+            output_count: Some(self.output_count.try_into().unwrap()),
+            size_metadata: self.size.clone(),
         }
     }
 
@@ -2954,7 +2996,7 @@ impl IndexedSession {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexedSubagent {
     reference: FragileSubagentReference,
     session_reference: FragileSessionReference,
@@ -2970,13 +3012,13 @@ pub struct IndexedSubagent {
 impl IndexedSubagent {
     pub fn card(&self) -> SubagentCard {
         SubagentCard {
-            reference: self.reference.clone(),
-            session_reference: self.session_reference.clone(),
-            name: self.name.clone(),
-            task: self.task.clone(),
-            authored_status: self.authored_status,
-            output_count: Some(ItemCount::new(self.output_count)),
-            size: self.size.clone(),
+            fragile_subagent_reference: self.reference.clone(),
+            fragile_session_reference: self.session_reference.clone(),
+            subagent_name: self.name.clone(),
+            subagent_task_metadata_option: self.task.clone(),
+            authored_status: self.authored_status.clone(),
+            output_count: Some(self.output_count.try_into().unwrap()),
+            size_metadata: self.size.clone(),
             first_observed_at: self.first_observed_at.clone(),
             last_observed_at: self.last_observed_at.clone(),
         }
@@ -2989,7 +3031,7 @@ impl IndexedSubagent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexedOutput {
     reference: FragileOutputReference,
     session_reference: FragileSessionReference,
@@ -3015,23 +3057,22 @@ impl IndexedOutput {
         preview_limit: ByteLimit,
     ) -> Self {
         let text_hash = StableHash::new(&record.text).hex();
-        let reference = FragileOutputReference::new(
-            StableReference::new(
-                "output",
-                format!(
-                    "{}|{}|{}|{}|{}|{}",
-                    SourceKindName::new(record.source).as_str(),
-                    record.source_identifier.as_str(),
-                    record.path.display(),
-                    record.line_number,
-                    fingerprint.material(),
-                    text_hash
-                ),
-            )
-            .as_string(),
-        );
+        let reference = StableReference::new(
+            "output",
+            format!(
+                "{}|{}|{}|{}|{}|{}",
+                SourceKindName::new(record.source.clone()).as_str(),
+                record.source_identifier.as_str(),
+                record.path.display(),
+                record.line_number,
+                fingerprint.material(),
+                text_hash
+            ),
+        )
+        .as_string();
         let size = SizeMetadataFactory::from_text(&record.text, Some(1)).exact();
-        let preview_text = Utf8Prefix::new(&record.text, preview_limit.into_u64()).into_string();
+        let preview_text =
+            Utf8Prefix::new(&record.text, preview_limit.try_into().unwrap()).into_string();
         let preview_original_bytes = record.byte_count();
         Self {
             reference,
@@ -3040,7 +3081,7 @@ impl IndexedOutput {
             title: record.title,
             task: record.task_metadata.clone(),
             provenance: OutputProvenance {
-                source: record.source,
+                source_kind: record.source,
                 source_identifier: record.source_identifier,
                 authored_status: record.authored_status,
                 produced_at: record.timestamp,
@@ -3057,17 +3098,17 @@ impl IndexedOutput {
 
     pub fn card(&self, projection: &CardProjection) -> OutputCard {
         OutputCard {
-            reference: self.reference.clone(),
-            session_reference: self.session_reference.clone(),
-            subagent_reference: self.subagent_reference.clone(),
-            title: self.title.clone(),
-            task: self.task.clone(),
-            provenance: self.provenance.clone(),
-            size: self.size.clone(),
-            preview: PreviewProjector::new(
+            fragile_output_reference: self.reference.clone(),
+            fragile_session_reference: self.session_reference.clone(),
+            fragile_subagent_reference_option: self.subagent_reference.clone(),
+            output_title_option: self.title.clone(),
+            subagent_task_metadata_option: self.task.clone(),
+            output_provenance: self.provenance.clone(),
+            size_metadata: self.size.clone(),
+            output_text_excerpt_option: PreviewProjector::new(
                 self.preview_text.clone(),
                 self.preview_original_bytes,
-                self.provenance.source,
+                self.provenance.source_kind.clone(),
                 self.path.clone(),
             )
             .project(projection),
@@ -3079,7 +3120,7 @@ impl IndexedOutput {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexedOutputSegment {
     reference: FragileOutputSegmentReference,
     output_reference: FragileOutputReference,
@@ -3096,45 +3137,38 @@ pub struct IndexedOutputSegment {
 impl IndexedOutputSegment {
     pub fn from_output(output: &IndexedOutput) -> Self {
         Self {
-            reference: FragileOutputSegmentReference::new(
-                StableReference::new("segment", format!("{}|0", output.reference.as_str()))
-                    .as_string(),
-            ),
+            reference: StableReference::new("segment", format!("{}|0", output.reference.as_str()))
+                .as_string(),
             output_reference: output.reference.clone(),
-            segment_index: SegmentIndex::new(0),
+            segment_index: 0,
             byte_range: Some(ByteRange {
-                start: ByteCount::new(0),
-                end: ByteCount::new(output.size.byte_count.map_or(0, ByteCount::into_u64)),
+                start_byte_count: 0,
+                end_byte_count: output.size.byte_count_option.unwrap_or(0),
             }),
             line_range: Some(LineRange {
-                start: LineNumber::new(1),
-                end: LineNumber::new(
-                    output
-                        .size
-                        .line_count
-                        .map_or(1, |count| count.into_u64() + 1),
-                ),
+                start_line_number: 1,
+                end_line_number: output.size.line_count_option.map_or(1, |count| count + 1),
             }),
             size: output.size.clone(),
             preview_text: output.preview_text.clone(),
             preview_original_bytes: output.preview_original_bytes,
-            source: output.provenance.source,
+            source: output.provenance.source_kind.clone(),
             path: output.path.clone(),
         }
     }
 
     pub fn card(&self, projection: &CardProjection) -> OutputSegmentCard {
         OutputSegmentCard {
-            reference: self.reference.clone(),
-            output_reference: self.output_reference.clone(),
+            fragile_output_segment_reference: self.reference.clone(),
+            fragile_output_reference: self.output_reference.clone(),
             segment_index: self.segment_index,
-            byte_range: self.byte_range.clone(),
-            line_range: self.line_range.clone(),
-            size: self.size.clone(),
-            preview: PreviewProjector::new(
+            byte_range_option: self.byte_range.clone(),
+            line_range_option: self.line_range.clone(),
+            size_metadata: self.size.clone(),
+            output_text_excerpt_option: PreviewProjector::new(
                 self.preview_text.clone(),
                 self.preview_original_bytes,
-                self.source,
+                self.source.clone(),
                 self.path.clone(),
             )
             .project(projection),
@@ -3142,7 +3176,7 @@ impl IndexedOutputSegment {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexedTranscriptBlock {
     reference: FragileTranscriptBlockReference,
     session_reference: FragileSessionReference,
@@ -3174,30 +3208,28 @@ impl IndexedTranscriptBlock {
             .map(StableHash::new)
             .map(|hash| hash.hex())
             .unwrap_or_else(|| StableHash::new("unavailable").hex());
-        let reference = FragileTranscriptBlockReference::new(
-            StableReference::new(
-                "transcript-block",
-                format!(
-                    "{}|{}|{}|{}|{}|{}|{}|{}",
-                    SourceKindName::new(record.source).as_str(),
-                    record.source_identifier.as_str(),
-                    record.path.display(),
-                    record.line_number,
-                    record.block_index,
-                    TranscriptBlockKindName::new(record.kind).as_str(),
-                    fingerprint.material(),
-                    text_hash
-                ),
-            )
-            .as_string(),
-        );
+        let reference = StableReference::new(
+            "transcript-block",
+            format!(
+                "{}|{}|{}|{}|{}|{}|{}|{}",
+                SourceKindName::new(record.source.clone()).as_str(),
+                record.source_identifier.as_str(),
+                record.path.display(),
+                record.line_number,
+                record.block_index,
+                TranscriptBlockKindName::new(record.kind.clone()).as_str(),
+                fingerprint.material(),
+                text_hash
+            ),
+        )
+        .as_string();
         let size = record
             .readable_text()
             .map(|text| SizeMetadataFactory::from_text(text, None).exact())
             .unwrap_or_else(SizeMetadataFactory::unknown);
         let preview_text = record
             .readable_text()
-            .map(|text| Utf8Prefix::new(text, preview_limit.into_u64()).into_string())
+            .map(|text| Utf8Prefix::new(text, preview_limit.try_into().unwrap()).into_string())
             .unwrap_or_default();
         let preview_original_bytes = record.byte_count().unwrap_or(0);
         Self {
@@ -3205,10 +3237,10 @@ impl IndexedTranscriptBlock {
             session_reference,
             subagent_reference,
             kind: record.kind,
-            block_index: signal_aggregator::TranscriptBlockIndex::new(record.block_index),
+            block_index: crate::MeasuredCount::contract_count(record.block_index),
             task: record.task_metadata.clone(),
             provenance: TranscriptBlockProvenance {
-                source: record.source,
+                source_kind: record.source,
                 source_identifier: record.source_identifier,
                 authored_status: record.authored_status,
                 observed_at: record.timestamp,
@@ -3226,26 +3258,26 @@ impl IndexedTranscriptBlock {
 
     pub fn card(&self, projection: &CardProjection) -> TranscriptBlockCard {
         TranscriptBlockCard {
-            reference: self.reference.clone(),
-            session_reference: self.session_reference.clone(),
-            subagent_reference: self.subagent_reference.clone(),
-            task: self.task.clone(),
-            kind: self.kind,
-            block_index: self.block_index,
-            provenance: self.provenance.clone(),
-            line_range: Some(LineRange {
-                start: LineNumber::new(self.source_line_number),
-                end: LineNumber::new(self.source_line_number + 1),
+            fragile_transcript_block_reference: self.reference.clone(),
+            fragile_session_reference: self.session_reference.clone(),
+            fragile_subagent_reference_option: self.subagent_reference.clone(),
+            subagent_task_metadata_option: self.task.clone(),
+            transcript_block_kind: self.kind.clone(),
+            transcript_block_index: self.block_index,
+            transcript_block_provenance: self.provenance.clone(),
+            line_range_option: Some(LineRange {
+                start_line_number: crate::MeasuredCount::contract_count(self.source_line_number),
+                end_line_number: crate::MeasuredCount::contract_count(self.source_line_number + 1),
             }),
-            byte_range: None,
-            size: self.size.clone(),
-            text_availability: self.text_availability,
-            preview: TranscriptBlockPreviewProjector::new(
+            byte_range_option: None,
+            size_metadata: self.size.clone(),
+            transcript_block_text_availability: self.text_availability.clone(),
+            transcript_text_excerpt_option: TranscriptBlockPreviewProjector::new(
                 self.preview_text.clone(),
                 self.preview_original_bytes,
-                self.provenance.source,
+                self.provenance.source_kind.clone(),
                 self.path.clone(),
-                self.text_availability,
+                self.text_availability.clone(),
             )
             .project(projection),
         }
@@ -3258,14 +3290,18 @@ impl IndexedTranscriptBlock {
     pub fn source_sort_material(&self) -> String {
         format!(
             "{}{}{}",
-            ProjectionTreeOrdering::component(SourceKindName::new(self.provenance.source).as_str()),
+            ProjectionTreeOrdering::component(
+                SourceKindName::new(self.provenance.source_kind.clone()).as_str()
+            ),
             ProjectionTreeOrdering::component(self.provenance.source_identifier.as_str()),
             ProjectionTreeOrdering::component(&self.path.display().to_string()),
         )
     }
 
     pub fn size_byte_count(&self) -> u64 {
-        self.size.byte_count.map_or(0, ByteCount::into_u64)
+        self.size
+            .byte_count_option
+            .map_or(0, crate::MeasuredCount::measured_count)
     }
 }
 
@@ -3302,7 +3338,7 @@ impl<'a> ReferenceResolver<'a> {
         request_identifier: &RequestIdentifier,
         operation: OperationKind,
     ) -> OutputOperationResult<IndexedSubagent> {
-        let factory = OperationRejectedFactory::new(request_identifier.clone(), operation);
+        let factory = OperationRejectedFactory::new(request_identifier.clone(), operation.clone());
         let Some(subagent) = self.index.subagent(reference) else {
             return Err(
                 factory.missing(Some(RejectedFragileReference::Subagent(reference.clone())))
@@ -3335,7 +3371,7 @@ impl<'a> ReferenceResolver<'a> {
         request_identifier: &RequestIdentifier,
         operation: OperationKind,
     ) -> OutputOperationResult<IndexedOutputSegment> {
-        let factory = OperationRejectedFactory::new(request_identifier.clone(), operation);
+        let factory = OperationRejectedFactory::new(request_identifier.clone(), operation.clone());
         let Some(segment) = self.index.segment(reference) else {
             return Err(
                 factory.missing(Some(RejectedFragileReference::OutputSegment(
@@ -3369,7 +3405,7 @@ impl<'a> ReferenceResolver<'a> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OutputBackingReader {
     output: IndexedOutput,
     maximum_line_bytes: ByteLimit,
@@ -3392,12 +3428,12 @@ impl OutputBackingReader {
         let line = BoundedLineReader::new(
             self.output.path.clone(),
             self.output.source_line_number,
-            self.maximum_line_bytes.into_u64().max(4096),
+            self.maximum_line_bytes.max(4096).try_into().unwrap(),
         )
         .read_line()
         .map_err(|failure| failure.rejection(&factory, self.output.reference.clone()))?;
         let record = TranscriptLineParser::new(
-            self.output.provenance.source,
+            self.output.provenance.source_kind.clone(),
             self.output.provenance.source_identifier.clone(),
             self.output.path.clone(),
             self.output.source_line_number,
@@ -3419,7 +3455,7 @@ impl OutputBackingReader {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TranscriptBlockBackingReader {
     block: IndexedTranscriptBlock,
     maximum_line_bytes: ByteLimit,
@@ -3454,22 +3490,18 @@ impl TranscriptBlockBackingReader {
         // The persisted card's size is untrusted for allocation: a changed backing line must
         // be rejected as oversized rather than expanding the single-line buffer to its claimed
         // corpus size.  JSON framing gets a fixed allowance while payload remains read-capped.
-        let line_limit = self
-            .maximum_line_bytes
-            .into_u64()
-            .saturating_add(4096)
-            .max(4096);
+        let line_limit = self.maximum_line_bytes.saturating_add(4096).max(4096);
         let line = BoundedLineReader::new(
             self.block.path.clone(),
             self.block.source_line_number,
-            line_limit,
+            line_limit.try_into().unwrap(),
         )
         .read_line()
         .map_err(|failure| {
             failure.transcript_block_rejection(&factory, self.block.reference.clone())
         })?;
         let record = TranscriptLineParser::new(
-            self.block.provenance.source,
+            self.block.provenance.source_kind.clone(),
             self.block.provenance.source_identifier.clone(),
             self.block.path.clone(),
             self.block.source_line_number,
@@ -3477,11 +3509,9 @@ impl TranscriptBlockBackingReader {
         )
         .parse()
         .ok_or_else(|| factory.stale(reference.clone()))?;
-        let Some(block) = record
-            .transcript_blocks()
-            .into_iter()
-            .find(|candidate| candidate.block_index == self.block.block_index.into_u64())
-        else {
+        let Some(block) = record.transcript_blocks().into_iter().find(|candidate| {
+            candidate.block_index == crate::MeasuredCount::measured_count(self.block.block_index)
+        }) else {
             return Err(factory.stale(reference));
         };
         let Some(text) = block.readable_text().map(ToOwned::to_owned) else {
@@ -3594,7 +3624,7 @@ impl BoundedLineReadFailure {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TranscriptLineParser {
     source: SourceKind,
     source_identifier: signal_aggregator::SourceIdentifier,
@@ -3626,7 +3656,7 @@ impl TranscriptLineParser {
             | SourceKind::ClaudeSubagentOutput
             | SourceKind::PiSubagentOutput => {
                 match ClaudeJsonlRecord::new(&self.line).into_transcript_record(
-                    self.source,
+                    self.source.clone(),
                     self.path.clone(),
                     self.line_number,
                     self.source_identifier.clone(),
@@ -3656,7 +3686,7 @@ impl TranscriptLineParser {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OutputRangeEstimator<'a> {
     index: &'a PersistentIndex,
     output: &'a IndexedOutput,
@@ -3673,7 +3703,7 @@ impl<'a> OutputRangeEstimator<'a> {
         request_identifier: &RequestIdentifier,
         operation: OperationKind,
     ) -> OutputOperationResult<SizeMetadata> {
-        let factory = OperationRejectedFactory::new(request_identifier.clone(), operation);
+        let factory = OperationRejectedFactory::new(request_identifier.clone(), operation.clone());
         match range {
             OutputReadRange::EntireOutput => Ok(self.output.size.clone()),
             OutputReadRange::Bytes(range) => {
@@ -3711,7 +3741,7 @@ impl<'a> OutputRangeEstimator<'a> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OutputRangeReader<'a> {
     index: &'a PersistentIndex,
     output: IndexedOutput,
@@ -3734,7 +3764,7 @@ impl<'a> OutputRangeReader<'a> {
         request_identifier: &RequestIdentifier,
         operation: OperationKind,
     ) -> OutputOperationResult<SelectedOutputText> {
-        let factory = OperationRejectedFactory::new(request_identifier.clone(), operation);
+        let factory = OperationRejectedFactory::new(request_identifier.clone(), operation.clone());
         let selected = match range {
             OutputReadRange::EntireOutput => self.text.clone(),
             OutputReadRange::Bytes(range) => ByteRangeTextSelector::new(&self.text, range.clone())
@@ -3767,14 +3797,14 @@ impl<'a> OutputRangeReader<'a> {
         };
         Ok(SelectedOutputText::new(
             selected,
-            self.output.provenance.source,
+            self.output.provenance.source_kind.clone(),
             self.output.path.clone(),
             maximum_bytes,
         ))
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SelectedOutputText {
     size: SizeMetadata,
     excerpt: OutputTextExcerpt,
@@ -3783,15 +3813,15 @@ pub struct SelectedOutputText {
 impl SelectedOutputText {
     pub fn new(text: String, source: SourceKind, path: PathBuf, maximum_bytes: ByteLimit) -> Self {
         let original_bytes = text.len() as u64;
-        let projected = Utf8Prefix::new(&text, maximum_bytes.into_u64()).into_string();
+        let projected = Utf8Prefix::new(&text, maximum_bytes.try_into().unwrap()).into_string();
         let projected_bytes = projected.len() as u64;
         let truncation = if projected_bytes < original_bytes {
             Some(Truncation {
-                source,
-                path: Some(FilesystemPath::new(path.display().to_string())),
-                original_bytes: Some(ByteCount::new(original_bytes)),
-                projected_bytes: ByteCount::new(projected_bytes),
-                reason: TruncationReason::RequestLimit,
+                source_kind: source,
+                filesystem_path_option: Some(path.display().to_string()),
+                original_bytes: Some(original_bytes.try_into().unwrap()),
+                projected_bytes: crate::MeasuredCount::contract_count(projected_bytes),
+                truncation_reason: TruncationReason::RequestLimit,
             })
         } else {
             None
@@ -3799,15 +3829,15 @@ impl SelectedOutputText {
         Self {
             size: SizeMetadataFactory::from_text(&text, None).exact(),
             excerpt: OutputTextExcerpt {
-                text: OutputText::new(projected),
-                byte_count: ByteCount::new(projected_bytes),
-                truncation,
+                output_text: projected,
+                byte_count: crate::MeasuredCount::contract_count(projected_bytes),
+                truncation_option: truncation,
             },
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SelectedTranscriptBlockText {
     size: SizeMetadata,
     excerpt: TranscriptTextExcerpt,
@@ -3816,15 +3846,15 @@ pub struct SelectedTranscriptBlockText {
 impl SelectedTranscriptBlockText {
     pub fn new(text: String, source: SourceKind, path: PathBuf, maximum_bytes: ByteLimit) -> Self {
         let original_bytes = text.len() as u64;
-        let projected = Utf8Prefix::new(&text, maximum_bytes.into_u64()).into_string();
+        let projected = Utf8Prefix::new(&text, maximum_bytes.try_into().unwrap()).into_string();
         let projected_bytes = projected.len() as u64;
         let truncation = if projected_bytes < original_bytes {
             Some(Truncation {
-                source,
-                path: Some(FilesystemPath::new(path.display().to_string())),
-                original_bytes: Some(ByteCount::new(original_bytes)),
-                projected_bytes: ByteCount::new(projected_bytes),
-                reason: TruncationReason::RequestLimit,
+                source_kind: source,
+                filesystem_path_option: Some(path.display().to_string()),
+                original_bytes: Some(original_bytes.try_into().unwrap()),
+                projected_bytes: crate::MeasuredCount::contract_count(projected_bytes),
+                truncation_reason: TruncationReason::RequestLimit,
             })
         } else {
             None
@@ -3832,15 +3862,15 @@ impl SelectedTranscriptBlockText {
         Self {
             size: SizeMetadataFactory::from_text(&text, None).exact(),
             excerpt: TranscriptTextExcerpt {
-                text: TranscriptText::new(projected),
-                byte_count: ByteCount::new(projected_bytes),
-                truncation,
+                transcript_text: projected,
+                byte_count: crate::MeasuredCount::contract_count(projected_bytes),
+                truncation_option: truncation,
             },
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ByteRangeTextSelector<'a> {
     text: &'a str,
     range: ByteRange,
@@ -3852,8 +3882,8 @@ impl<'a> ByteRangeTextSelector<'a> {
     }
 
     pub fn select(&self) -> std::result::Result<String, RangeSelectionError> {
-        let start = self.range.start.into_u64() as usize;
-        let end = self.range.end.into_u64() as usize;
+        let start = self.range.start_byte_count as usize;
+        let end = self.range.end_byte_count as usize;
         if end < start
             || end > self.text.len()
             || !self.text.is_char_boundary(start)
@@ -3865,7 +3895,7 @@ impl<'a> ByteRangeTextSelector<'a> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LineRangeTextSelector<'a> {
     text: &'a str,
     range: LineRange,
@@ -3877,11 +3907,11 @@ impl<'a> LineRangeTextSelector<'a> {
     }
 
     pub fn select(&self) -> std::result::Result<String, RangeSelectionError> {
-        let start = self.range.start.into_u64();
-        let end = self.range.end.into_u64();
+        let start = self.range.start_line_number;
+        let end = self.range.end_line_number;
         let lines = self.text.lines().collect::<Vec<_>>();
         let maximum_end = lines.len() as u64 + 1;
-        if start == 0 || end < start || end > maximum_end {
+        if start == 0 || end < start || end > maximum_end.try_into().unwrap() {
             return Err(RangeSelectionError);
         }
         let start_index = (start - 1) as usize;
@@ -3893,7 +3923,7 @@ impl<'a> LineRangeTextSelector<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RangeSelectionError;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ByteRangeSelection {
     output: IndexedOutput,
     range: ByteRange,
@@ -3905,22 +3935,26 @@ impl ByteRangeSelection {
     }
 
     pub fn estimate(&self) -> std::result::Result<SizeMetadata, RangeSelectionError> {
-        let start = self.range.start.into_u64();
-        let end = self.range.end.into_u64();
-        let output_bytes = self.output.size.byte_count.map_or(0, ByteCount::into_u64);
-        if end < start || end > output_bytes {
+        let start = self.range.start_byte_count;
+        let end = self.range.end_byte_count;
+        let output_bytes = self
+            .output
+            .size
+            .byte_count_option
+            .map_or(0, crate::MeasuredCount::measured_count);
+        if end < start || end > output_bytes.try_into().unwrap() {
             return Err(RangeSelectionError);
         }
         Ok(SizeMetadata {
-            byte_count: Some(ByteCount::new(end - start)),
-            line_count: None,
+            byte_count_option: Some(end - start),
+            line_count_option: None,
             segment_count: None,
-            certainty: SizeCertainty::Exact,
+            size_certainty: SizeCertainty::Exact,
         })
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LineRangeSelection {
     output: IndexedOutput,
     range: LineRange,
@@ -3932,21 +3966,21 @@ impl LineRangeSelection {
     }
 
     pub fn estimate(&self) -> std::result::Result<SizeMetadata, RangeSelectionError> {
-        let start = self.range.start.into_u64();
-        let end = self.range.end.into_u64();
+        let start = self.range.start_line_number;
+        let end = self.range.end_line_number;
         let maximum_end = self
             .output
             .size
-            .line_count
-            .map_or(1, |count| count.into_u64() + 1);
+            .line_count_option
+            .map_or(1, |count| count + 1);
         if start == 0 || end < start || end > maximum_end {
             return Err(RangeSelectionError);
         }
         Ok(SizeMetadata {
-            byte_count: None,
-            line_count: Some(LineCount::new(end - start)),
+            byte_count_option: None,
+            line_count_option: Some(end - start),
             segment_count: None,
-            certainty: SizeCertainty::Estimated,
+            size_certainty: SizeCertainty::Estimated,
         })
     }
 }
@@ -4020,15 +4054,13 @@ impl SourceFingerprint {
             .ok()?
             .replace_nanosecond(self.modified_nanoseconds)
             .ok()?;
-        Some(Timestamp::new(
-            instant
-                .format(&time::format_description::well_known::Rfc3339)
-                .ok()?,
-        ))
+        instant
+            .format(&time::format_description::well_known::Rfc3339)
+            .ok()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PreviewProjector {
     preview_text: String,
     original_bytes: u64,
@@ -4059,28 +4091,29 @@ impl PreviewProjector {
     }
 
     pub fn bounded(&self, maximum_bytes: ByteLimit) -> OutputTextExcerpt {
-        let text = Utf8Prefix::new(&self.preview_text, maximum_bytes.into_u64()).into_string();
+        let text =
+            Utf8Prefix::new(&self.preview_text, maximum_bytes.try_into().unwrap()).into_string();
         let projected_bytes = text.len() as u64;
         let truncation = if projected_bytes < self.original_bytes {
             Some(Truncation {
-                source: self.source,
-                path: Some(FilesystemPath::new(self.path.display().to_string())),
-                original_bytes: Some(ByteCount::new(self.original_bytes)),
-                projected_bytes: ByteCount::new(projected_bytes),
-                reason: TruncationReason::ProjectionLimit,
+                source_kind: self.source.clone(),
+                filesystem_path_option: Some(self.path.display().to_string()),
+                original_bytes: Some(self.original_bytes.try_into().unwrap()),
+                projected_bytes: crate::MeasuredCount::contract_count(projected_bytes),
+                truncation_reason: TruncationReason::ProjectionLimit,
             })
         } else {
             None
         };
         OutputTextExcerpt {
-            text: OutputText::new(text),
-            byte_count: ByteCount::new(projected_bytes),
-            truncation,
+            output_text: text,
+            byte_count: crate::MeasuredCount::contract_count(projected_bytes),
+            truncation_option: truncation,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TranscriptBlockPreviewProjector {
     preview_text: String,
     original_bytes: u64,
@@ -4117,23 +4150,24 @@ impl TranscriptBlockPreviewProjector {
     }
 
     pub fn bounded(&self, maximum_bytes: ByteLimit) -> TranscriptTextExcerpt {
-        let text = Utf8Prefix::new(&self.preview_text, maximum_bytes.into_u64()).into_string();
+        let text =
+            Utf8Prefix::new(&self.preview_text, maximum_bytes.try_into().unwrap()).into_string();
         let projected_bytes = text.len() as u64;
         let truncation = if projected_bytes < self.original_bytes {
             Some(Truncation {
-                source: self.source,
-                path: Some(FilesystemPath::new(self.path.display().to_string())),
-                original_bytes: Some(ByteCount::new(self.original_bytes)),
-                projected_bytes: ByteCount::new(projected_bytes),
-                reason: TruncationReason::ProjectionLimit,
+                source_kind: self.source.clone(),
+                filesystem_path_option: Some(self.path.display().to_string()),
+                original_bytes: Some(self.original_bytes.try_into().unwrap()),
+                projected_bytes: crate::MeasuredCount::contract_count(projected_bytes),
+                truncation_reason: TruncationReason::ProjectionLimit,
             })
         } else {
             None
         };
         TranscriptTextExcerpt {
-            text: TranscriptText::new(text),
-            byte_count: ByteCount::new(projected_bytes),
-            truncation,
+            transcript_text: text,
+            byte_count: crate::MeasuredCount::contract_count(projected_bytes),
+            truncation_option: truncation,
         }
     }
 }
@@ -4165,7 +4199,7 @@ impl<'a> Utf8Prefix<'a> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PageRequestValidator {
     request_identifier: RequestIdentifier,
     operation: OperationKind,
@@ -4187,18 +4221,18 @@ impl PageRequestValidator {
 
     pub fn validate(&self, page: &PageRequest) -> OutputOperationResult<()> {
         let factory =
-            OperationRejectedFactory::new(self.request_identifier.clone(), self.operation);
-        if page.limit.into_u64() == 0 {
+            OperationRejectedFactory::new(self.request_identifier.clone(), self.operation.clone());
+        if page.page_limit == 0 {
             return Err(factory.invalid_request());
         }
-        if page.limit.into_u64() > self.maximum_page_items.into_u64() {
+        if page.page_limit > self.maximum_page_items {
             return Err(factory.oversized(None));
         }
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProjectionRequestValidator {
     request_identifier: RequestIdentifier,
     operation: OperationKind,
@@ -4220,12 +4254,12 @@ impl ProjectionRequestValidator {
 
     pub fn validate(&self, projection: &CardProjection) -> OutputOperationResult<()> {
         let factory =
-            OperationRejectedFactory::new(self.request_identifier.clone(), self.operation);
+            OperationRejectedFactory::new(self.request_identifier.clone(), self.operation.clone());
         if let CardProjection::BoundedPreview(bound) = projection {
-            if bound.maximum_bytes.into_u64() == 0 {
+            if bound.maximum_bytes == 0 {
                 return Err(factory.invalid_request());
             }
-            if bound.maximum_bytes.into_u64() > self.maximum_preview_bytes.into_u64() {
+            if bound.maximum_bytes > self.maximum_preview_bytes {
                 return Err(factory.oversized(None));
             }
         }
@@ -4233,7 +4267,7 @@ impl ProjectionRequestValidator {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReadLimitValidator {
     request_identifier: RequestIdentifier,
     operation: OperationKind,
@@ -4255,11 +4289,11 @@ impl ReadLimitValidator {
 
     pub fn validate(&self, requested: ByteLimit) -> OutputOperationResult<()> {
         let factory =
-            OperationRejectedFactory::new(self.request_identifier.clone(), self.operation);
-        if requested.into_u64() == 0 {
+            OperationRejectedFactory::new(self.request_identifier.clone(), self.operation.clone());
+        if requested == 0 {
             return Err(factory.invalid_request());
         }
-        if requested.into_u64() > self.maximum_read_bytes.into_u64() {
+        if requested > self.maximum_read_bytes {
             return Err(factory.oversized(None));
         }
         Ok(())
@@ -4289,7 +4323,7 @@ impl TranscriptBlockRequestValidator {
     ) -> OutputOperationResult<()> {
         PageRequestValidator::new(
             request_identifier.clone(),
-            operation,
+            operation.clone(),
             self.maximum_page_items,
         )
         .validate(page)?;
@@ -4302,7 +4336,7 @@ impl TranscriptBlockRequestValidator {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TranscriptBlockQueryValidator<'a> {
     query: &'a TranscriptBlockTextQuery,
 }
@@ -4312,16 +4346,22 @@ impl<'a> TranscriptBlockQueryValidator<'a> {
         Self { query }
     }
 
+    /// Projects the flat arena the contract carries into the matching engine's
+    /// tree. An index outside the arena, a cycle, or a pathological shape is a
+    /// rejected query, never a panic and never an unbounded walk.
     pub fn validate(
         &self,
         request_identifier: &RequestIdentifier,
         operation: OperationKind,
-    ) -> OutputOperationResult<()> {
+    ) -> OutputOperationResult<Query> {
         let factory = OperationRejectedFactory::new(request_identifier.clone(), operation);
-        if QueryComplexity::new(self.query.as_query()).is_pathological() {
+        let query = ContractQueryProjection::new(self.query)
+            .project()
+            .map_err(|_| factory.invalid_query())?;
+        if QueryComplexity::new(&query).is_pathological() {
             Err(factory.invalid_query())
         } else {
-            Ok(())
+            Ok(query)
         }
     }
 }
@@ -4457,10 +4497,13 @@ impl PaginationQueryShape {
     pub fn subagents(filter: &SubagentListFilter) -> Self {
         Self {
             material: StableSignatureMaterial::new("subagents-query")
-                .field("session_reference", filter.session_reference.as_str())
+                .field(
+                    "session_reference",
+                    filter.fragile_session_reference.as_str(),
+                )
                 .field(
                     "authored_status",
-                    AuthoredStatusFilterSignature::new(&filter.authored_status).material(),
+                    AuthoredStatusFilterSignature::new(&filter.authored_status_filter).material(),
                 )
                 .finish(),
         }
@@ -4475,27 +4518,17 @@ impl PaginationQueryShape {
                 )
                 .field(
                     "session_reference",
-                    OptionalSignatureText::new(
-                        filter
-                            .session_reference
-                            .as_ref()
-                            .map(|reference| reference.as_str()),
-                    )
-                    .material(),
+                    OptionalSignatureText::new(filter.fragile_session_reference_option.as_deref())
+                        .material(),
                 )
                 .field(
                     "subagent_reference",
-                    OptionalSignatureText::new(
-                        filter
-                            .subagent_reference
-                            .as_ref()
-                            .map(|reference| reference.as_str()),
-                    )
-                    .material(),
+                    OptionalSignatureText::new(filter.fragile_subagent_reference_option.as_deref())
+                        .material(),
                 )
                 .field(
                     "authored_status",
-                    AuthoredStatusFilterSignature::new(&filter.authored_status).material(),
+                    AuthoredStatusFilterSignature::new(&filter.authored_status_filter).material(),
                 )
                 .field(
                     "time_window",
@@ -4508,7 +4541,7 @@ impl PaginationQueryShape {
     pub fn segments(filter: &OutputSegmentListFilter) -> Self {
         Self {
             material: StableSignatureMaterial::new("segments-query")
-                .field("output_reference", filter.output_reference.as_str())
+                .field("output_reference", filter.fragile_output_reference.as_str())
                 .finish(),
         }
     }
@@ -4530,7 +4563,7 @@ impl PaginationQueryShape {
     pub fn transcript_block_search(
         filter: &TranscriptBlockFilter,
         lowered_time_window: Option<&TimeWindow>,
-        query: &TranscriptBlockTextQuery,
+        query: &Query,
     ) -> Self {
         Self {
             material: StableSignatureMaterial::new("transcript-block-search-query")
@@ -4538,10 +4571,7 @@ impl PaginationQueryShape {
                     "filter",
                     TranscriptBlockFilterSignature::new(filter, lowered_time_window).material(),
                 )
-                .field(
-                    "text_query",
-                    TextQuerySignature::new(query.as_query()).material(),
-                )
+                .field("text_query", TextQuerySignature::new(query).material())
                 .finish(),
         }
     }
@@ -4551,7 +4581,7 @@ impl PaginationQueryShape {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SourceSelectionSignature<'a> {
     selection: &'a SourceSelection,
 }
@@ -4568,9 +4598,9 @@ impl<'a> SourceSelectionSignature<'a> {
                 .finish(),
             SourceSelection::Only(selected) => {
                 let sources = selected
-                    .sources
+                    .source_kinds
                     .iter()
-                    .map(|source| SourceKindName::new(*source).as_str().to_string())
+                    .map(|source| SourceKindName::new(source.clone()).as_str().to_string())
                     .collect::<BTreeSet<_>>();
                 let mut material = StableSignatureMaterial::new("source-selection")
                     .field("kind", "only")
@@ -4584,7 +4614,7 @@ impl<'a> SourceSelectionSignature<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AuthoredStatusFilterSignature<'a> {
     filter: &'a AuthoredStatusFilter,
 }
@@ -4604,14 +4634,14 @@ impl<'a> AuthoredStatusFilterSignature<'a> {
             AuthoredStatusFilter::OnlyAuthoredStatus(status) => {
                 StableSignatureMaterial::new("authored-status-filter")
                     .field("kind", "only")
-                    .field("status", AuthoredStatusName::new(*status).as_str())
+                    .field("status", AuthoredStatusName::new(status.clone()).as_str())
                     .finish()
             }
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TranscriptBlockFilterSignature<'a> {
     filter: &'a TranscriptBlockFilter,
     lowered_time_window: Option<&'a TimeWindow>,
@@ -4636,31 +4666,26 @@ impl<'a> TranscriptBlockFilterSignature<'a> {
             )
             .field(
                 "session_reference",
-                OptionalSignatureText::new(
-                    self.filter
-                        .session_reference
-                        .as_ref()
-                        .map(|reference| reference.as_str()),
-                )
-                .material(),
+                OptionalSignatureText::new(self.filter.fragile_session_reference_option.as_deref())
+                    .material(),
             )
             .field(
                 "subagent_reference",
                 OptionalSignatureText::new(
-                    self.filter
-                        .subagent_reference
-                        .as_ref()
-                        .map(|reference| reference.as_str()),
+                    self.filter.fragile_subagent_reference_option.as_deref(),
                 )
                 .material(),
             )
             .field(
                 "kind_selection",
-                TranscriptBlockKindSelectionSignature::new(&self.filter.kind_selection).material(),
+                TranscriptBlockKindSelectionSignature::new(
+                    &self.filter.transcript_block_kind_selection,
+                )
+                .material(),
             )
             .field(
                 "authored_status",
-                AuthoredStatusFilterSignature::new(&self.filter.authored_status).material(),
+                AuthoredStatusFilterSignature::new(&self.filter.authored_status_filter).material(),
             )
             .field(
                 "time_window",
@@ -4670,7 +4695,7 @@ impl<'a> TranscriptBlockFilterSignature<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TranscriptBlockKindSelectionSignature<'a> {
     selection: &'a TranscriptBlockKindSelection,
 }
@@ -4689,9 +4714,13 @@ impl<'a> TranscriptBlockKindSelectionSignature<'a> {
             }
             TranscriptBlockKindSelection::OnlyTranscriptBlockKinds(selected) => {
                 let kinds = selected
-                    .kinds
+                    .transcript_block_kinds
                     .iter()
-                    .map(|kind| TranscriptBlockKindName::new(*kind).as_str().to_string())
+                    .map(|kind| {
+                        TranscriptBlockKindName::new(kind.clone())
+                            .as_str()
+                            .to_string()
+                    })
                     .collect::<BTreeSet<_>>();
                 let mut material = StableSignatureMaterial::new("transcript-block-kind-selection")
                     .field("kind", "only")
@@ -4776,7 +4805,7 @@ impl<'a> QueryTermSignature<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OptionalTimeWindowSignature<'a> {
     time_window: Option<&'a TimeWindow>,
 }
@@ -4796,7 +4825,7 @@ impl<'a> OptionalTimeWindowSignature<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TimeWindowSignature<'a> {
     time_window: &'a TimeWindow,
 }
@@ -4810,13 +4839,16 @@ impl<'a> TimeWindowSignature<'a> {
         match self.time_window {
             TimeWindow::Recent(duration) => StableSignatureMaterial::new("time-window")
                 .field("kind", "recent")
-                .field("amount", duration.amount.into_u64().to_string())
-                .field("unit", DurationUnitName::new(duration.unit).as_str())
+                .field("amount", duration.duration_amount.to_string())
+                .field(
+                    "unit",
+                    DurationUnitName::new(duration.duration_unit.clone()).as_str(),
+                )
                 .finish(),
             TimeWindow::Range(range) => StableSignatureMaterial::new("time-window")
                 .field("kind", "range")
-                .field("start", range.start.as_str())
-                .field("end", range.end.as_str())
+                .field("start", range.start_timestamp.as_str())
+                .field("end", range.end_timestamp.as_str())
                 .finish(),
             TimeWindow::Since(timestamp) => StableSignatureMaterial::new("time-window")
                 .field("kind", "since")
@@ -4918,7 +4950,7 @@ impl PaginatedItemReference for IndexedTranscriptBlockSearchMatch {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PaginationCursorBinding {
     collection: PageCollectionKind,
     order: ListingOrder,
@@ -4934,8 +4966,8 @@ impl PaginationCursorBinding {
     ) -> Self {
         Self {
             collection,
-            order: page.order,
-            limit: page.limit,
+            order: page.listing_order.clone(),
+            limit: page.page_limit,
             query,
         }
     }
@@ -4945,8 +4977,8 @@ impl PaginationCursorBinding {
         StableHash::new(
             StableSignatureMaterial::new("v3-page-query")
                 .field("collection", self.collection.as_str())
-                .field("order", ListingOrderName::new(self.order).as_str())
-                .field("limit", self.limit.into_u64().to_string())
+                .field("order", ListingOrderName::new(self.order.clone()).as_str())
+                .field("limit", self.limit.to_string())
                 .field("query", self.query.material())
                 .finish(),
         )
@@ -4980,13 +5012,13 @@ impl<'a> CursorSortTuple<'a> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PaginatedItems<T> {
     items: Vec<T>,
     metadata: PageMetadata,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PaginationWindow<T> {
     request_identifier: RequestIdentifier,
     operation: OperationKind,
@@ -5019,7 +5051,7 @@ impl<T: Clone + PaginatedItemReference> PaginationWindow<T> {
         let snapshot_identity = self.binding.snapshot_identity(items);
         let query_digest = self.binding.query_digest();
         let start = self.cursor_start(items, &snapshot_identity, &query_digest)?;
-        let limit = self.page.limit.into_u64() as usize;
+        let limit = self.page.page_limit as usize;
         // Materialize at most the requested page and one look-ahead candidate. The collection
         // provider is responsible for presenting its own bounded candidate stream.
         let mut page_and_look_ahead = items.iter().skip(start).take(limit + 1);
@@ -5037,8 +5069,8 @@ impl<T: Clone + PaginatedItemReference> PaginationWindow<T> {
                 cursor::V3PageCursor::new(
                     cursor::V3CursorBinding {
                         collection: self.collection,
-                        order: self.page.order,
-                        limit: self.page.limit,
+                        order: self.page.listing_order.clone(),
+                        limit: self.page.page_limit,
                         snapshot_identity,
                         query_digest,
                     },
@@ -5052,13 +5084,13 @@ impl<T: Clone + PaginatedItemReference> PaginationWindow<T> {
         Ok(PaginatedItems {
             items: selected.clone(),
             metadata: PageMetadata {
-                limit: self.page.limit,
-                returned_items: ItemCount::new(selected.len() as u64),
+                page_limit: self.page.page_limit,
+                returned_items: crate::MeasuredCount::contract_count(selected.len() as u64),
                 // A generic filtered page has no manifest aggregate. Callers that own one may
                 // replace this with the exact count without scanning.
                 total_items: None,
-                next_cursor,
-                order: self.page.order,
+                next_page_cursor: next_cursor,
+                listing_order: self.page.listing_order.clone(),
             },
         })
     }
@@ -5069,19 +5101,19 @@ impl<T: Clone + PaginatedItemReference> PaginationWindow<T> {
         snapshot_identity: &str,
         query_digest: &str,
     ) -> OutputOperationResult<usize> {
-        let Some(cursor) = &self.page.cursor else {
+        let Some(cursor) = &self.page.page_cursor else {
             return Ok(0);
         };
         let factory =
-            OperationRejectedFactory::new(self.request_identifier.clone(), self.operation);
+            OperationRejectedFactory::new(self.request_identifier.clone(), self.operation.clone());
         let parsed = cursor::V3PageCursor::parse(
             cursor,
             limits::IndexStoreLimits::default().maximum_cursor_bytes,
         )
         .ok_or_else(|| factory.stale(Some(RejectedFragileReference::PageCursor(cursor.clone()))))?;
         if parsed.collection != self.collection
-            || parsed.order != self.page.order
-            || parsed.limit != self.page.limit
+            || parsed.order != self.page.listing_order
+            || parsed.limit != self.page.page_limit
             || parsed.snapshot_identity != snapshot_identity
             || parsed.query_digest != query_digest
             || parsed.sort_tuple_digest != CursorSortTuple::new(&parsed.last_reference).digest()
@@ -5131,7 +5163,7 @@ impl PageCollectionKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ListingOrderName {
     order: ListingOrder,
 }
@@ -5163,7 +5195,7 @@ impl ListingOrderName {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DurationUnitName {
     unit: DurationUnit,
 }
@@ -5182,7 +5214,7 @@ impl DurationUnitName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexedSessionSorter {
     order: ListingOrder,
 }
@@ -5203,7 +5235,7 @@ impl IndexedSessionSorter {
                     right.chronology_timestamp().cloned(),
                 ),
             };
-            ChronologyOrdering::new(self.order).compare(
+            ChronologyOrdering::new(self.order.clone()).compare(
                 left_timestamp.as_ref(),
                 left.reference.as_str(),
                 right_timestamp.as_ref(),
@@ -5213,7 +5245,7 @@ impl IndexedSessionSorter {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexedSubagentSorter {
     order: ListingOrder,
 }
@@ -5225,7 +5257,7 @@ impl IndexedSubagentSorter {
 
     pub fn sort(&self, subagents: &mut [IndexedSubagent]) {
         subagents.sort_by(|left, right| {
-            ChronologyOrdering::new(self.order).compare(
+            ChronologyOrdering::new(self.order.clone()).compare(
                 left.chronology_timestamp(),
                 left.reference.as_str(),
                 right.chronology_timestamp(),
@@ -5235,7 +5267,7 @@ impl IndexedSubagentSorter {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexedOutputSorter {
     order: ListingOrder,
 }
@@ -5247,7 +5279,7 @@ impl IndexedOutputSorter {
 
     pub fn sort(&self, outputs: &mut [IndexedOutput]) {
         outputs.sort_by(|left, right| {
-            ChronologyOrdering::new(self.order).compare(
+            ChronologyOrdering::new(self.order.clone()).compare(
                 left.chronology_timestamp(),
                 left.reference.as_str(),
                 right.chronology_timestamp(),
@@ -5257,7 +5289,7 @@ impl IndexedOutputSorter {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexedSegmentSorter {
     order: ListingOrder,
 }
@@ -5273,19 +5305,19 @@ impl IndexedSegmentSorter {
                 left.reference.as_str().cmp(right.reference.as_str())
             }
             _ => ProjectionTreeOrdering::segment_index_material(
-                self.order,
-                left.segment_index.into_u64(),
+                self.order.clone(),
+                left.segment_index.try_into().unwrap(),
             )
             .cmp(&ProjectionTreeOrdering::segment_index_material(
-                self.order,
-                right.segment_index.into_u64(),
+                self.order.clone(),
+                right.segment_index.try_into().unwrap(),
             ))
             .then_with(|| left.reference.as_str().cmp(right.reference.as_str())),
         });
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexedTranscriptBlockSorter {
     order: ListingOrder,
 }
@@ -5296,11 +5328,13 @@ impl IndexedTranscriptBlockSorter {
     }
 
     pub fn sort(&self, blocks: &mut [IndexedTranscriptBlock]) {
-        blocks.sort_by(|left, right| TranscriptBlockOrdering::new(self.order).compare(left, right));
+        blocks.sort_by(|left, right| {
+            TranscriptBlockOrdering::new(self.order.clone()).compare(left, right)
+        });
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TranscriptBlockOrdering {
     order: ListingOrder,
 }
@@ -5326,11 +5360,7 @@ impl TranscriptBlockOrdering {
                         .cmp(&right.source_sort_material())
                 })
                 .then_with(|| left.source_line_number.cmp(&right.source_line_number))
-                .then_with(|| {
-                    left.block_index
-                        .into_u64()
-                        .cmp(&right.block_index.into_u64())
-                })
+                .then_with(|| left.block_index.cmp(&right.block_index))
                 .then_with(|| left.reference.as_str().cmp(right.reference.as_str())),
             ListingOrder::NewestFirst | ListingOrder::NewestModifiedFirst => self
                 .compare_newest(left.chronology_timestamp(), right.chronology_timestamp())
@@ -5339,11 +5369,7 @@ impl TranscriptBlockOrdering {
                         .cmp(&right.source_sort_material())
                 })
                 .then_with(|| left.source_line_number.cmp(&right.source_line_number))
-                .then_with(|| {
-                    left.block_index
-                        .into_u64()
-                        .cmp(&right.block_index.into_u64())
-                })
+                .then_with(|| left.block_index.cmp(&right.block_index))
                 .then_with(|| left.reference.as_str().cmp(right.reference.as_str())),
         }
     }
@@ -5357,7 +5383,7 @@ impl TranscriptBlockOrdering {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChronologyOrdering {
     order: ListingOrder,
 }
@@ -5376,10 +5402,10 @@ impl ChronologyOrdering {
     ) -> Ordering {
         match self.order {
             ListingOrder::ReferenceAscending => left_reference.cmp(right_reference),
-            _ => ProjectionTreeOrdering::new(self.order)
+            _ => ProjectionTreeOrdering::new(self.order.clone())
                 .timestamp_key(left_timestamp.map(Timestamp::as_str))
                 .cmp(
-                    &ProjectionTreeOrdering::new(self.order)
+                    &ProjectionTreeOrdering::new(self.order.clone())
                         .timestamp_key(right_timestamp.map(Timestamp::as_str)),
                 )
                 .then_with(|| left_reference.cmp(right_reference)),
@@ -5405,7 +5431,7 @@ impl ChronologyOrdering {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SourceSelectionFilter<'a> {
     selection: &'a SourceSelection,
 }
@@ -5418,12 +5444,12 @@ impl<'a> SourceSelectionFilter<'a> {
     pub fn accepts(&self, source: SourceKind) -> bool {
         match self.selection {
             SourceSelection::AllConfigured => true,
-            SourceSelection::Only(selected) => selected.sources.contains(&source),
+            SourceSelection::Only(selected) => selected.source_kinds.contains(&source),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OptionalTimeWindowFilter<'a> {
     time_window: Option<&'a TimeWindow>,
 }
@@ -5444,7 +5470,7 @@ impl<'a> OptionalTimeWindowFilter<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AuthoredStatusFilterMatcher<'a> {
     filter: &'a AuthoredStatusFilter,
 }
@@ -5479,7 +5505,7 @@ impl<'a> TaskIdentifierFilter<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TranscriptBlockKindSelectionMatcher<'a> {
     selection: &'a TranscriptBlockKindSelection,
 }
@@ -5493,13 +5519,13 @@ impl<'a> TranscriptBlockKindSelectionMatcher<'a> {
         match self.selection {
             TranscriptBlockKindSelection::AllTranscriptBlockKinds => true,
             TranscriptBlockKindSelection::OnlyTranscriptBlockKinds(selected) => {
-                selected.kinds.contains(&kind)
+                selected.transcript_block_kinds.contains(&kind)
             }
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TranscriptBlockFilterMatcher<'a> {
     filter: &'a TranscriptBlockFilter,
     lowered_time_window: Option<&'a TimeWindow>,
@@ -5524,30 +5550,32 @@ impl<'a> TranscriptBlockFilterMatcher<'a> {
             .into_iter()
             .filter(|block| {
                 SourceSelectionFilter::new(&self.filter.source_selection)
-                    .accepts(block.provenance.source)
+                    .accepts(block.provenance.source_kind.clone())
             })
             .filter(|block| {
                 self.filter
-                    .session_reference
+                    .fragile_session_reference_option
                     .as_ref()
                     .is_none_or(|reference| block.session_reference == *reference)
             })
             .filter(|block| {
                 self.filter
-                    .subagent_reference
+                    .fragile_subagent_reference_option
                     .as_ref()
                     .is_none_or(|reference| block.subagent_reference.as_ref() == Some(reference))
             })
             .filter(|block| {
-                TranscriptBlockKindSelectionMatcher::new(&self.filter.kind_selection)
-                    .accepts(block.kind)
+                TranscriptBlockKindSelectionMatcher::new(
+                    &self.filter.transcript_block_kind_selection,
+                )
+                .accepts(block.kind.clone())
             })
             .filter(|block| {
-                AuthoredStatusFilterMatcher::new(&self.filter.authored_status)
-                    .accepts(block.provenance.authored_status)
+                AuthoredStatusFilterMatcher::new(&self.filter.authored_status_filter)
+                    .accepts(block.provenance.authored_status.clone())
             })
             .filter(|block| {
-                TaskIdentifierFilter::new(self.filter.task_identifier.as_ref())
+                TaskIdentifierFilter::new(self.filter.task_identifier_option.as_ref())
                     .accepts(block.task.as_ref())
             })
             .filter(|block| {
@@ -5574,14 +5602,14 @@ impl<'a> TranscriptBlockReferenceFilterResolver<'a> {
         request_identifier: &RequestIdentifier,
         operation: OperationKind,
     ) -> OutputOperationResult<()> {
-        if let Some(reference) = &filter.session_reference {
+        if let Some(reference) = &filter.fragile_session_reference_option {
             ReferenceResolver::new(self.index).resolve_session(
                 reference,
                 request_identifier,
-                operation,
+                operation.clone(),
             )?;
         }
-        if let Some(reference) = &filter.subagent_reference {
+        if let Some(reference) = &filter.fragile_subagent_reference_option {
             ReferenceResolver::new(self.index).resolve_subagent(
                 reference,
                 request_identifier,
@@ -5592,7 +5620,7 @@ impl<'a> TranscriptBlockReferenceFilterResolver<'a> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexedTranscriptBlockSearchMatch {
     block: IndexedTranscriptBlock,
     evidence: TranscriptBlockSearchEvidence,
@@ -5605,15 +5633,15 @@ impl IndexedTranscriptBlockSearchMatch {
 
     pub fn reply_match(&self, projection: &CardProjection) -> TranscriptBlockSearchMatch {
         TranscriptBlockSearchMatch {
-            card: self.block.card(projection),
-            evidence: self.evidence.clone(),
+            transcript_block_card: self.block.card(projection),
+            transcript_block_search_evidence: self.evidence.clone(),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StreamingTranscriptBlockSearch {
-    query: TranscriptBlockTextQuery,
+    query: Query,
     maximum_read_bytes: ByteLimit,
     page_limit: u64,
     candidate_budget: u64,
@@ -5621,7 +5649,7 @@ pub struct StreamingTranscriptBlockSearch {
 
 impl StreamingTranscriptBlockSearch {
     pub fn new(
-        query: TranscriptBlockTextQuery,
+        query: Query,
         maximum_read_bytes: ByteLimit,
         page_limit: u64,
         candidate_budget: u64,
@@ -5653,19 +5681,13 @@ impl StreamingTranscriptBlockSearch {
                 &block,
                 self.maximum_read_bytes,
                 request_identifier,
-                operation,
+                operation.clone(),
             )?;
             let search_text = SearchText::new(text);
-            if let Some(evidence) = self
-                .query
-                .as_query()
-                .find_in(&search_text)
-                .evidence()
-                .cloned()
-            {
+            if let Some(evidence) = self.query.find_in(&search_text).evidence() {
                 matches.push(IndexedTranscriptBlockSearchMatch::new(
                     block,
-                    TranscriptBlockSearchEvidence::new(evidence),
+                    EngineEvidenceProjection::new(evidence).project(),
                 ));
             }
         }
@@ -5695,19 +5717,22 @@ impl OneBackingLineCache {
         if self.path.as_ref() != Some(&block.path) || self.line_number != block.source_line_number {
             // Search has exactly one bounded backing-line buffer.  Do not trust a card's
             // recorded size to widen that buffer after its backing evidence changes.
-            let line_limit = maximum_read_bytes.into_u64().saturating_add(4096).max(4096);
-            let line =
-                BoundedLineReader::new(block.path.clone(), block.source_line_number, line_limit)
-                    .read_line()
-                    .map_err(|failure| {
-                        failure.transcript_block_rejection(&factory, block.reference.clone())
-                    })?;
+            let line_limit = maximum_read_bytes.saturating_add(4096).max(4096);
+            let line = BoundedLineReader::new(
+                block.path.clone(),
+                block.source_line_number,
+                line_limit.try_into().unwrap(),
+            )
+            .read_line()
+            .map_err(|failure| {
+                failure.transcript_block_rejection(&factory, block.reference.clone())
+            })?;
             self.path = Some(block.path.clone());
             self.line_number = block.source_line_number;
             self.line = Some(line);
         }
         let record = TranscriptLineParser::new(
-            block.provenance.source,
+            block.provenance.source_kind.clone(),
             block.provenance.source_identifier.clone(),
             block.path.clone(),
             block.source_line_number,
@@ -5718,7 +5743,9 @@ impl OneBackingLineCache {
         let matching = record
             .transcript_blocks()
             .into_iter()
-            .find(|candidate| candidate.block_index == block.block_index.into_u64())
+            .find(|candidate| {
+                candidate.block_index == crate::MeasuredCount::measured_count(block.block_index)
+            })
             .ok_or_else(|| factory.stale(rejected.clone()))?;
         let text = matching
             .readable_text()
@@ -5754,17 +5781,23 @@ impl SizeAccumulator {
     }
 
     pub fn observe_size(&mut self, size: &SizeMetadata) {
-        self.byte_count += size.byte_count.map_or(0, ByteCount::into_u64);
-        self.line_count += size.line_count.map_or(0, LineCount::into_u64);
-        self.segment_count += size.segment_count.map_or(0, ItemCount::into_u64);
+        self.byte_count += size
+            .byte_count_option
+            .map_or(0, crate::MeasuredCount::measured_count);
+        self.line_count += size
+            .line_count_option
+            .map_or(0, crate::MeasuredCount::measured_count);
+        self.segment_count += size
+            .segment_count
+            .map_or(0, crate::MeasuredCount::measured_count);
     }
 
     pub fn finish(self) -> SizeMetadata {
         SizeMetadata {
-            byte_count: Some(ByteCount::new(self.byte_count)),
-            line_count: Some(LineCount::new(self.line_count)),
-            segment_count: Some(ItemCount::new(self.segment_count)),
-            certainty: SizeCertainty::Exact,
+            byte_count_option: Some(self.byte_count.try_into().unwrap()),
+            line_count_option: Some(self.line_count.try_into().unwrap()),
+            segment_count: Some(self.segment_count.try_into().unwrap()),
+            size_certainty: SizeCertainty::Exact,
         }
     }
 }
@@ -5793,19 +5826,19 @@ impl SizeMetadataFactory {
 
     pub fn exact(&self) -> SizeMetadata {
         SizeMetadata {
-            byte_count: Some(ByteCount::new(self.byte_count)),
-            line_count: Some(LineCount::new(self.line_count)),
-            segment_count: self.segment_count.map(ItemCount::new),
-            certainty: SizeCertainty::Exact,
+            byte_count_option: Some(self.byte_count.try_into().unwrap()),
+            line_count_option: Some(self.line_count.try_into().unwrap()),
+            segment_count: self.segment_count.map(crate::MeasuredCount::contract_count),
+            size_certainty: SizeCertainty::Exact,
         }
     }
 
     pub fn unknown() -> SizeMetadata {
         SizeMetadata {
-            byte_count: None,
-            line_count: None,
+            byte_count_option: None,
+            line_count_option: None,
             segment_count: None,
-            certainty: SizeCertainty::Unknown,
+            size_certainty: SizeCertainty::Unknown,
         }
     }
 }
@@ -5899,7 +5932,7 @@ impl<'a> TimestampOrdering<'a> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OperationRejectedFactory {
     request_identifier: RequestIdentifier,
     operation: OperationKind,
@@ -5920,9 +5953,9 @@ impl OperationRejectedFactory {
     ) -> OperationRejected {
         OperationRejected {
             request_identifier: self.request_identifier.clone(),
-            operation: self.operation,
-            reason,
-            reference,
+            operation_kind: self.operation.clone(),
+            operation_rejection_reason: reason,
+            rejected_fragile_reference_option: reference,
         }
     }
 
@@ -5970,7 +6003,7 @@ impl OperationRejectedFactory {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SourceKindName {
     source: SourceKind,
 }
@@ -6004,7 +6037,7 @@ impl SourceKindName {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TranscriptBlockKindName {
     kind: TranscriptBlockKind,
 }
@@ -6044,7 +6077,7 @@ impl TranscriptBlockKindName {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TranscriptBlockTextAvailabilityName {
     availability: TranscriptBlockTextAvailability,
 }
@@ -6072,7 +6105,7 @@ impl TranscriptBlockTextAvailabilityName {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AuthoredStatusName {
     status: AuthoredStatus,
 }
@@ -6102,7 +6135,7 @@ impl AuthoredStatusName {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SizeCertaintyName {
     certainty: SizeCertainty,
 }
@@ -6130,7 +6163,7 @@ impl SizeCertaintyName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SizeMetadataJson<'a> {
     size: &'a SizeMetadata,
 }

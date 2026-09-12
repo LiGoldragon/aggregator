@@ -10,13 +10,13 @@ use aggregator::{
         store::{ChunkReader, IndexStore},
     },
 };
-use signal_aggregator::{SourceIdentifier, SourceKind};
+use signal_aggregator::SourceKind;
 use tempfile::TempDir;
 
 fn record(line_number: u64) -> TranscriptRecord {
     TranscriptRecord::new(
         SourceKind::Claude,
-        SourceIdentifier::new("claude:fixture"),
+        String::from("claude:fixture"),
         PathBuf::from("/private/fixture/session.jsonl"),
         line_number,
         None,
@@ -26,14 +26,10 @@ fn record(line_number: u64) -> TranscriptRecord {
 
 #[test]
 fn source_occurrence_prevents_cross_root_or_duplicate_configuration_merges() {
-    let source = SourceIdentifier::new("claude:same-root");
+    let source = String::from("claude:same-root");
     let first = SourceKey::new(SourceKind::Claude, source.clone(), 0);
     let second = SourceKey::new(SourceKind::Claude, source, 1);
-    let other_root = SourceKey::new(
-        SourceKind::Claude,
-        SourceIdentifier::new("claude:other-root"),
-        0,
-    );
+    let other_root = SourceKey::new(SourceKind::Claude, String::from("claude:other-root"), 0);
 
     assert_ne!(first, second);
     assert_ne!(first.signature(), second.signature());
@@ -70,11 +66,7 @@ fn build_corpus(records: u64) -> aggregator::output_index::instrumentation::Inde
     let store = IndexStore::new(root.path().join("store.output-index.json"), tiny_limits());
     let staging = store.create_staging("builder-test").expect("staging");
     let meter = IndexResourceMeter::default();
-    let source_key = SourceKey::new(
-        SourceKind::Claude,
-        SourceIdentifier::new("claude:fixture"),
-        0,
-    );
+    let source_key = SourceKey::new(SourceKind::Claude, String::from("claude:fixture"), 0);
     let mut builder =
         BoundedGenerationBuilder::new(staging, source_key, tiny_limits(), meter.clone());
 
@@ -95,11 +87,7 @@ fn builder_emits_every_projection_kind_and_scalar_reference_edges() {
     let root = TempDir::new().expect("temporary index root");
     let store = IndexStore::new(root.path().join("store.output-index.json"), tiny_limits());
     let staging = store.create_staging("typed-projection").expect("staging");
-    let source_key = SourceKey::new(
-        SourceKind::Claude,
-        SourceIdentifier::new("claude:fixture"),
-        0,
-    );
+    let source_key = SourceKey::new(SourceKind::Claude, String::from("claude:fixture"), 0);
     let mut builder = BoundedGenerationBuilder::new(
         staging.clone(),
         source_key,
@@ -108,11 +96,11 @@ fn builder_emits_every_projection_kind_and_scalar_reference_edges() {
     );
     for line_number in 1..=4 {
         let record = record(line_number)
-            .with_subagent_name(Some(signal_aggregator::SubagentName::new("worker")))
+            .with_subagent_name(Some(String::from("worker")))
             .with_blocks(vec![
                 aggregator::adapter::TranscriptBlockSourceContext::new(
                     SourceKind::Claude,
-                    SourceIdentifier::new("claude:fixture"),
+                    String::from("claude:fixture"),
                     PathBuf::from("/private/fixture/session.jsonl"),
                     line_number,
                     None,

@@ -4,7 +4,7 @@
 //! never owns a session's children: downstream reducers join by `SourceKey` and scalar keys.
 
 use signal_aggregator::{
-    AuthoredStatus, ByteLimit, ListingOrder, SourceIdentifier, SourceKind, TranscriptBlockKind,
+    AuthoredStatus, ListingOrder, SourceIdentifier, SourceKind, TranscriptBlockKind,
     TranscriptBlockTextAvailability,
 };
 
@@ -117,7 +117,7 @@ pub struct SourceGenerationRun {
 }
 
 /// The immutable publication result contains only scalar source facts and opaque chunk locators.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BoundedGenerationPublication {
     /// The pointer is absent when an incomplete first scan has no last-complete v3 truth.
     pub pointer: Option<CurrentPointer>,
@@ -305,11 +305,7 @@ impl BoundedIndexRefresher {
     }
 
     fn source_identifier(&self, source: &TranscriptAdapterConfiguration) -> SourceIdentifier {
-        SourceIdentifier::new(format!(
-            "{:?}:{}",
-            source.kind(),
-            source.root().path().display()
-        ))
+        format!("{:?}:{}", source.kind(), source.root().path().display())
     }
 
     fn configuration_signature(&self, source: &TranscriptAdapterConfiguration) -> [u8; 32] {
@@ -482,7 +478,7 @@ impl BoundedGenerationBuilder {
             || {
                 format!(
                     "{}|{}|{}|{}",
-                    SourceKindName::new(record.source).as_str(),
+                    SourceKindName::new(record.source.clone()).as_str(),
                     record.source_identifier.as_str(),
                     record.path.display(),
                     fingerprint.material(),
@@ -493,25 +489,21 @@ impl BoundedGenerationBuilder {
                     .scoped_reference_material("producer-session", identifier.as_str())
             },
         );
-        let session_reference = FragileSessionReference::new(
-            StableReference::new("session", session_material).as_string(),
-        );
+        let session_reference = StableReference::new("session", session_material).as_string();
         let subagent_reference = record.subagent_name.as_ref().map(|name| {
-            FragileSubagentReference::new(
-                StableReference::new(
-                    "subagent",
-                    format!("{}|{}", session_reference.as_str(), name.as_str()),
-                )
-                .as_string(),
+            StableReference::new(
+                "subagent",
+                format!("{}|{}", session_reference.as_str(), name.as_str()),
             )
+            .as_string()
         });
-        let preview_limit = ByteLimit::new(self.limits.maximum_string_bytes);
+        let preview_limit = self.limits.maximum_string_bytes;
         let output = IndexedOutput::from_record(
             record.clone(),
             session_reference.clone(),
             subagent_reference.clone(),
             fingerprint.clone(),
-            preview_limit,
+            preview_limit.try_into().unwrap(),
         );
         self.write_projection(ProjectionRecordDto::Output(self.output_dto(&output)))?;
         self.write_projection(ProjectionRecordDto::Segment(
@@ -519,20 +511,18 @@ impl BoundedGenerationBuilder {
         ))?;
         for block in record.transcript_blocks() {
             let block_subagent = block.subagent_name.as_ref().map(|name| {
-                FragileSubagentReference::new(
-                    StableReference::new(
-                        "subagent",
-                        format!("{}|{}", session_reference.as_str(), name.as_str()),
-                    )
-                    .as_string(),
+                StableReference::new(
+                    "subagent",
+                    format!("{}|{}", session_reference.as_str(), name.as_str()),
                 )
+                .as_string()
             });
             let indexed = IndexedTranscriptBlock::from_record(
                 block,
                 session_reference.clone(),
                 block_subagent,
                 fingerprint.clone(),
-                preview_limit,
+                preview_limit.try_into().unwrap(),
             );
             self.write_projection(ProjectionRecordDto::TranscriptBlock(
                 self.block_dto(&indexed),
@@ -540,7 +530,7 @@ impl BoundedGenerationBuilder {
         }
         self.write_projection(ProjectionRecordDto::Session(ProjectionSessionDto {
             reference: session_reference.as_str().to_owned(),
-            source: SourceKindCode::new(record.source).code(),
+            source: SourceKindCode::new(record.source.clone()).code(),
             source_identifier: record.source_identifier.as_str().to_owned(),
             path: DiskPath::new(
                 record.path.as_os_str().as_encoded_bytes().to_vec(),
@@ -574,7 +564,7 @@ impl BoundedGenerationBuilder {
                     .to_owned(),
                 session_reference: session_reference.as_str().to_owned(),
                 name: name.as_str().to_owned(),
-                authored_status: AuthoredStatusCode::new(record.authored_status).code(),
+                authored_status: AuthoredStatusCode::new(record.authored_status.clone()).code(),
                 task: record.task_metadata.as_ref().map(|task| ProjectionTaskDto {
                     task_identifier: task.task_identifier.as_str().to_owned(),
                 }),
@@ -718,9 +708,10 @@ impl BoundedGenerationBuilder {
             task: output.task.as_ref().map(|task| ProjectionTaskDto {
                 task_identifier: task.task_identifier.as_str().to_owned(),
             }),
-            source: SourceKindCode::new(output.provenance.source).code(),
+            source: SourceKindCode::new(output.provenance.source_kind.clone()).code(),
             source_identifier: output.provenance.source_identifier.as_str().to_owned(),
-            authored_status: AuthoredStatusCode::new(output.provenance.authored_status).code(),
+            authored_status: AuthoredStatusCode::new(output.provenance.authored_status.clone())
+                .code(),
             produced_at: output
                 .provenance
                 .produced_at
@@ -733,12 +724,18 @@ impl BoundedGenerationBuilder {
             source_line_number: output.source_line_number,
             text_hash: output.text_hash.clone(),
             size: self.size_dto(
-                output.size.byte_count.map_or(0, |count| count.into_u64()),
-                output.size.line_count.map_or(0, |count| count.into_u64()),
+                output
+                    .size
+                    .byte_count_option
+                    .map_or(0, |count| count.try_into().unwrap()),
+                output
+                    .size
+                    .line_count_option
+                    .map_or(0, |count| count.try_into().unwrap()),
                 output
                     .size
                     .segment_count
-                    .map_or(0, |count| count.into_u64()),
+                    .map_or(0, |count| count.try_into().unwrap()),
                 1,
             ),
             preview_text: output.preview_text.clone(),
@@ -750,27 +747,37 @@ impl BoundedGenerationBuilder {
         ProjectionSegmentDto {
             reference: segment.reference.as_str().to_owned(),
             output_reference: segment.output_reference.as_str().to_owned(),
-            segment_index: segment.segment_index.into_u64(),
-            byte_range: segment
-                .byte_range
-                .as_ref()
-                .map(|range| (range.start.into_u64(), range.end.into_u64())),
-            line_range: segment
-                .line_range
-                .as_ref()
-                .map(|range| (range.start.into_u64(), range.end.into_u64())),
+            segment_index: crate::MeasuredCount::measured_count(segment.segment_index),
+            byte_range: segment.byte_range.as_ref().map(|range| {
+                (
+                    crate::MeasuredCount::measured_count(range.start_byte_count),
+                    crate::MeasuredCount::measured_count(range.end_byte_count),
+                )
+            }),
+            line_range: segment.line_range.as_ref().map(|range| {
+                (
+                    crate::MeasuredCount::measured_count(range.start_line_number),
+                    crate::MeasuredCount::measured_count(range.end_line_number),
+                )
+            }),
             size: self.size_dto(
-                segment.size.byte_count.map_or(0, |count| count.into_u64()),
-                segment.size.line_count.map_or(0, |count| count.into_u64()),
+                segment
+                    .size
+                    .byte_count_option
+                    .map_or(0, |count| count.try_into().unwrap()),
+                segment
+                    .size
+                    .line_count_option
+                    .map_or(0, |count| count.try_into().unwrap()),
                 segment
                     .size
                     .segment_count
-                    .map_or(0, |count| count.into_u64()),
+                    .map_or(0, |count| count.try_into().unwrap()),
                 1,
             ),
             preview_text: segment.preview_text.clone(),
             preview_original_bytes: segment.preview_original_bytes,
-            source: SourceKindCode::new(segment.source).code(),
+            source: SourceKindCode::new(segment.source.clone()).code(),
             path: self.disk_path(&segment.path),
         }
     }
@@ -783,14 +790,15 @@ impl BoundedGenerationBuilder {
                 .subagent_reference
                 .as_ref()
                 .map(|reference| reference.as_str().to_owned()),
-            kind: TranscriptBlockKindCode::new(block.kind).code(),
-            block_index: block.block_index.into_u64(),
+            kind: TranscriptBlockKindCode::new(block.kind.clone()).code(),
+            block_index: crate::MeasuredCount::measured_count(block.block_index),
             task: block.task.as_ref().map(|task| ProjectionTaskDto {
                 task_identifier: task.task_identifier.as_str().to_owned(),
             }),
-            source: SourceKindCode::new(block.provenance.source).code(),
+            source: SourceKindCode::new(block.provenance.source_kind.clone()).code(),
             source_identifier: block.provenance.source_identifier.as_str().to_owned(),
-            authored_status: AuthoredStatusCode::new(block.provenance.authored_status).code(),
+            authored_status: AuthoredStatusCode::new(block.provenance.authored_status.clone())
+                .code(),
             observed_at: block
                 .provenance
                 .observed_at
@@ -803,13 +811,24 @@ impl BoundedGenerationBuilder {
             source_line_number: block.source_line_number,
             text_hash: block.text_hash.clone(),
             size: self.size_dto(
-                block.size.byte_count.map_or(0, |count| count.into_u64()),
-                block.size.line_count.map_or(0, |count| count.into_u64()),
-                block.size.segment_count.map_or(0, |count| count.into_u64()),
+                block
+                    .size
+                    .byte_count_option
+                    .map_or(0, |count| count.try_into().unwrap()),
+                block
+                    .size
+                    .line_count_option
+                    .map_or(0, |count| count.try_into().unwrap()),
+                block
+                    .size
+                    .segment_count
+                    .map_or(0, |count| count.try_into().unwrap()),
                 1,
             ),
-            text_availability: TranscriptBlockTextAvailabilityCode::new(block.text_availability)
-                .code(),
+            text_availability: TranscriptBlockTextAvailabilityCode::new(
+                block.text_availability.clone(),
+            )
+            .code(),
             preview_text: block.preview_text.clone(),
             preview_original_bytes: block.preview_original_bytes,
         }
@@ -852,7 +871,7 @@ impl TranscriptRecordSink for BoundedGenerationBuilder {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SourceKindCode {
     source: SourceKind,
 }
@@ -872,7 +891,7 @@ impl SourceKindCode {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct AuthoredStatusCode {
     status: AuthoredStatus,
 }
@@ -890,7 +909,7 @@ impl AuthoredStatusCode {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct TranscriptBlockKindCode {
     kind: TranscriptBlockKind,
 }
@@ -913,7 +932,7 @@ impl TranscriptBlockKindCode {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct TranscriptBlockTextAvailabilityCode {
     availability: TranscriptBlockTextAvailability,
 }
@@ -2003,7 +2022,7 @@ impl IndexManifestRecord {
 mod persistent_tree_tests {
     use std::{fs, path::PathBuf};
 
-    use signal_aggregator::{SourceIdentifier, SourceKind, SubagentName, TranscriptBlockKind};
+    use signal_aggregator::{SourceKind, TranscriptBlockKind};
     use tempfile::TempDir;
 
     use super::*;
@@ -2029,24 +2048,20 @@ mod persistent_tree_tests {
         let path = PathBuf::from("/synthetic/persistent-tree.jsonl");
         TranscriptRecord::new(
             SourceKind::Claude,
-            SourceIdentifier::new("claude:persistent-tree"),
+            String::from("claude:persistent-tree"),
             path.clone(),
             line_number,
-            Some(signal_aggregator::Timestamp::new(format!(
-                "2026-01-01T00:00:{line_number:02}Z"
-            ))),
+            Some(format!("2026-01-01T00:00:{line_number:02}Z")),
             format!("synthetic bounded record {line_number}"),
         )
-        .with_subagent_name(Some(SubagentName::new("worker")))
+        .with_subagent_name(Some(String::from("worker")))
         .with_blocks(vec![
             crate::adapter::TranscriptBlockSourceContext::new(
                 SourceKind::Claude,
-                SourceIdentifier::new("claude:persistent-tree"),
+                String::from("claude:persistent-tree"),
                 path,
                 line_number,
-                Some(signal_aggregator::Timestamp::new(format!(
-                    "2026-01-01T00:00:{line_number:02}Z"
-                ))),
+                Some(format!("2026-01-01T00:00:{line_number:02}Z")),
             )
             .readable_block(
                 0,
@@ -2073,7 +2088,7 @@ mod persistent_tree_tests {
             staging.clone(),
             SourceKey::new(
                 SourceKind::Claude,
-                SourceIdentifier::new("claude:persistent-tree"),
+                String::from("claude:persistent-tree"),
                 0,
             ),
             limits(),
@@ -2256,16 +2271,8 @@ mod persistent_tree_tests {
 
     #[test]
     fn relationship_keys_group_parents_and_preserve_configured_source_isolation() {
-        let first_source = SourceKey::new(
-            SourceKind::Claude,
-            SourceIdentifier::new("claude:shared"),
-            0,
-        );
-        let second_source = SourceKey::new(
-            SourceKind::Claude,
-            SourceIdentifier::new("claude:shared"),
-            1,
-        );
+        let first_source = SourceKey::new(SourceKind::Claude, String::from("claude:shared"), 0);
+        let second_source = SourceKey::new(SourceKind::Claude, String::from("claude:shared"), 1);
         let first_session = StableReference::new(
             "session",
             first_source.scoped_reference_material("producer-session", "same"),

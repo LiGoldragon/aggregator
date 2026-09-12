@@ -21,9 +21,7 @@ impl CollectionClock {
 
     pub fn from_environment() -> Result<Self> {
         match std::env::var("AGGREGATOR_REFERENCE_TIMESTAMP") {
-            Ok(value) => Ok(Self::fixed(ReferenceTime::from_timestamp(Timestamp::new(
-                value,
-            ))?)),
+            Ok(value) => Ok(Self::fixed(ReferenceTime::from_timestamp(value)?)),
             Err(std::env::VarError::NotPresent) => Ok(Self::system()),
             Err(error) => Err(Error::argument(format!(
                 "AGGREGATOR_REFERENCE_TIMESTAMP is not readable: {error}"
@@ -65,11 +63,9 @@ impl ReferenceTime {
     }
 
     pub fn timestamp(&self) -> Timestamp {
-        Timestamp::new(
-            self.instant
-                .format(&Rfc3339)
-                .expect("RFC3339 formatting for OffsetDateTime should be infallible"),
-        )
+        self.instant
+            .format(&Rfc3339)
+            .expect("RFC3339 formatting for OffsetDateTime should be infallible")
     }
 
     pub fn lower(&self, time_window: &TimeWindow) -> Result<TimeWindow> {
@@ -81,7 +77,7 @@ impl ReferenceTime {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RelativeTimeWindow {
     duration: RelativeDuration,
 }
@@ -95,10 +91,10 @@ impl RelativeTimeWindow {
         let absolute_duration = AbsoluteDuration::from_relative(&self.duration)?;
         let start = reference_time.instant - absolute_duration.duration;
         Ok(TimeWindow::Range(TimeRange {
-            start: Timestamp::new(start.format(&Rfc3339).map_err(|error| Error::Clock {
+            start_timestamp: start.format(&Rfc3339).map_err(|error| Error::Clock {
                 detail: format!("failed to format lowered start timestamp: {error}"),
-            })?),
-            end: reference_time.timestamp(),
+            })?,
+            end_timestamp: reference_time.timestamp(),
         }))
     }
 }
@@ -110,11 +106,8 @@ pub struct AbsoluteDuration {
 
 impl AbsoluteDuration {
     pub fn from_relative(duration: &RelativeDuration) -> Result<Self> {
-        let amount = duration.amount.into_u64();
-        let amount = i64::try_from(amount).map_err(|_| Error::Clock {
-            detail: "relative duration amount is too large".to_string(),
-        })?;
-        let duration = match duration.unit {
+        let amount = duration.duration_amount;
+        let duration = match duration.duration_unit {
             signal_aggregator::DurationUnit::Minutes => Duration::minutes(amount),
             signal_aggregator::DurationUnit::Hours => Duration::hours(amount),
             signal_aggregator::DurationUnit::Days => Duration::days(amount),

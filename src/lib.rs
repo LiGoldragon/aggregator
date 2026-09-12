@@ -8,6 +8,7 @@ pub mod archive;
 pub mod client;
 pub mod clock;
 pub mod configuration;
+pub mod counting;
 pub mod daemon;
 pub mod derived_paths;
 pub mod error;
@@ -16,7 +17,9 @@ pub mod nexus;
 pub mod output_index;
 pub mod sema;
 pub mod signal;
+pub mod text_query;
 pub mod time_model;
+pub mod wire;
 
 pub use adapter::AdapterKind;
 pub use archive::SessionArchiveStore;
@@ -30,6 +33,7 @@ pub use configuration::{
     RuntimeOutputInterfaceConfiguration, RuntimeSourceSelection, RuntimeStorePath,
     TranscriptAdapterConfiguration, TranscriptRootConfiguration,
 };
+pub use counting::MeasuredCount;
 pub use daemon::AggregatorDaemonCommand;
 pub use derived_paths::{
     ClaudeNativeSubagentOutputRoot, ClaudeProjectPathComponent, ClaudeProjectTranscriptRoot,
@@ -43,3 +47,7 @@ pub use output_index::OutputInterfaceRuntime;
 pub use output_index::store::IndexStore;
 pub use sema::SemaPlane;
 pub use signal::SignalPlane;
+pub use text_query::{
+    ContractEvidenceProjection, ContractQueryProjection, EngineEvidenceProjection,
+    EngineQueryProjection, TextQueryProjectionFault,
+};
