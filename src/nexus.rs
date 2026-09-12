@@ -389,7 +389,7 @@ impl<'a> EvidencePackageBuilder<'a> {
             transcript_segments: self.transcript_segments,
             repository_changes: self.repository_changes,
             truncations: self.truncations,
-            read_failures: self.read_failures,
+            read_failure_records: self.read_failures,
         }
     }
 }

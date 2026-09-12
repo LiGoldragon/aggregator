@@ -774,7 +774,7 @@ fn transcript_discovery_file_limit_is_configurable_and_reported() {
     .read_records();
     assert_eq!(limited.discovered_files, 2);
     assert!(limited.scan_limits.iter().any(|limit| {
-        matches!(limit.scan_limit_kind, ScanLimitKind::DiscoveredFiles(_)) && limit.scan_limit == 2
+        matches!(limit.scan_limit_kind, ScanLimitKind::DiscoveredFiles) && limit.scan_limit == 2
     }));
 
     let raised = ClaudeJsonlRootReader::with_limits(
@@ -1072,7 +1072,7 @@ fn nexus_lowers_recent_window_before_transcript_adapters() {
     );
     assert!(
         !package
-            .read_failures
+            .read_failure_records
             .iter()
             .any(|failure| failure.read_failure_reason == ReadFailureReason::UnsupportedFormat)
     );
@@ -1996,7 +1996,7 @@ fn daemon_cli_boundary_handles_collect_version_and_meta_configuration() {
     );
     assert!(
         !package
-            .read_failures
+            .read_failure_records
             .iter()
             .any(|failure| failure.read_failure_reason == ReadFailureReason::UnsupportedFormat)
     );
@@ -2258,9 +2258,9 @@ fn codex_health_observation_reports_configured_discovery_limit() {
         health.source_health_status,
         SourceHealthStatus::DiscoveryTruncated
     );
-    assert_eq!(health.discovered_files, 1);
+    assert_eq!(health.discovered_file_count, 1);
     assert!(health.scan_limits.iter().any(|limit| {
-        matches!(limit.scan_limit_kind, ScanLimitKind::DiscoveredFiles(_)) && limit.scan_limit == 1
+        matches!(limit.scan_limit_kind, ScanLimitKind::DiscoveredFiles) && limit.scan_limit == 1
     }));
 }
 
@@ -2292,9 +2292,9 @@ fn codex_health_observation_reports_configured_index_discovery_limit() {
         health.source_health_status,
         SourceHealthStatus::DiscoveryTruncated
     );
-    assert_eq!(health.discovered_files, 1);
+    assert_eq!(health.discovered_file_count, 1);
     assert!(health.scan_limits.iter().any(|limit| {
-        matches!(limit.scan_limit_kind, ScanLimitKind::DiscoveredFiles(_)) && limit.scan_limit == 1
+        matches!(limit.scan_limit_kind, ScanLimitKind::DiscoveredFiles) && limit.scan_limit == 1
     }));
 }
 
@@ -2545,9 +2545,9 @@ fn pi_health_observation_reports_configured_discovery_limit() {
         health.source_health_status,
         SourceHealthStatus::DiscoveryTruncated
     );
-    assert_eq!(health.discovered_files, 1);
+    assert_eq!(health.discovered_file_count, 1);
     assert!(health.scan_limits.iter().any(|limit| {
-        matches!(limit.scan_limit_kind, ScanLimitKind::DiscoveredFiles(_)) && limit.scan_limit == 1
+        matches!(limit.scan_limit_kind, ScanLimitKind::DiscoveredFiles) && limit.scan_limit == 1
     }));
 }
 
@@ -2646,10 +2646,9 @@ fn session_inventory_reports_configured_indexed_codex_and_pi_discovery_limits() 
             report.session_inventory_completeness,
             SessionInventoryCompleteness::Truncated
         );
-        assert_eq!(report.discovered_files, 1);
+        assert_eq!(report.discovered_file_count, 1);
         assert!(report.scan_limits.iter().any(|limit| {
-            matches!(limit.scan_limit_kind, ScanLimitKind::DiscoveredFiles(_))
-                && limit.scan_limit == 1
+            matches!(limit.scan_limit_kind, ScanLimitKind::DiscoveredFiles) && limit.scan_limit == 1
         }));
     }
 }
@@ -3754,9 +3753,9 @@ fn health_distinguishes_empty_and_malformed_fixture_roots() {
     assert!(health.source_health_cards.iter().any(|source| {
         matches!(
             source.source_health_status,
-            SourceHealthStatus::MalformedRecords(_)
-        ) && source.discovered_files == 1
-            && source.malformed_records > 0
+            SourceHealthStatus::MalformedRecords
+        ) && source.discovered_file_count == 1
+            && source.malformed_record_count > 0
     }));
 
     let inventory = nexus
@@ -3779,7 +3778,7 @@ fn health_distinguishes_empty_and_malformed_fixture_roots() {
             .iter()
             .any(|source| {
                 source.session_inventory_completeness == SessionInventoryCompleteness::Resumable
-                    && source.discovered_files == 1
+                    && source.discovered_file_count == 1
             })
     );
 }

@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "aggregator"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "blake3",
  "datom-codec",
@@ -287,8 +287,8 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "meta-signal-aggregator"
-version = "0.5.0"
-source = "git+https://github.com/LiGoldragon/meta-signal-aggregator?rev=028979475775cc4d24357e93c853d1ea27dd5113#028979475775cc4d24357e93c853d1ea27dd5113"
+version = "0.6.0"
+source = "git+https://github.com/LiGoldragon/meta-signal-aggregator?rev=55ac16ac2fc5a18ba083e02168199421023e9771#55ac16ac2fc5a18ba083e02168199421023e9771"
 dependencies = [
  "datom-codec",
  "ethos-zero",
@@ -531,8 +531,8 @@ dependencies = [
 
 [[package]]
 name = "signal-aggregator"
-version = "0.7.0"
-source = "git+https://github.com/LiGoldragon/signal-aggregator?rev=234ed6420867b431323603f78f984c0fe997a7f3#234ed6420867b431323603f78f984c0fe997a7f3"
+version = "0.8.0"
+source = "git+https://github.com/LiGoldragon/signal-aggregator?rev=e5009d65527a5ac9658fb85f03685e26c78ec85c#e5009d65527a5ac9658fb85f03685e26c78ec85c"
 dependencies = [
  "datom-codec",
  "ethos-zero",

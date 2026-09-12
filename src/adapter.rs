@@ -1870,9 +1870,7 @@ impl TranscriptDiscoveryState {
                     Some(path),
                     None,
                     0,
-                    ScanLimitKind::DiscoveredFiles(crate::MeasuredCount::contract_count(
-                        self.limits.maximum_discovered_files(),
-                    )),
+                    ScanLimitKind::DiscoveredFiles,
                     self.limits.maximum_discovered_files(),
                 ));
                 self.file_limit_reported = true;
@@ -2140,7 +2138,7 @@ impl TranscriptFailureAccumulator {
                 self.limit_path,
                 None,
                 0,
-                ScanLimitKind::ReadFailures(Vec::new()),
+                ScanLimitKind::ReadFailures,
                 self.limit,
             ))
         } else {

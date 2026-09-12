@@ -2509,10 +2509,7 @@ impl SourceHealthObserver {
         } else if !outcome.truncations.is_empty() {
             SourceHealthStatus::DiscoveryTruncated
         } else if malformed > 0 {
-            // The declared contract names this variant bare; its generated form
-            // carries the malformed count, because a declared type shares the
-            // name. The count is the one this scan observed.
-            SourceHealthStatus::MalformedRecords(crate::MeasuredCount::contract_count(malformed))
+            SourceHealthStatus::MalformedRecords
         } else if outcome.record_count == 0 {
             SourceHealthStatus::ReadableEmpty
         } else {
@@ -2527,9 +2524,9 @@ impl SourceHealthObserver {
             },
             source_health_status: status,
             scan_limits: outcome.scan_limits.clone(),
-            discovered_files: crate::MeasuredCount::contract_count(outcome.discovered_files),
+            discovered_file_count: crate::MeasuredCount::contract_count(outcome.discovered_files),
             indexed_records: crate::MeasuredCount::contract_count(outcome.record_count),
-            malformed_records: crate::MeasuredCount::contract_count(malformed),
+            malformed_record_count: crate::MeasuredCount::contract_count(malformed),
             unreadable_records: crate::MeasuredCount::contract_count(unreadable),
         }
     }
@@ -2652,9 +2649,9 @@ impl SessionInventoryBuilder {
                 },
                 source_health_status: SourceHealthStatus::IndexStoreUnreadable,
                 scan_limits: Vec::new(),
-                discovered_files: 0,
+                discovered_file_count: 0,
                 indexed_records: 0,
-                malformed_records: 0,
+                malformed_record_count: 0,
                 unreadable_records: 0,
             });
         let sessions = self
@@ -2694,7 +2691,7 @@ impl SessionInventoryBuilder {
             )
             .completeness(),
             scan_limits: health.scan_limits,
-            discovered_files: health.discovered_files,
+            discovered_file_count: health.discovered_file_count,
             indexed_sessions: crate::MeasuredCount::contract_count(sessions.len() as u64),
             byte_count: crate::MeasuredCount::contract_count(byte_count),
             earliest_modified_at: earliest,
@@ -2774,7 +2771,7 @@ impl SourceHealthCompleteness {
             SourceHealthStatus::UnreadableRoot | SourceHealthStatus::IndexStoreUnreadable => {
                 SessionInventoryCompleteness::Failed
             }
-            SourceHealthStatus::MalformedRecords(_) => SessionInventoryCompleteness::Resumable,
+            SourceHealthStatus::MalformedRecords => SessionInventoryCompleteness::Resumable,
             SourceHealthStatus::ReadableEmpty | SourceHealthStatus::ReadableIndexed => {
                 SessionInventoryCompleteness::Complete
             }
@@ -2795,7 +2792,7 @@ impl SourceCompletenessStatus {
     pub fn status(self) -> SourceHealthStatus {
         match self.completeness {
             SessionInventoryCompleteness::Complete => SourceHealthStatus::ReadableIndexed,
-            SessionInventoryCompleteness::Resumable => SourceHealthStatus::MalformedRecords(0),
+            SessionInventoryCompleteness::Resumable => SourceHealthStatus::MalformedRecords,
             SessionInventoryCompleteness::Truncated => SourceHealthStatus::DiscoveryTruncated,
             SessionInventoryCompleteness::Failed => SourceHealthStatus::UnreadableRoot,
         }
