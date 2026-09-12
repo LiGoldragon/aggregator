@@ -12,7 +12,7 @@ use std::{
     path::PathBuf,
 };
 
-use datom_codec::{Actualizing, Budget, Compositional, Datom, Datomizable, Potential};
+use datom_codec::{Actualizing, Budget, Composing, Datom, Datomizable, Potential};
 use protos::{Protosizable, ReaderBudget, Textualizable};
 use signal::{
     ByteViewable, FrameCapacity, FrameReading, FrameWriting, Restorable, Signal, Signalizable,
@@ -39,7 +39,7 @@ pub struct DatomText;
 
 impl DatomText {
     /// Reads one contract value from Datom text.
-    pub fn read<T: Compositional>(context: &'static str, text: &str) -> Result<T> {
+    pub fn read<T: Composing>(context: &'static str, text: &str) -> Result<T> {
         Potential::<T>::from(text)
             .actualize(&mut Self::budget())
             .map_err(|fault| Error::datom(context, format!("{fault:?}")))

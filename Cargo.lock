@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "aggregator"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "blake3",
  "datom-codec",
@@ -115,8 +115,8 @@ dependencies = [
 
 [[package]]
 name = "datom-codec"
-version = "0.26.3"
-source = "git+https://github.com/LiGoldragon/datom-codec?rev=627db67f2655efd9f786864009955005fd8ab2ad#627db67f2655efd9f786864009955005fd8ab2ad"
+version = "0.27.0"
+source = "git+https://github.com/LiGoldragon/datom-codec?rev=6dccc76b75918a91d3370a9d4fe88aa7dd567876#6dccc76b75918a91d3370a9d4fe88aa7dd567876"
 dependencies = [
  "datom-codec-derive",
  "protos",
@@ -124,8 +124,8 @@ dependencies = [
 
 [[package]]
 name = "datom-codec-derive"
-version = "0.26.0"
-source = "git+https://github.com/LiGoldragon/datom-codec?rev=627db67f2655efd9f786864009955005fd8ab2ad#627db67f2655efd9f786864009955005fd8ab2ad"
+version = "0.27.0"
+source = "git+https://github.com/LiGoldragon/datom-codec?rev=6dccc76b75918a91d3370a9d4fe88aa7dd567876#6dccc76b75918a91d3370a9d4fe88aa7dd567876"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -165,8 +165,8 @@ dependencies = [
 
 [[package]]
 name = "ethos-zero"
-version = "8.0.1"
-source = "git+https://github.com/LiGoldragon/ethos-zero?rev=de3d9928b156f2e1a92d060b7817af201abfdbef#de3d9928b156f2e1a92d060b7817af201abfdbef"
+version = "9.0.0"
+source = "git+https://github.com/LiGoldragon/ethos-zero?rev=b232d35e03011161fe7ec9129ad99a9914413348#b232d35e03011161fe7ec9129ad99a9914413348"
 dependencies = [
  "datom-codec",
  "prettyplease",
@@ -287,8 +287,8 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "meta-signal-aggregator"
-version = "0.6.0"
-source = "git+https://github.com/LiGoldragon/meta-signal-aggregator?rev=55ac16ac2fc5a18ba083e02168199421023e9771#55ac16ac2fc5a18ba083e02168199421023e9771"
+version = "0.7.0"
+source = "git+https://github.com/LiGoldragon/meta-signal-aggregator?rev=5baab6475ff70f555f514e69f2e671cd54d6e636#5baab6475ff70f555f514e69f2e671cd54d6e636"
 dependencies = [
  "datom-codec",
  "ethos-zero",
@@ -519,8 +519,8 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "signal"
-version = "3.0.2"
-source = "git+https://github.com/LiGoldragon/signal?rev=8f9a0deb701cebbea518679548df4a795affc918#8f9a0deb701cebbea518679548df4a795affc918"
+version = "4.0.0"
+source = "git+https://github.com/LiGoldragon/signal?rev=48ae17b485f2781e8ec1ca02a7fe04ad28a37f9f#48ae17b485f2781e8ec1ca02a7fe04ad28a37f9f"
 dependencies = [
  "datom-codec",
  "ethos-zero",
@@ -531,8 +531,8 @@ dependencies = [
 
 [[package]]
 name = "signal-aggregator"
-version = "0.8.0"
-source = "git+https://github.com/LiGoldragon/signal-aggregator?rev=e5009d65527a5ac9658fb85f03685e26c78ec85c#e5009d65527a5ac9658fb85f03685e26c78ec85c"
+version = "0.9.0"
+source = "git+https://github.com/LiGoldragon/signal-aggregator?rev=b21dc9fdf8580341a66dfceb01e9aae1b36b9783#b21dc9fdf8580341a66dfceb01e9aae1b36b9783"
 dependencies = [
  "datom-codec",
  "ethos-zero",
