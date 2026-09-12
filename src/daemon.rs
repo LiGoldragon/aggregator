@@ -329,6 +329,7 @@ impl OrdinarySocketFrame {
     }
 
     pub fn reply_frame(self) -> Result<AggregatorFrame> {
+        let route = self.frame.short_header().route();
         match self.frame.into_body() {
             AggregatorFrameBody::Request { exchange, request } => {
                 let handler = OrdinaryRequestHandler::new(self.sema, self.clock);
@@ -340,17 +341,21 @@ impl OrdinarySocketFrame {
                 let per_operation = NonEmpty::try_from_vec(replies).map_err(|error| {
                     Error::protocol("ordinary request shape", error.to_string())
                 })?;
-                Ok(AggregatorFrame::new(AggregatorFrameBody::Reply {
-                    exchange,
-                    reply: FrameReply::committed(per_operation),
-                }))
+                Ok(AggregatorFrame::new(
+                    route,
+                    AggregatorFrameBody::Reply {
+                        exchange,
+                        reply: FrameReply::committed(per_operation),
+                    },
+                ))
             }
-            AggregatorFrameBody::Reply { exchange, .. } => {
-                Ok(AggregatorFrame::new(AggregatorFrameBody::Reply {
+            AggregatorFrameBody::Reply { exchange, .. } => Ok(AggregatorFrame::new(
+                route,
+                AggregatorFrameBody::Reply {
                     exchange,
                     reply: FrameReply::rejected(RequestRejectionReason::Internal),
-                }))
-            }
+                },
+            )),
             other => Err(Error::protocol(
                 "ordinary request shape",
                 format!("expected request frame, got {other:?}"),
@@ -371,6 +376,7 @@ impl MetaSocketFrame {
     }
 
     pub fn reply_frame(self) -> Result<MetaAggregatorFrame> {
+        let route = self.frame.short_header().route();
         match self.frame.into_body() {
             MetaAggregatorFrameBody::Request { exchange, request } => {
                 let handler = MetaRequestHandler::new(self.sema);
@@ -381,17 +387,21 @@ impl MetaSocketFrame {
                     .collect::<Vec<_>>();
                 let per_operation = NonEmpty::try_from_vec(replies)
                     .map_err(|error| Error::protocol("meta request shape", error.to_string()))?;
-                Ok(MetaAggregatorFrame::new(MetaAggregatorFrameBody::Reply {
-                    exchange,
-                    reply: FrameReply::committed(per_operation),
-                }))
+                Ok(MetaAggregatorFrame::new(
+                    route,
+                    MetaAggregatorFrameBody::Reply {
+                        exchange,
+                        reply: FrameReply::committed(per_operation),
+                    },
+                ))
             }
-            MetaAggregatorFrameBody::Reply { exchange, .. } => {
-                Ok(MetaAggregatorFrame::new(MetaAggregatorFrameBody::Reply {
+            MetaAggregatorFrameBody::Reply { exchange, .. } => Ok(MetaAggregatorFrame::new(
+                route,
+                MetaAggregatorFrameBody::Reply {
                     exchange,
                     reply: FrameReply::rejected(RequestRejectionReason::Internal),
-                }))
-            }
+                },
+            )),
             other => Err(Error::protocol(
                 "meta request shape",
                 format!("expected request frame, got {other:?}"),

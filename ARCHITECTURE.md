@@ -75,7 +75,7 @@ The ordinary contract exposes metadata-first output operations:
   projection.
 - `ListOutputSegments` lists segment cards for a selected output.
 - `ListTranscriptBlocks` lists whole logical transcript-block cards with grounded kind selection and optional bounded previews.
-- `SearchTranscriptBlocks` applies `nota-text-query` over readable transcript blocks and returns query evidence with matching cards.
+- `SearchTranscriptBlocks` applies `dotos-text-query` over readable transcript blocks and returns query evidence with matching cards.
 - `ObserveHealth` reports metadata-first runtime capabilities, configured source health, and fragile-index counts without transcript text.
 - `EstimateTranscriptBlock` estimates a selected block before text projection.
 - `ReadTranscriptBlock` reads a selected whole block only with an explicit `maximum_bytes` bounded by the configured read cap.
@@ -151,13 +151,13 @@ src/error.rs                              typed crate error boundary
 schema/runtime.schema                     runtime triad schema sketch
 generated/README.md                       schema-generation placeholder
 tests/boundary.rs                         contract, daemon, adapter, and output-interface witnesses
-examples/collect.nota                     coarse evidence collection request example
-examples/configuration.nota               current configuration example
-examples/output-interface-requests.nota   metadata-first output operation request examples
-examples/session-inventory-archive-requests.nota inventory and local archive request examples
-examples/output-interface-replies.nota    output operation reply and rejection examples
-examples/transcript-block-search-requests.nota  transcript block scrape/search/read request examples
-examples/transcript-block-search-replies.nota   transcript block reply, evidence, and rejection examples
+examples/collect.dotos                     coarse evidence collection request example
+examples/configuration.dotos               current configuration example
+examples/output-interface-requests.dotos   metadata-first output operation request examples
+examples/session-inventory-archive-requests.dotos inventory and local archive request examples
+examples/output-interface-replies.dotos    output operation reply and rejection examples
+examples/transcript-block-search-requests.dotos  transcript block scrape/search/read request examples
+examples/transcript-block-search-replies.dotos   transcript block reply, evidence, and rejection examples
 ```
 
 ## Current status
@@ -166,7 +166,7 @@ The configured runtime path implements collection over configured transcript and
 repository evidence, and the daemon serves ordinary and meta frame requests over
 Unix sockets. The output interface implementation is present: session,
 subagent, output, segment, and transcript-block listings; complete metadata-first session inventory and lookup; aggregator-local rkyv session archive write/query/read with explicit archive paths; transcript-block
-search with `nota-text-query` evidence; size estimates; bounded reads; durable
+search with `dotos-text-query` evidence; size estimates; bounded reads; durable
 store-derived fragile index; metadata-first cards; typed stale, missing, broken,
 oversized, invalid-range, invalid-query, and invalid-request rejections; and
 query-bound page cursors.

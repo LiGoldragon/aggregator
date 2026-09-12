@@ -4,11 +4,11 @@ use std::{
     path::PathBuf,
 };
 
+use dotos::{DotosEncode, DotosSource};
 use meta_signal_aggregator::{
     AggregatorConfiguration, MetaAggregatorFrame, MetaAggregatorFrameBody, MetaAggregatorReply,
     MetaAggregatorRequest,
 };
-use nota::{NotaEncode, NotaSource};
 use signal_aggregator::{AggregatorFrame, AggregatorFrameBody, AggregatorReply, AggregatorRequest};
 use signal_frame::{
     AcceptedOutcome, ExchangeIdentifier, ExchangeLane, LaneSequence, Reply as FrameReply, Request,
@@ -45,13 +45,13 @@ impl AggregatorClientCommand {
     pub fn run(&self) -> Result<()> {
         let configuration = self.arguments.configuration_store()?.read_configuration()?;
         let request_text = self.arguments.input_text()?;
-        let request = NotaSource::new(&request_text)
+        let request = DotosSource::new(&request_text)
             .parse::<AggregatorRequest>()
-            .map_err(|error| Error::nota("ordinary request decode", error.to_string()))?;
+            .map_err(|error| Error::dotos("ordinary request decode", error.to_string()))?;
         let reply =
             UnixSocketClient::new(PathBuf::from(configuration.ordinary_socket_path.as_str()))
                 .exchange_ordinary(request)?;
-        print!("{}", reply.to_nota());
+        print!("{}", reply.to_dotos());
         Ok(())
     }
 }
@@ -66,12 +66,12 @@ impl MetaAggregatorClientCommand {
     pub fn run(&self) -> Result<()> {
         let configuration = self.arguments.configuration_store()?.read_configuration()?;
         let request_text = self.arguments.input_text()?;
-        let request = NotaSource::new(&request_text)
+        let request = DotosSource::new(&request_text)
             .parse::<MetaAggregatorRequest>()
-            .map_err(|error| Error::nota("meta request decode", error.to_string()))?;
+            .map_err(|error| Error::dotos("meta request decode", error.to_string()))?;
         let reply = UnixSocketClient::new(PathBuf::from(configuration.meta_socket_path.as_str()))
             .exchange_meta(request)?;
-        print!("{}", reply.to_nota());
+        print!("{}", reply.to_dotos());
         Ok(())
     }
 }
@@ -101,14 +101,14 @@ impl ConfigurationWriterCommand {
             request.configuration()
         } else {
             let text = self.arguments.input_text()?;
-            NotaSource::new(&text)
+            DotosSource::new(&text)
                 .parse::<AggregatorConfiguration>()
-                .map_err(|error| Error::nota("configuration decode", error.to_string()))?
+                .map_err(|error| Error::dotos("configuration decode", error.to_string()))?
         };
         self.arguments
             .configuration_store()?
             .write_configuration(&configuration)?;
-        println!("{}", configuration.to_nota());
+        println!("{}", configuration.to_dotos());
         Ok(())
     }
 }
@@ -148,7 +148,7 @@ impl ClientCommandArguments {
             .map_err(|error| Error::io("reading standard input", error))?;
         if text.trim().is_empty() {
             Err(Error::argument(
-                "request/configuration NOTA is required on stdin",
+                "request/configuration DOTOS is required on stdin",
             ))
         } else {
             Ok(text)
@@ -272,10 +272,14 @@ impl UnixSocketClient {
     }
 
     pub fn exchange_ordinary(&self, request: AggregatorRequest) -> Result<AggregatorReply> {
-        let frame = AggregatorFrame::new(AggregatorFrameBody::Request {
-            exchange: SocketExchangeIdentity::first().connector_exchange(),
-            request: Request::from_payload(request),
-        });
+        let route = request.wire_route();
+        let frame = AggregatorFrame::new(
+            route,
+            AggregatorFrameBody::Request {
+                exchange: SocketExchangeIdentity::first().connector_exchange(),
+                request: Request::from_payload(request),
+            },
+        );
         let reply_frame = AggregatorFrame::decode_length_prefixed(
             &self.exchange_bytes(
                 &frame
@@ -288,10 +292,14 @@ impl UnixSocketClient {
     }
 
     pub fn exchange_meta(&self, request: MetaAggregatorRequest) -> Result<MetaAggregatorReply> {
-        let frame = MetaAggregatorFrame::new(MetaAggregatorFrameBody::Request {
-            exchange: SocketExchangeIdentity::first().connector_exchange(),
-            request: Request::from_payload(request),
-        });
+        let route = request.wire_route();
+        let frame = MetaAggregatorFrame::new(
+            route,
+            MetaAggregatorFrameBody::Request {
+                exchange: SocketExchangeIdentity::first().connector_exchange(),
+                request: Request::from_payload(request),
+            },
+        );
         let reply_frame = MetaAggregatorFrame::decode_length_prefixed(
             &self.exchange_bytes(
                 &frame

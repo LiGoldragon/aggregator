@@ -1,6 +1,6 @@
 [package]
 name         = "aggregator"
-version      = "0.3.1"
+version      = "0.4.0"
 edition      = "2024"
 rust-version = "1.89"
 license      = "MIT OR Apache-2.0"
@@ -31,14 +31,14 @@ path = "src/bin/aggregator-write-configuration.rs"
 [dependencies]
 blake3 = "1"
 fs2 = "0.4"
-meta-signal-aggregator = { git = "https://github.com/LiGoldragon/meta-signal-aggregator", branch = "main", features = ["nota-text"] }
-nota                   = { package = "nota", git = "https://github.com/LiGoldragon/nota-next.git", branch = "main" }
-nota-text-query        = { git = "https://github.com/LiGoldragon/nota-text-query.git", branch = "main", default-features = false }
+meta-signal-aggregator = { git = "https://github.com/LiGoldragon/meta-signal-aggregator", rev = "98cc36fc7cbf9d0ae18d976a19c5c1a626d165d5", features = ["dotos-text"] }
+dotos                  = { package = "dotos", git = "https://github.com/LiGoldragon/dotos.git", rev = "80c7b17f7ad3cf547d2624c6a243e5de5f85c9f3" }
+dotos-text-query       = { git = "https://github.com/LiGoldragon/dotos-text-query.git", rev = "aee1a446bb3236858d7157bad88dd63550abc25b", default-features = false }
 rkyv                   = { version = "0.8", default-features = false, features = ["std", "bytecheck", "little_endian", "pointer_width_32", "unaligned"] }
 serde                  = { version = "1", features = ["derive"] }
 serde_json             = "1"
-signal-aggregator      = { git = "https://github.com/LiGoldragon/signal-aggregator", branch = "main", features = ["nota-text"] }
-signal-frame           = { git = "https://github.com/LiGoldragon/signal-frame.git", branch = "main", features = ["nota-text"] }
+signal-aggregator      = { git = "https://github.com/LiGoldragon/signal-aggregator", rev = "5d2b80e21f1a79b1025731d269ceb03c64f26d5b", features = ["dotos-text"] }
+signal-frame           = { git = "https://github.com/LiGoldragon/signal-frame.git", rev = "8aa0bcaeb29fe9e461a11706a469638d2fd109ac", features = ["dotos-text"] }
 thiserror              = "2"
 time                   = { version = "0.3", features = ["formatting", "parsing"] }
 

@@ -152,7 +152,7 @@ impl LocalDefaultConfigurationRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nota::NotaEncode;
+    use dotos::DotosEncode;
 
     #[test]
     fn local_default_configuration_derives_roots_from_fake_context() {
@@ -165,7 +165,7 @@ mod tests {
             PathBuf::from("/fake/state/aggregator.sema"),
         );
 
-        let text = request.configuration().to_nota();
+        let text = request.configuration().to_dotos();
         assert!(text.contains("/.claude/projects/-fake-workspace"));
         assert!(text.contains("/fake/tmp/claude-123"));
         assert!(text.contains("/fake/tmp/pi-subagents-123"));

@@ -4,23 +4,23 @@ Runtime component for collecting and normalizing recent work evidence from confi
 
 ## Examples
 
-- `examples/collect.nota` is the coarse evidence collection request.
-- `examples/configuration.nota` shows the current meta configuration shape, including configured source roots, the daemon-local fragile output index policy, and read/preview/page limits. Replace the sample `/srv/aggregator/...` paths with local readable roots before validation.
-- `examples/output-interface-requests.nota` is a signal/client sequence for metadata-first discovery followed by explicit bounded output reads. Submit one NOTA form at a time, replacing each `fragile-*` placeholder with the opaque reference returned by the previous listing.
-- `examples/output-interface-replies.nota` shows schema-faithful reply and rejection shapes a UI or agent should handle.
-- `examples/transcript-block-search-requests.nota` demonstrates local session and subagent scraping with metadata-first `TranscriptBlock` discovery, `nota-text-query` searches, and explicit bounded whole-block reads.
-- `examples/transcript-block-search-replies.nota` shows transcript-block reply, search-evidence, read, and stale-reference shapes.
+- `examples/collect.dotos` is the coarse evidence collection request.
+- `examples/configuration.dotos` shows the current meta configuration shape, including configured source roots, the daemon-local fragile output index policy, and read/preview/page limits. Replace the sample `/srv/aggregator/...` paths with local readable roots before validation.
+- `examples/output-interface-requests.dotos` is a signal/client sequence for metadata-first discovery followed by explicit bounded output reads. Submit one DOTOS form at a time, replacing each `fragile-*` placeholder with the opaque reference returned by the previous listing.
+- `examples/output-interface-replies.dotos` shows schema-faithful reply and rejection shapes a UI or agent should handle.
+- `examples/transcript-block-search-requests.dotos` demonstrates local session and subagent scraping with metadata-first `TranscriptBlock` discovery, `dotos-text-query` searches, and explicit bounded whole-block reads.
+- `examples/transcript-block-search-replies.dotos` shows transcript-block reply, search-evidence, read, and stale-reference shapes.
 
 After substituting real references from earlier replies, run one request per CLI invocation:
 
 ```sh
 while IFS= read -r request; do
   [ -z "$request" ] && continue
-  cargo run --bin aggregator -- --configuration /path/to/configuration.nota --request "$request"
-done < examples/output-interface-requests.nota
+  cargo run --bin aggregator -- --configuration /path/to/configuration.dotos --request "$request"
+done < examples/output-interface-requests.dotos
 ```
 
-Use the same loop with `examples/transcript-block-search-requests.nota` after replacing placeholder fragile references with values from earlier replies.
+Use the same loop with `examples/transcript-block-search-requests.dotos` after replacing placeholder fragile references with values from earlier replies.
 
 ## Metadata-first bounded output workflow
 
@@ -49,7 +49,7 @@ Transcript block search is for scraping configured local harness, session, and s
 2. `ListSessions` with source and time filters.
 2. `ListSubagents` for the selected session when subagent drill-down matters.
 3. `ListTranscriptBlocks` with `MetadataOnly` or a small `BoundedPreview` and a grounded kind filter.
-4. `SearchTranscriptBlocks` with canonical `nota-text-query` forms such as `(Contains (Word (quota)))`, `(Contains (Phrase ([rate limit])))`, or `(Near ((Word (quota)) (Word (reset)) 6))`.
+4. `SearchTranscriptBlocks` with canonical `dotos-text-query` forms such as `(Contains (Word (quota)))`, `(Contains (Phrase ([rate limit])))`, or `(Near ((Word (quota)) (Word (reset)) 6))`.
 5. `EstimateTranscriptBlock` for the selected fragile block reference.
 6. `ReadTranscriptBlock` only with an explicit `maximum_bytes`; there is no unbounded whole-block text fetch.
 

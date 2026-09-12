@@ -35,6 +35,8 @@ use aggregator::{
         PersistentIndex, SourceHealthObserver, limits::IndexStoreLimits, store::IndexStore,
     },
 };
+use dotos::{DotosEncode, DotosSource};
+use dotos_text_query::{QueryTerm, WordDistance};
 use meta_signal_aggregator::{
     ActiveRepository, AggregatorConfiguration, ConfigurationCandidate, ConfigurationChange,
     ConfigurationObservation, FilesystemPath, LegacyRecoveryAccess, LegacyRecoveryRoot,
@@ -42,8 +44,6 @@ use meta_signal_aggregator::{
     OutputInterfaceConfiguration, OutputInterfaceLimitPolicy, RepositoryName, SocketMode,
     TranscriptRoot, TranscriptSource,
 };
-use nota::{NotaEncode, NotaSource};
-use nota_text_query::{QueryTerm, WordDistance};
 use signal_aggregator::{
     AggregatorReply, AggregatorRequest, ArchivePath, ArchiveProvenanceText, ArchiveSummaryText,
     ArchiveTextCompleteness, AuthoredStatus, AuthoredStatusFilter, BoundedTextProjection,
@@ -84,19 +84,19 @@ fn evidence_request() -> EvidenceRequest {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ExampleNotaFile {
+struct ExampleDotosFile {
     name: &'static str,
     text: &'static str,
 }
 
-impl ExampleNotaFile {
+impl ExampleDotosFile {
     fn new(name: &'static str, text: &'static str) -> Self {
         Self { name, text }
     }
 
     fn parse_as_requests(&self) {
         self.for_each_non_empty_line(|line_number, line| {
-            NotaSource::new(line)
+            DotosSource::new(line)
                 .parse::<AggregatorRequest>()
                 .unwrap_or_else(|error| {
                     panic!(
@@ -109,7 +109,7 @@ impl ExampleNotaFile {
 
     fn parse_as_replies(&self) {
         self.for_each_non_empty_line(|line_number, line| {
-            NotaSource::new(line)
+            DotosSource::new(line)
                 .parse::<AggregatorReply>()
                 .unwrap_or_else(|error| {
                     panic!(
@@ -121,7 +121,7 @@ impl ExampleNotaFile {
     }
 
     fn parse_as_configuration(&self) {
-        NotaSource::new(self.text.trim())
+        DotosSource::new(self.text.trim())
             .parse::<AggregatorConfiguration>()
             .unwrap_or_else(|error| {
                 panic!(
@@ -142,40 +142,40 @@ impl ExampleNotaFile {
 }
 
 #[test]
-fn example_nota_files_match_contract_shapes() {
-    ExampleNotaFile::new(
-        "examples/collect.nota",
-        include_str!("../examples/collect.nota"),
+fn example_dotos_files_match_contract_shapes() {
+    ExampleDotosFile::new(
+        "examples/collect.dotos",
+        include_str!("../examples/collect.dotos"),
     )
     .parse_as_requests();
-    ExampleNotaFile::new(
-        "examples/output-interface-requests.nota",
-        include_str!("../examples/output-interface-requests.nota"),
+    ExampleDotosFile::new(
+        "examples/output-interface-requests.dotos",
+        include_str!("../examples/output-interface-requests.dotos"),
     )
     .parse_as_requests();
-    ExampleNotaFile::new(
-        "examples/output-interface-replies.nota",
-        include_str!("../examples/output-interface-replies.nota"),
+    ExampleDotosFile::new(
+        "examples/output-interface-replies.dotos",
+        include_str!("../examples/output-interface-replies.dotos"),
     )
     .parse_as_replies();
-    ExampleNotaFile::new(
-        "examples/session-inventory-archive-requests.nota",
-        include_str!("../examples/session-inventory-archive-requests.nota"),
+    ExampleDotosFile::new(
+        "examples/session-inventory-archive-requests.dotos",
+        include_str!("../examples/session-inventory-archive-requests.dotos"),
     )
     .parse_as_requests();
-    ExampleNotaFile::new(
-        "examples/transcript-block-search-requests.nota",
-        include_str!("../examples/transcript-block-search-requests.nota"),
+    ExampleDotosFile::new(
+        "examples/transcript-block-search-requests.dotos",
+        include_str!("../examples/transcript-block-search-requests.dotos"),
     )
     .parse_as_requests();
-    ExampleNotaFile::new(
-        "examples/transcript-block-search-replies.nota",
-        include_str!("../examples/transcript-block-search-replies.nota"),
+    ExampleDotosFile::new(
+        "examples/transcript-block-search-replies.dotos",
+        include_str!("../examples/transcript-block-search-replies.dotos"),
     )
     .parse_as_replies();
-    ExampleNotaFile::new(
-        "examples/configuration.nota",
-        include_str!("../examples/configuration.nota"),
+    ExampleDotosFile::new(
+        "examples/configuration.dotos",
+        include_str!("../examples/configuration.dotos"),
     )
     .parse_as_configuration();
 }
@@ -395,7 +395,7 @@ fn signal_plane_returns_typed_rejection_without_synthesis() {
         RequestIdentifier::new("req-test"),
         RejectionReason::CollectionUnavailable,
     );
-    let text = reply.to_nota();
+    let text = reply.to_dotos();
     assert!(matches!(reply, AggregatorReply::EvidenceRejected(_)));
     for forbidden in ["Summary", "Review", "Recommendation", "Score", "Judgment"] {
         assert!(!text.contains(forbidden));
@@ -412,10 +412,10 @@ fn nexus_scaffold_does_not_collect_private_sources() {
 }
 
 #[test]
-fn configuration_fixture_round_trips_through_nota() {
+fn configuration_fixture_round_trips_through_dotos() {
     let configuration = ConfigurationFixture::minimal();
-    let text = configuration.to_nota();
-    let decoded = NotaSource::new(&text)
+    let text = configuration.to_dotos();
+    let decoded = DotosSource::new(&text)
         .parse::<meta_signal_aggregator::AggregatorConfiguration>()
         .expect("decode configuration");
     assert_eq!(decoded, configuration);
@@ -443,7 +443,7 @@ fn sema_scaffold_observes_configuration_and_rejects_configuration_without_store(
 fn sema_configure_persists_typed_configuration_when_store_is_available() {
     let root = TempDir::new().expect("temporary root");
     let configuration = accepted_configuration(&root);
-    let store = ConfigurationStore::at_path(root.path().join("configuration.nota"));
+    let store = ConfigurationStore::at_path(root.path().join("configuration.dotos"));
     let mut sema = SemaPlane::with_configuration_store(configuration.clone(), store.clone());
 
     let configured = sema.configure(ConfigurationChange {
@@ -461,10 +461,10 @@ fn sema_configure_persists_typed_configuration_when_store_is_available() {
 }
 
 #[test]
-fn configuration_store_round_trips_nota_file_storage() {
+fn configuration_store_round_trips_dotos_file_storage() {
     let root = TempDir::new().expect("temporary root");
     let configuration = accepted_configuration(&root);
-    let store = ConfigurationStore::at_path(root.path().join("configuration.nota"));
+    let store = ConfigurationStore::at_path(root.path().join("configuration.dotos"));
     store
         .write_configuration(&configuration)
         .expect("write configuration");
@@ -1845,8 +1845,8 @@ fn configuration_store_migrates_legacy_zero_one_configuration_with_default_outpu
         default_projection: configuration.default_projection.clone(),
         default_limit_policy: configuration.default_limit_policy.clone(),
     };
-    let configuration_path = root.path().join("legacy-configuration.nota");
-    fs::write(&configuration_path, legacy.to_nota()).expect("write legacy configuration");
+    let configuration_path = root.path().join("legacy-configuration.dotos");
+    fs::write(&configuration_path, legacy.to_dotos()).expect("write legacy configuration");
     let migrated = ConfigurationStore::at_path(&configuration_path)
         .read_configuration()
         .expect("migrate legacy configuration");
@@ -1879,11 +1879,11 @@ fn daemon_cli_boundary_handles_collect_version_and_meta_configuration() {
         ),
     )
     .expect("write transcript");
-    let configuration_path = root.path().join("configuration.nota");
+    let configuration_path = root.path().join("configuration.dotos");
     run_binary_with_input(
         env!("CARGO_BIN_EXE_aggregator-write-configuration"),
         &configuration_path,
-        &configuration.to_nota(),
+        &configuration.to_dotos(),
     );
     let _daemon = DaemonGuard::start(&configuration_path, "2026-01-02T01:00:00Z");
     let ordinary_socket_path = std::path::Path::new(configuration.ordinary_socket_path.as_str());
@@ -1901,9 +1901,9 @@ fn daemon_cli_boundary_handles_collect_version_and_meta_configuration() {
         &AggregatorRequest::Version(Version {
             client_name: Some(ContractName::new("boundary-test")),
         })
-        .to_nota(),
+        .to_dotos(),
     );
-    let version_reply = NotaSource::new(&version_output)
+    let version_reply = DotosSource::new(&version_output)
         .parse::<AggregatorReply>()
         .expect("parse version reply");
     assert!(matches!(version_reply, AggregatorReply::VersionReported(_)));
@@ -1912,9 +1912,9 @@ fn daemon_cli_boundary_handles_collect_version_and_meta_configuration() {
         env!("CARGO_BIN_EXE_meta-aggregator"),
         &configuration_path,
         &MetaAggregatorRequest::ObserveConfiguration(ObserveConfiguration { observer: None })
-            .to_nota(),
+            .to_dotos(),
     );
-    let observe_reply = NotaSource::new(&observe_output)
+    let observe_reply = DotosSource::new(&observe_output)
         .parse::<MetaAggregatorReply>()
         .expect("parse observe reply");
     assert!(matches!(
@@ -1928,9 +1928,9 @@ fn daemon_cli_boundary_handles_collect_version_and_meta_configuration() {
         &MetaAggregatorRequest::ValidateConfiguration(ConfigurationCandidate {
             configuration: configuration.clone(),
         })
-        .to_nota(),
+        .to_dotos(),
     );
-    let validate_reply = NotaSource::new(&validate_output)
+    let validate_reply = DotosSource::new(&validate_output)
         .parse::<MetaAggregatorReply>()
         .expect("parse validate reply");
     assert!(matches!(
@@ -1944,9 +1944,9 @@ fn daemon_cli_boundary_handles_collect_version_and_meta_configuration() {
         &MetaAggregatorRequest::Configure(ConfigurationChange {
             configuration: configuration.clone(),
         })
-        .to_nota(),
+        .to_dotos(),
     );
-    let configure_reply = NotaSource::new(&configure_output)
+    let configure_reply = DotosSource::new(&configure_output)
         .parse::<MetaAggregatorReply>()
         .expect("parse configure reply");
     assert!(matches!(
@@ -1976,9 +1976,9 @@ fn daemon_cli_boundary_handles_collect_version_and_meta_configuration() {
             },
             projection: CardProjection::MetadataOnly,
         })
-        .to_nota(),
+        .to_dotos(),
     );
-    let list_outputs_reply = NotaSource::new(&list_outputs_output)
+    let list_outputs_reply = DotosSource::new(&list_outputs_output)
         .parse::<AggregatorReply>()
         .expect("parse list outputs reply");
     assert!(matches!(
@@ -1995,9 +1995,9 @@ fn daemon_cli_boundary_handles_collect_version_and_meta_configuration() {
     let collect_output = run_binary_with_input(
         env!("CARGO_BIN_EXE_aggregator"),
         &configuration_path,
-        &AggregatorRequest::Collect(collect_request).to_nota(),
+        &AggregatorRequest::Collect(collect_request).to_dotos(),
     );
-    let collect_reply = NotaSource::new(&collect_output)
+    let collect_reply = DotosSource::new(&collect_output)
         .parse::<AggregatorReply>()
         .expect("parse collect reply");
     let package = match collect_reply {
@@ -2024,11 +2024,11 @@ fn daemon_cli_boundary_handles_collect_version_and_meta_configuration() {
 fn meta_configure_persists_to_startup_configuration_for_restart() {
     let root = TempDir::new().expect("temporary root");
     let configuration = accepted_configuration(&root);
-    let configuration_path = root.path().join("configuration.nota");
+    let configuration_path = root.path().join("configuration.dotos");
     run_binary_with_input(
         env!("CARGO_BIN_EXE_aggregator-write-configuration"),
         &configuration_path,
-        &configuration.to_nota(),
+        &configuration.to_dotos(),
     );
     let daemon = DaemonGuard::start(&configuration_path, "2026-01-02T01:00:00Z");
     wait_for_socket(std::path::Path::new(
@@ -2057,9 +2057,9 @@ fn meta_configure_persists_to_startup_configuration_for_restart() {
         &MetaAggregatorRequest::Configure(ConfigurationChange {
             configuration: updated_configuration.clone(),
         })
-        .to_nota(),
+        .to_dotos(),
     );
-    let configure_reply = NotaSource::new(&configure_output)
+    let configure_reply = DotosSource::new(&configure_output)
         .parse::<MetaAggregatorReply>()
         .expect("parse configure reply");
     assert!(matches!(
@@ -2077,9 +2077,9 @@ fn meta_configure_persists_to_startup_configuration_for_restart() {
         env!("CARGO_BIN_EXE_meta-aggregator"),
         &configuration_path,
         &MetaAggregatorRequest::ObserveConfiguration(ObserveConfiguration { observer: None })
-            .to_nota(),
+            .to_dotos(),
     );
-    let observe_reply = NotaSource::new(&observe_output)
+    let observe_reply = DotosSource::new(&observe_output)
         .parse::<MetaAggregatorReply>()
         .expect("parse observe reply");
     match observe_reply {

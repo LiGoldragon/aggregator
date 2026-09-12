@@ -20,7 +20,7 @@ use self::{
     schema::{ProjectionRecordDto, ProjectionSizeDto, ProjectionTaskDto},
     store::IndexStore,
 };
-use nota_text_query::{Query, QueryTerm, SearchText};
+use dotos_text_query::{Query, QueryTerm, SearchText};
 use signal_aggregator::{
     AuthoredStatus, AuthoredStatusFilter, ByteCount, ByteLimit, ByteRange, CardProjection,
     DurationUnit, FilesystemPath, FragileOutputReference, FragileOutputSegmentReference,

@@ -71,8 +71,8 @@ pub enum Error {
     #[error("clock error: {detail}")]
     Clock { detail: String },
 
-    #[error("NOTA {context} failed: {detail}")]
-    Nota {
+    #[error("DOTOS {context} failed: {detail}")]
+    Dotos {
         context: &'static str,
         detail: String,
     },
@@ -114,8 +114,8 @@ impl Error {
         }
     }
 
-    pub fn nota(context: &'static str, detail: impl Into<String>) -> Self {
-        Self::Nota {
+    pub fn dotos(context: &'static str, detail: impl Into<String>) -> Self {
+        Self::Dotos {
             context,
             detail: detail.into(),
         }

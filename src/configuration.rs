@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use dotos::{DotosDecode, DotosEncode, DotosSource};
 use meta_signal_aggregator::{
     ActiveRepository, AggregatorConfiguration, ConfigurationValidationIssue,
     ConfigurationValidationIssueKind, ConfigurationValidationOutcome,
@@ -7,7 +8,6 @@ use meta_signal_aggregator::{
     OutputInterfaceConfiguration, OutputInterfaceLimitPolicy, RepositoryName, SocketMode,
     TranscriptRoot, TranscriptSource, ValidationIssueDetail,
 };
-use nota::{NotaDecode, NotaEncode, NotaSource};
 use signal_aggregator::{
     ByteLimit, LimitPolicy, Projection, RepositoryIdentifier, SegmentLimit, SelectedSources,
     SourceKind, SourceSelection,
@@ -42,13 +42,13 @@ impl ConfigurationStore {
             .ok_or(Error::ConfigurationStorageNotImplemented)?;
         let text = std::fs::read_to_string(path)
             .map_err(|error| Error::io("reading configuration", error))?;
-        match NotaSource::new(&text).parse::<AggregatorConfiguration>() {
+        match DotosSource::new(&text).parse::<AggregatorConfiguration>() {
             Ok(configuration) => Ok(configuration),
-            Err(current_error) => NotaSource::new(&text)
+            Err(current_error) => DotosSource::new(&text)
                 .parse::<LegacyAggregatorConfiguration>()
                 .map(LegacyAggregatorConfiguration::into_current)
                 .map_err(|legacy_error| {
-                    Error::nota(
+                    Error::dotos(
                         "configuration decode",
                         format!(
                             "current shape failed: {current_error}; legacy 0.1 migration failed: {legacy_error}"
@@ -68,7 +68,7 @@ impl ConfigurationStore {
                 .map_err(|error| Error::io("creating configuration directory", error))?;
         }
         let temporary_path = self.temporary_path(path);
-        std::fs::write(&temporary_path, configuration.to_nota())
+        std::fs::write(&temporary_path, configuration.to_dotos())
             .map_err(|error| Error::io("writing temporary configuration", error))?;
         std::fs::rename(&temporary_path, path)
             .map_err(|error| Error::io("committing configuration", error))
@@ -78,12 +78,12 @@ impl ConfigurationStore {
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("configuration.nota");
+            .unwrap_or("configuration.dotos");
         path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()))
     }
 }
 
-#[derive(NotaEncode, NotaDecode, Debug, Clone, PartialEq, Eq)]
+#[derive(DotosEncode, DotosDecode, Debug, Clone, PartialEq, Eq)]
 pub struct LegacyAggregatorConfiguration {
     pub ordinary_socket_path: FilesystemPath,
     pub ordinary_socket_mode: SocketMode,
