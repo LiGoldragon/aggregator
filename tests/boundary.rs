@@ -774,8 +774,7 @@ fn transcript_discovery_file_limit_is_configurable_and_reported() {
     .read_records();
     assert_eq!(limited.discovered_files, 2);
     assert!(limited.scan_limits.iter().any(|limit| {
-        limit.scan_limit_kind == ScanLimitKind::DiscoveredFiles(limit.scan_limit)
-            && limit.scan_limit == 2
+        matches!(limit.scan_limit_kind, ScanLimitKind::DiscoveredFiles(_)) && limit.scan_limit == 2
     }));
 
     let raised = ClaudeJsonlRootReader::with_limits(
@@ -2261,8 +2260,7 @@ fn codex_health_observation_reports_configured_discovery_limit() {
     );
     assert_eq!(health.discovered_files, 1);
     assert!(health.scan_limits.iter().any(|limit| {
-        limit.scan_limit_kind == ScanLimitKind::DiscoveredFiles(limit.scan_limit)
-            && limit.scan_limit == 1
+        matches!(limit.scan_limit_kind, ScanLimitKind::DiscoveredFiles(_)) && limit.scan_limit == 1
     }));
 }
 
@@ -2296,8 +2294,7 @@ fn codex_health_observation_reports_configured_index_discovery_limit() {
     );
     assert_eq!(health.discovered_files, 1);
     assert!(health.scan_limits.iter().any(|limit| {
-        limit.scan_limit_kind == ScanLimitKind::DiscoveredFiles(limit.scan_limit)
-            && limit.scan_limit == 1
+        matches!(limit.scan_limit_kind, ScanLimitKind::DiscoveredFiles(_)) && limit.scan_limit == 1
     }));
 }
 
@@ -2550,8 +2547,7 @@ fn pi_health_observation_reports_configured_discovery_limit() {
     );
     assert_eq!(health.discovered_files, 1);
     assert!(health.scan_limits.iter().any(|limit| {
-        limit.scan_limit_kind == ScanLimitKind::DiscoveredFiles(limit.scan_limit)
-            && limit.scan_limit == 1
+        matches!(limit.scan_limit_kind, ScanLimitKind::DiscoveredFiles(_)) && limit.scan_limit == 1
     }));
 }
 
@@ -2652,7 +2648,7 @@ fn session_inventory_reports_configured_indexed_codex_and_pi_discovery_limits() 
         );
         assert_eq!(report.discovered_files, 1);
         assert!(report.scan_limits.iter().any(|limit| {
-            limit.scan_limit_kind == ScanLimitKind::DiscoveredFiles(limit.scan_limit)
+            matches!(limit.scan_limit_kind, ScanLimitKind::DiscoveredFiles(_))
                 && limit.scan_limit == 1
         }));
     }

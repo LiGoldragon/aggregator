@@ -674,7 +674,7 @@ impl OutputInterfaceRuntime {
                 .output_interfaces()
                 .limits()
                 .maximum_read_bytes,
-            request.page_request.page_limit.try_into().unwrap(),
+            crate::MeasuredCount::measured_count(request.page_request.page_limit),
             limits::IndexStoreLimits::default().maximum_query_candidates,
         )
         .search(
@@ -2914,8 +2914,8 @@ impl IndexedSession {
             latest_modified_at: self.modified_timestamp(),
             started_at: self.started_at.clone(),
             last_observed_at: self.last_observed_at.clone(),
-            subagent_count: Some(self.subagent_count.try_into().unwrap()),
-            output_count: Some(self.output_count.try_into().unwrap()),
+            subagent_count: Some(crate::MeasuredCount::contract_count(self.subagent_count)),
+            output_count: Some(crate::MeasuredCount::contract_count(self.output_count)),
             session_lifecycle_status: self.lifecycle_status(),
             source_health_status: source_status,
             session_archive_status: archive_status,
@@ -2985,8 +2985,8 @@ impl IndexedSession {
             }),
             started_at: self.started_at.clone(),
             last_observed_at: self.last_observed_at.clone(),
-            subagent_count: Some(self.subagent_count.try_into().unwrap()),
-            output_count: Some(self.output_count.try_into().unwrap()),
+            subagent_count: Some(crate::MeasuredCount::contract_count(self.subagent_count)),
+            output_count: Some(crate::MeasuredCount::contract_count(self.output_count)),
             size_metadata: self.size.clone(),
         }
     }
@@ -3017,7 +3017,7 @@ impl IndexedSubagent {
             subagent_name: self.name.clone(),
             subagent_task_metadata_option: self.task.clone(),
             authored_status: self.authored_status.clone(),
-            output_count: Some(self.output_count.try_into().unwrap()),
+            output_count: Some(crate::MeasuredCount::contract_count(self.output_count)),
             size_metadata: self.size.clone(),
             first_observed_at: self.first_observed_at.clone(),
             last_observed_at: self.last_observed_at.clone(),
@@ -3071,8 +3071,11 @@ impl IndexedOutput {
         )
         .as_string();
         let size = SizeMetadataFactory::from_text(&record.text, Some(1)).exact();
-        let preview_text =
-            Utf8Prefix::new(&record.text, preview_limit.try_into().unwrap()).into_string();
+        let preview_text = Utf8Prefix::new(
+            &record.text,
+            crate::MeasuredCount::measured_count(preview_limit),
+        )
+        .into_string();
         let preview_original_bytes = record.byte_count();
         Self {
             reference,
@@ -3229,7 +3232,10 @@ impl IndexedTranscriptBlock {
             .unwrap_or_else(SizeMetadataFactory::unknown);
         let preview_text = record
             .readable_text()
-            .map(|text| Utf8Prefix::new(text, preview_limit.try_into().unwrap()).into_string())
+            .map(|text| {
+                Utf8Prefix::new(text, crate::MeasuredCount::measured_count(preview_limit))
+                    .into_string()
+            })
             .unwrap_or_default();
         let preview_original_bytes = record.byte_count().unwrap_or(0);
         Self {
@@ -3428,7 +3434,7 @@ impl OutputBackingReader {
         let line = BoundedLineReader::new(
             self.output.path.clone(),
             self.output.source_line_number,
-            self.maximum_line_bytes.max(4096).try_into().unwrap(),
+            crate::MeasuredCount::measured_count(self.maximum_line_bytes.max(4096)),
         )
         .read_line()
         .map_err(|failure| failure.rejection(&factory, self.output.reference.clone()))?;
@@ -3494,7 +3500,7 @@ impl TranscriptBlockBackingReader {
         let line = BoundedLineReader::new(
             self.block.path.clone(),
             self.block.source_line_number,
-            line_limit.try_into().unwrap(),
+            crate::MeasuredCount::measured_count(line_limit),
         )
         .read_line()
         .map_err(|failure| {
@@ -3813,13 +3819,14 @@ pub struct SelectedOutputText {
 impl SelectedOutputText {
     pub fn new(text: String, source: SourceKind, path: PathBuf, maximum_bytes: ByteLimit) -> Self {
         let original_bytes = text.len() as u64;
-        let projected = Utf8Prefix::new(&text, maximum_bytes.try_into().unwrap()).into_string();
+        let projected = Utf8Prefix::new(&text, crate::MeasuredCount::measured_count(maximum_bytes))
+            .into_string();
         let projected_bytes = projected.len() as u64;
         let truncation = if projected_bytes < original_bytes {
             Some(Truncation {
                 source_kind: source,
                 filesystem_path_option: Some(path.display().to_string()),
-                original_bytes: Some(original_bytes.try_into().unwrap()),
+                original_bytes: Some(crate::MeasuredCount::contract_count(original_bytes)),
                 projected_bytes: crate::MeasuredCount::contract_count(projected_bytes),
                 truncation_reason: TruncationReason::RequestLimit,
             })
@@ -3846,13 +3853,14 @@ pub struct SelectedTranscriptBlockText {
 impl SelectedTranscriptBlockText {
     pub fn new(text: String, source: SourceKind, path: PathBuf, maximum_bytes: ByteLimit) -> Self {
         let original_bytes = text.len() as u64;
-        let projected = Utf8Prefix::new(&text, maximum_bytes.try_into().unwrap()).into_string();
+        let projected = Utf8Prefix::new(&text, crate::MeasuredCount::measured_count(maximum_bytes))
+            .into_string();
         let projected_bytes = projected.len() as u64;
         let truncation = if projected_bytes < original_bytes {
             Some(Truncation {
                 source_kind: source,
                 filesystem_path_option: Some(path.display().to_string()),
-                original_bytes: Some(original_bytes.try_into().unwrap()),
+                original_bytes: Some(crate::MeasuredCount::contract_count(original_bytes)),
                 projected_bytes: crate::MeasuredCount::contract_count(projected_bytes),
                 truncation_reason: TruncationReason::RequestLimit,
             })
@@ -3911,7 +3919,7 @@ impl<'a> LineRangeTextSelector<'a> {
         let end = self.range.end_line_number;
         let lines = self.text.lines().collect::<Vec<_>>();
         let maximum_end = lines.len() as u64 + 1;
-        if start == 0 || end < start || end > maximum_end.try_into().unwrap() {
+        if start == 0 || end < start || end > crate::MeasuredCount::contract_count(maximum_end) {
             return Err(RangeSelectionError);
         }
         let start_index = (start - 1) as usize;
@@ -3942,7 +3950,7 @@ impl ByteRangeSelection {
             .size
             .byte_count_option
             .map_or(0, crate::MeasuredCount::measured_count);
-        if end < start || end > output_bytes.try_into().unwrap() {
+        if end < start || end > crate::MeasuredCount::contract_count(output_bytes) {
             return Err(RangeSelectionError);
         }
         Ok(SizeMetadata {
@@ -4091,14 +4099,17 @@ impl PreviewProjector {
     }
 
     pub fn bounded(&self, maximum_bytes: ByteLimit) -> OutputTextExcerpt {
-        let text =
-            Utf8Prefix::new(&self.preview_text, maximum_bytes.try_into().unwrap()).into_string();
+        let text = Utf8Prefix::new(
+            &self.preview_text,
+            crate::MeasuredCount::measured_count(maximum_bytes),
+        )
+        .into_string();
         let projected_bytes = text.len() as u64;
         let truncation = if projected_bytes < self.original_bytes {
             Some(Truncation {
                 source_kind: self.source.clone(),
                 filesystem_path_option: Some(self.path.display().to_string()),
-                original_bytes: Some(self.original_bytes.try_into().unwrap()),
+                original_bytes: Some(crate::MeasuredCount::contract_count(self.original_bytes)),
                 projected_bytes: crate::MeasuredCount::contract_count(projected_bytes),
                 truncation_reason: TruncationReason::ProjectionLimit,
             })
@@ -4150,14 +4161,17 @@ impl TranscriptBlockPreviewProjector {
     }
 
     pub fn bounded(&self, maximum_bytes: ByteLimit) -> TranscriptTextExcerpt {
-        let text =
-            Utf8Prefix::new(&self.preview_text, maximum_bytes.try_into().unwrap()).into_string();
+        let text = Utf8Prefix::new(
+            &self.preview_text,
+            crate::MeasuredCount::measured_count(maximum_bytes),
+        )
+        .into_string();
         let projected_bytes = text.len() as u64;
         let truncation = if projected_bytes < self.original_bytes {
             Some(Truncation {
                 source_kind: self.source.clone(),
                 filesystem_path_option: Some(self.path.display().to_string()),
-                original_bytes: Some(self.original_bytes.try_into().unwrap()),
+                original_bytes: Some(crate::MeasuredCount::contract_count(self.original_bytes)),
                 projected_bytes: crate::MeasuredCount::contract_count(projected_bytes),
                 truncation_reason: TruncationReason::ProjectionLimit,
             })
@@ -5306,11 +5320,11 @@ impl IndexedSegmentSorter {
             }
             _ => ProjectionTreeOrdering::segment_index_material(
                 self.order.clone(),
-                left.segment_index.try_into().unwrap(),
+                crate::MeasuredCount::measured_count(left.segment_index),
             )
             .cmp(&ProjectionTreeOrdering::segment_index_material(
                 self.order.clone(),
-                right.segment_index.try_into().unwrap(),
+                crate::MeasuredCount::measured_count(right.segment_index),
             ))
             .then_with(|| left.reference.as_str().cmp(right.reference.as_str())),
         });
@@ -5721,7 +5735,7 @@ impl OneBackingLineCache {
             let line = BoundedLineReader::new(
                 block.path.clone(),
                 block.source_line_number,
-                line_limit.try_into().unwrap(),
+                crate::MeasuredCount::measured_count(line_limit),
             )
             .read_line()
             .map_err(|failure| {
@@ -5794,9 +5808,9 @@ impl SizeAccumulator {
 
     pub fn finish(self) -> SizeMetadata {
         SizeMetadata {
-            byte_count_option: Some(self.byte_count.try_into().unwrap()),
-            line_count_option: Some(self.line_count.try_into().unwrap()),
-            segment_count: Some(self.segment_count.try_into().unwrap()),
+            byte_count_option: Some(crate::MeasuredCount::contract_count(self.byte_count)),
+            line_count_option: Some(crate::MeasuredCount::contract_count(self.line_count)),
+            segment_count: Some(crate::MeasuredCount::contract_count(self.segment_count)),
             size_certainty: SizeCertainty::Exact,
         }
     }
@@ -5826,8 +5840,8 @@ impl SizeMetadataFactory {
 
     pub fn exact(&self) -> SizeMetadata {
         SizeMetadata {
-            byte_count_option: Some(self.byte_count.try_into().unwrap()),
-            line_count_option: Some(self.line_count.try_into().unwrap()),
+            byte_count_option: Some(crate::MeasuredCount::contract_count(self.byte_count)),
+            line_count_option: Some(crate::MeasuredCount::contract_count(self.line_count)),
             segment_count: self.segment_count.map(crate::MeasuredCount::contract_count),
             size_certainty: SizeCertainty::Exact,
         }

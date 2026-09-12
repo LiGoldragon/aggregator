@@ -27,8 +27,8 @@ use crate::{Error, Result};
 /// let one text exhaust the process.
 pub const MAXIMUM_DATOM_EXTENT: i64 = 1 << 20;
 
-/// The same extent expressed as a byte count for the protos reader.
-pub const MAXIMUM_DATOM_TEXT_BYTES: usize = 1 << 20;
+/// The same extent as a byte count, which is what the protos reader spends.
+pub const MAXIMUM_DATOM_TEXT_BYTES: usize = MAXIMUM_DATOM_EXTENT as usize;
 
 /// The greatest nesting a Datom text may reach.
 pub const MAXIMUM_DATOM_DEPTH: i64 = 256;

@@ -25,4 +25,11 @@ impl MeasuredCount {
     pub fn indexable_count(value: i64) -> Option<usize> {
         usize::try_from(value).ok()
     }
+
+    /// Reads a contract count as a length. A negative count is not a length and
+    /// bounds nothing, so it reads as zero rather than panicking on a peer
+    /// value the runtime never produced.
+    pub fn bounded_length(value: i64) -> usize {
+        usize::try_from(value).unwrap_or(0)
+    }
 }

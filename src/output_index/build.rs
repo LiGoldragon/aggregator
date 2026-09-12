@@ -503,7 +503,7 @@ impl BoundedGenerationBuilder {
             session_reference.clone(),
             subagent_reference.clone(),
             fingerprint.clone(),
-            preview_limit.try_into().unwrap(),
+            crate::MeasuredCount::contract_count(preview_limit),
         );
         self.write_projection(ProjectionRecordDto::Output(self.output_dto(&output)))?;
         self.write_projection(ProjectionRecordDto::Segment(
@@ -522,7 +522,7 @@ impl BoundedGenerationBuilder {
                 session_reference.clone(),
                 block_subagent,
                 fingerprint.clone(),
-                preview_limit.try_into().unwrap(),
+                crate::MeasuredCount::contract_count(preview_limit),
             );
             self.write_projection(ProjectionRecordDto::TranscriptBlock(
                 self.block_dto(&indexed),
@@ -727,15 +727,15 @@ impl BoundedGenerationBuilder {
                 output
                     .size
                     .byte_count_option
-                    .map_or(0, |count| count.try_into().unwrap()),
+                    .map_or(0, crate::MeasuredCount::measured_count),
                 output
                     .size
                     .line_count_option
-                    .map_or(0, |count| count.try_into().unwrap()),
+                    .map_or(0, crate::MeasuredCount::measured_count),
                 output
                     .size
                     .segment_count
-                    .map_or(0, |count| count.try_into().unwrap()),
+                    .map_or(0, crate::MeasuredCount::measured_count),
                 1,
             ),
             preview_text: output.preview_text.clone(),
@@ -764,15 +764,15 @@ impl BoundedGenerationBuilder {
                 segment
                     .size
                     .byte_count_option
-                    .map_or(0, |count| count.try_into().unwrap()),
+                    .map_or(0, crate::MeasuredCount::measured_count),
                 segment
                     .size
                     .line_count_option
-                    .map_or(0, |count| count.try_into().unwrap()),
+                    .map_or(0, crate::MeasuredCount::measured_count),
                 segment
                     .size
                     .segment_count
-                    .map_or(0, |count| count.try_into().unwrap()),
+                    .map_or(0, crate::MeasuredCount::measured_count),
                 1,
             ),
             preview_text: segment.preview_text.clone(),
@@ -814,15 +814,15 @@ impl BoundedGenerationBuilder {
                 block
                     .size
                     .byte_count_option
-                    .map_or(0, |count| count.try_into().unwrap()),
+                    .map_or(0, crate::MeasuredCount::measured_count),
                 block
                     .size
                     .line_count_option
-                    .map_or(0, |count| count.try_into().unwrap()),
+                    .map_or(0, crate::MeasuredCount::measured_count),
                 block
                     .size
                     .segment_count
-                    .map_or(0, |count| count.try_into().unwrap()),
+                    .map_or(0, crate::MeasuredCount::measured_count),
                 1,
             ),
             text_availability: TranscriptBlockTextAvailabilityCode::new(

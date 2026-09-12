@@ -1171,7 +1171,9 @@ impl TranscriptProjectionState {
 
     pub fn observe(&mut self, record: TranscriptRecord) {
         self.source_volume.observe(&record);
-        if self.segments.len() as u64 >= self.limit_policy.maximum_segments.try_into().unwrap() {
+        if self.segments.len() as u64
+            >= crate::MeasuredCount::measured_count(self.limit_policy.maximum_segments)
+        {
             self.segment_limit_truncated = SegmentLimitTruncation::Truncated;
             return;
         }
@@ -1223,7 +1225,7 @@ impl TranscriptProjectionState {
                 let remaining_request_bytes = self
                     .limit_policy
                     .maximum_bytes
-                    .saturating_sub(self.projected_bytes.try_into().unwrap());
+                    .saturating_sub(crate::MeasuredCount::contract_count(self.projected_bytes));
                 let truncation_reason = if remaining_request_bytes < bound.maximum_bytes {
                     TruncationReason::RequestLimit
                 } else {
@@ -1239,7 +1241,9 @@ impl TranscriptProjectionState {
                     self.truncations.push(Truncation {
                         source_kind: record.source.clone(),
                         filesystem_path_option: Some(record.filesystem_path()),
-                        original_bytes: Some(record.byte_count().try_into().unwrap()),
+                        original_bytes: Some(crate::MeasuredCount::contract_count(
+                            record.byte_count(),
+                        )),
                         projected_bytes: excerpt.byte_count,
                         truncation_reason,
                     });
@@ -1277,7 +1281,7 @@ impl TextProjectionLimit {
             Some(Truncation {
                 source_kind: record.source.clone(),
                 filesystem_path_option: Some(record.filesystem_path()),
-                original_bytes: Some(record.byte_count().try_into().unwrap()),
+                original_bytes: Some(crate::MeasuredCount::contract_count(record.byte_count())),
                 projected_bytes: crate::MeasuredCount::contract_count(projected_bytes),
                 truncation_reason: self.truncation_reason.clone(),
             })
@@ -1499,16 +1503,24 @@ impl TranscriptScanLimits {
         limits: &meta_signal_aggregator::OutputInterfaceLimitPolicy,
     ) -> Self {
         Self::new(TranscriptScanLimitConfiguration::new(
-            MaximumScanEntries::new(limits.maximum_transcript_scan_entries.try_into().unwrap()),
+            MaximumScanEntries::new(crate::MeasuredCount::measured_count(
+                limits.maximum_transcript_scan_entries,
+            )),
             MaximumDiscoveredFiles::new(
                 limits
                     .maximum_transcript_discovered_files
                     .try_into()
                     .unwrap(),
             ),
-            MaximumFileBytes::new(limits.maximum_transcript_file_bytes.try_into().unwrap()),
-            MaximumLineBytes::new(limits.maximum_transcript_line_bytes.try_into().unwrap()),
-            MaximumReadFailures::new(limits.maximum_transcript_read_failures.try_into().unwrap()),
+            MaximumFileBytes::new(crate::MeasuredCount::measured_count(
+                limits.maximum_transcript_file_bytes,
+            )),
+            MaximumLineBytes::new(crate::MeasuredCount::measured_count(
+                limits.maximum_transcript_line_bytes,
+            )),
+            MaximumReadFailures::new(crate::MeasuredCount::measured_count(
+                limits.maximum_transcript_read_failures,
+            )),
         ))
     }
 
