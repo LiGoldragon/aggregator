@@ -4357,8 +4357,8 @@ impl<'a> TranscriptBlockQueryValidator<'a> {
         Self { query }
     }
 
-    /// Projects the flat arena the contract carries into the matching engine's
-    /// tree. An index outside the arena, a cycle, or a pathological shape is a
+    /// Projects the tree the contract carries into the matching engine's tree.
+    /// A tree past its depth or node bound, or a pathological shape, is a
     /// rejected query, never a panic and never an unbounded walk.
     pub fn validate(
         &self,

@@ -57,8 +57,7 @@ use signal_aggregator::{
     SourceSelection, SubagentListFilter, SubagentListRequest, TimeRange, TimeWindow,
     TranscriptBlockEstimateRequest, TranscriptBlockFilter, TranscriptBlockKind,
     TranscriptBlockKindSelection, TranscriptBlockListRequest, TranscriptBlockReadRequest,
-    TranscriptBlockSearchRequest, TranscriptBlockTextAvailability, TranscriptBlockTextQuery,
-    TruncationReason, VersionQuery,
+    TranscriptBlockSearchRequest, TranscriptBlockTextAvailability, TruncationReason, VersionQuery,
 };
 use tempfile::TempDir;
 
@@ -101,7 +100,7 @@ fn example_collect_query_carries_the_written_window_and_limits() {
 }
 
 #[test]
-fn example_search_query_carries_a_flat_arena_the_engine_accepts() {
+fn example_search_query_carries_a_tree_the_engine_accepts() {
     let query = DatomText::read::<Query>(
         "example search",
         include_str!("../examples/transcript-block-search.datom").trim(),
@@ -110,14 +109,14 @@ fn example_search_query_carries_a_flat_arena_the_engine_accepts() {
     let Query::SearchTranscriptBlocks(request) = query else {
         panic!("examples/transcript-block-search.datom must carry a search query");
     };
-    assert_eq!(
-        request.transcript_block_text_query.text_query_nodes.len(),
-        3
-    );
+    assert!(matches!(
+        &request.transcript_block_text_query,
+        signal_aggregator::TextQuery::AllOf(children) if children.len() == 2
+    ));
     assert_eq!(
         ContractQueryProjection::new(&request.transcript_block_text_query)
             .project()
-            .expect("the example arena must project"),
+            .expect("the example tree must project"),
         TextQuery::all_of(vec![
             TextQuery::near(
                 QueryTerm::word("quota"),
@@ -3204,24 +3203,22 @@ fn transcript_block_reads_reject_missing_broken_stale_unavailable_and_invalid_qu
         OperationRejectionReason::InvalidQuery
     );
 
-    for broken_arena in [
-        TranscriptBlockTextQuery {
-            text_query_nodes: vec![signal_aggregator::TextQueryNode::AllOf(vec![9])],
-            text_query_root: 0,
-        },
-        TranscriptBlockTextQuery {
-            text_query_nodes: vec![
-                signal_aggregator::TextQueryNode::Not(1),
-                signal_aggregator::TextQueryNode::Not(0),
-            ],
-            text_query_root: 0,
-        },
+    let leaf = signal_aggregator::TextQuery::Contains(signal_aggregator::TextQueryTerm::Word(
+        String::from("block"),
+    ));
+    let mut too_deep = leaf.clone();
+    for _ in 0..64 {
+        too_deep = signal_aggregator::TextQuery::Not(Box::new(too_deep));
+    }
+    for unbounded_tree in [
+        too_deep,
+        signal_aggregator::TextQuery::AnyOf(vec![leaf; 512]),
     ] {
         let rejected = nexus
             .search_transcript_blocks(TranscriptBlockSearchRequest {
-                request_identifier: String::from("broken-arena"),
+                request_identifier: String::from("unbounded-tree"),
                 transcript_block_filter: all_transcript_block_filter(),
-                transcript_block_text_query: broken_arena,
+                transcript_block_text_query: unbounded_tree,
                 page_request: PageRequest {
                     page_limit: 10,
                     page_cursor: None,
@@ -3229,7 +3226,7 @@ fn transcript_block_reads_reject_missing_broken_stale_unavailable_and_invalid_qu
                 },
                 card_projection: CardProjection::MetadataOnly,
             })
-            .expect_err("an arena that is not a finite tree is rejected");
+            .expect_err("a tree past its depth or node bound is rejected");
         assert_eq!(
             rejected.operation_rejection_reason,
             OperationRejectionReason::InvalidQuery

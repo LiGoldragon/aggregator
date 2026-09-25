@@ -1,6 +1,6 @@
 [package]
 name         = "aggregator"
-version      = "0.7.0"
+version      = "0.8.0"
 edition      = "2024"
 rust-version = "1.89"
 license      = "MIT OR Apache-2.0"
@@ -33,13 +33,13 @@ blake3 = "1"
 datom-codec            = { git = "https://github.com/LiGoldragon/datom-codec", rev = "6dccc76b75918a91d3370a9d4fe88aa7dd567876" }
 dotos-text-query       = { git = "https://github.com/LiGoldragon/dotos-text-query.git", rev = "aee1a446bb3236858d7157bad88dd63550abc25b", default-features = false }
 fs2 = "0.4"
-meta-signal-aggregator = { git = "https://github.com/LiGoldragon/meta-signal-aggregator", rev = "5baab6475ff70f555f514e69f2e671cd54d6e636", features = ["datom"] }
+meta-signal-aggregator = { git = "https://github.com/LiGoldragon/meta-signal-aggregator", rev = "f7e9f4ff57f10da0f436ceeddc9aadcc6418f97c", features = ["datom"] }
 protos                 = { git = "https://github.com/LiGoldragon/protos", rev = "171b21f65337983ab624b7b906397a4f1f92c5a3" }
 rkyv                   = { version = "0.8", default-features = false, features = ["std", "bytecheck", "little_endian", "pointer_width_32", "unaligned"] }
 serde                  = { version = "1", features = ["derive"] }
 serde_json             = "1"
 signal                 = { git = "https://github.com/LiGoldragon/signal", rev = "48ae17b485f2781e8ec1ca02a7fe04ad28a37f9f", default-features = false }
-signal-aggregator      = { git = "https://github.com/LiGoldragon/signal-aggregator", rev = "b21dc9fdf8580341a66dfceb01e9aae1b36b9783", features = ["datom"] }
+signal-aggregator      = { git = "https://github.com/LiGoldragon/signal-aggregator", rev = "d5ce22622bb499da89a87a394d01da9d31dffbb7", features = ["datom"] }
 thiserror              = "2"
 time                   = { version = "0.3", features = ["formatting", "parsing"] }
 

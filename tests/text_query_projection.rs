@@ -1,7 +1,7 @@
-//! The flat arena the contract carries and the tree the matching engine runs.
+//! The tree the contract carries and the tree the matching engine runs.
 //!
-//! Expected values are written here as engine trees and as arenas by hand; no
-//! expectation is computed through the projection under test.
+//! Expected values are written here as engine trees and as contract trees by
+//! hand; no expectation is computed through the projection under test.
 
 use aggregator::{
     ContractEvidenceProjection, ContractQueryProjection, EngineEvidenceProjection,
@@ -12,8 +12,9 @@ use dotos_text_query::{
     SearchText, WordDistance, evidence::NearOccurrencePair,
 };
 use signal_aggregator::{
-    MatchEvidenceNode, SearchPhrase, TextQueryNode, TextQueryTerm, TranscriptBlockSearchEvidence,
-    TranscriptBlockTextQuery,
+    ContainsEvidence as ContractContainsEvidence, MatchEvidence as ContractMatchEvidence,
+    NearEvidence as ContractNearEvidence, NearOccurrencePair as ContractNearOccurrencePair,
+    NearTextQuery, Occurrence as ContractOccurrence, SearchPhrase, TextQuery, TextQueryTerm,
 };
 
 fn nested_query() -> Query {
@@ -35,32 +36,28 @@ fn nested_query() -> Query {
 }
 
 #[test]
-fn a_nested_query_survives_the_arena_unchanged() {
-    let arena = EngineQueryProjection::new(&nested_query()).project();
+fn a_nested_query_survives_the_contract_tree_unchanged() {
+    let tree = EngineQueryProjection::new(&nested_query()).project();
     assert_eq!(
-        ContractQueryProjection::new(&arena)
+        ContractQueryProjection::new(&tree)
             .project()
-            .expect("the arena must project"),
+            .expect("the tree must project"),
         nested_query()
     );
 }
 
 #[test]
-fn a_hand_written_arena_names_its_children_by_index() {
-    let arena = TranscriptBlockTextQuery {
-        text_query_nodes: vec![
-            TextQueryNode::Contains(TextQueryTerm::Word(String::from("alpha"))),
-            TextQueryNode::Contains(TextQueryTerm::Phrase(SearchPhrase {
-                search_words: vec![String::from("bounded"), String::from("text")],
-            })),
-            TextQueryNode::AnyOf(vec![0, 1]),
-        ],
-        text_query_root: 2,
-    };
+fn a_hand_written_tree_carries_its_children_in_place() {
+    let tree = TextQuery::AnyOf(vec![
+        TextQuery::Contains(TextQueryTerm::Word(String::from("alpha"))),
+        TextQuery::Contains(TextQueryTerm::Phrase(SearchPhrase {
+            search_words: vec![String::from("bounded"), String::from("text")],
+        })),
+    ]);
     assert_eq!(
-        ContractQueryProjection::new(&arena)
+        ContractQueryProjection::new(&tree)
             .project()
-            .expect("the arena must project"),
+            .expect("the tree must project"),
         Query::any_of(vec![
             Query::contains(QueryTerm::word("alpha")),
             Query::contains(QueryTerm::phrase(vec![
@@ -72,79 +69,88 @@ fn a_hand_written_arena_names_its_children_by_index() {
 }
 
 #[test]
-fn an_index_outside_the_arena_is_a_fault() {
-    let arena = TranscriptBlockTextQuery {
-        text_query_nodes: vec![TextQueryNode::AllOf(vec![7])],
-        text_query_root: 0,
-    };
+fn the_engine_tree_projects_to_the_hand_written_contract_tree() {
     assert_eq!(
-        ContractQueryProjection::new(&arena).project(),
-        Err(TextQueryProjectionFault::IndexOutsideArena {
-            index: 7,
-            length: 1,
-        })
+        EngineQueryProjection::new(&nested_query()).project(),
+        TextQuery::AllOf(vec![
+            TextQuery::Contains(TextQueryTerm::Word(String::from("quota"))),
+            TextQuery::AnyOf(vec![
+                TextQuery::Contains(TextQueryTerm::Phrase(SearchPhrase {
+                    search_words: vec![String::from("rate"), String::from("limit")],
+                })),
+                TextQuery::Not(Box::new(TextQuery::Contains(TextQueryTerm::Word(
+                    String::from("draft"),
+                )))),
+            ]),
+            TextQuery::Near(NearTextQuery {
+                left_text_query_term: TextQueryTerm::Word(String::from("quota")),
+                right_text_query_term: TextQueryTerm::Word(String::from("reset")),
+                word_distance: 6,
+            }),
+        ])
     );
 }
 
 #[test]
-fn a_negative_index_is_a_fault() {
-    let arena = TranscriptBlockTextQuery {
-        text_query_nodes: vec![TextQueryNode::Not(-1)],
-        text_query_root: 0,
-    };
+fn a_word_distance_the_engine_cannot_hold_is_a_fault() {
+    let tree = TextQuery::Near(NearTextQuery {
+        left_text_query_term: TextQueryTerm::Word(String::from("quota")),
+        right_text_query_term: TextQueryTerm::Word(String::from("reset")),
+        word_distance: -1,
+    });
     assert_eq!(
-        ContractQueryProjection::new(&arena).project(),
-        Err(TextQueryProjectionFault::IndexOutsideArena {
-            index: -1,
-            length: 1,
-        })
+        ContractQueryProjection::new(&tree).project(),
+        Err(TextQueryProjectionFault::DistanceOutsideRange { distance: -1 })
     );
 }
 
 #[test]
-fn a_node_that_reaches_itself_is_a_fault() {
-    let arena = TranscriptBlockTextQuery {
-        text_query_nodes: vec![TextQueryNode::Not(1), TextQueryNode::AllOf(vec![0])],
-        text_query_root: 0,
-    };
+fn a_tree_wider_than_the_node_bound_is_a_fault() {
+    let leaf = TextQuery::Contains(TextQueryTerm::Word(String::from("leaf")));
+    let tree = TextQuery::AnyOf(vec![leaf; 256]);
     assert_eq!(
-        ContractQueryProjection::new(&arena).project(),
-        Err(TextQueryProjectionFault::Cycle { index: 0 })
+        ContractQueryProjection::new(&tree).project(),
+        Err(TextQueryProjectionFault::TooLarge)
     );
 }
 
 #[test]
-fn an_arena_deeper_than_the_bound_is_a_fault() {
-    let depth = 64;
-    let mut text_query_nodes = vec![TextQueryNode::Contains(TextQueryTerm::Word(String::from(
-        "leaf",
-    )))];
-    for index in 0..depth {
-        text_query_nodes.push(TextQueryNode::Not(index));
+fn a_tree_at_the_node_bound_projects() {
+    let leaf = TextQuery::Contains(TextQueryTerm::Word(String::from("leaf")));
+    let tree = TextQuery::AnyOf(vec![leaf; 255]);
+    assert_eq!(
+        ContractQueryProjection::new(&tree)
+            .project()
+            .expect("255 leaves and their parent are 256 nodes"),
+        Query::any_of(vec![Query::contains(QueryTerm::word("leaf")); 255])
+    );
+}
+
+#[test]
+fn a_tree_deeper_than_the_bound_is_a_fault() {
+    let mut tree = TextQuery::Contains(TextQueryTerm::Word(String::from("leaf")));
+    for _ in 0..64 {
+        tree = TextQuery::Not(Box::new(tree));
     }
-    let arena = TranscriptBlockTextQuery {
-        text_query_root: depth,
-        text_query_nodes,
-    };
     assert_eq!(
-        ContractQueryProjection::new(&arena).project(),
+        ContractQueryProjection::new(&tree).project(),
         Err(TextQueryProjectionFault::TooDeep)
     );
 }
 
 #[test]
-fn evidence_from_a_real_match_survives_the_arena_unchanged() {
+fn evidence_from_a_real_match_survives_the_contract_tree_unchanged() {
     let text = SearchText::new("quota reset is pending, the rate limit holds");
     let evidence = nested_query()
         .find_in(&text)
         .evidence()
         .cloned()
         .expect("the corpus must match the query");
-    let arena = EngineEvidenceProjection::new(&evidence).project();
+    let tree = EngineEvidenceProjection::new(&evidence).project();
     assert_eq!(
-        ContractEvidenceProjection::new(&arena)
+        ContractEvidenceProjection::new(&tree)
             .project()
-            .expect("the evidence arena must project"),
+            .expect("the evidence tree must project"),
         evidence
     );
 }
@@ -168,32 +174,69 @@ fn hand_written_evidence_carries_its_occurrences() {
             )],
         )),
     ]));
-    let arena = EngineEvidenceProjection::new(&evidence).project();
-    assert_eq!(arena.match_evidence_nodes.len(), 4);
-    assert_eq!(arena.match_evidence_root, 3);
-    assert!(matches!(
-        arena.match_evidence_nodes[1],
-        MatchEvidenceNode::Not
-    ));
+    let tree = EngineEvidenceProjection::new(&evidence).project();
     assert_eq!(
-        ContractEvidenceProjection::new(&arena)
+        tree,
+        ContractMatchEvidence::AllOf(vec![
+            ContractMatchEvidence::Contains(ContractContainsEvidence {
+                text_query_term: TextQueryTerm::Word(String::from("quota")),
+                occurrences: vec![ContractOccurrence {
+                    start_word_position: 0,
+                    end_word_position: 0,
+                }],
+            }),
+            ContractMatchEvidence::Not,
+            ContractMatchEvidence::Near(ContractNearEvidence {
+                left_text_query_term: TextQueryTerm::Word(String::from("quota")),
+                right_text_query_term: TextQueryTerm::Word(String::from("reset")),
+                word_distance: 6,
+                near_occurrence_pairs: vec![ContractNearOccurrencePair {
+                    left_occurrence: ContractOccurrence {
+                        start_word_position: 0,
+                        end_word_position: 0,
+                    },
+                    right_occurrence: ContractOccurrence {
+                        start_word_position: 1,
+                        end_word_position: 1,
+                    },
+                    occurrence_gap: 0,
+                }],
+            }),
+        ])
+    );
+    assert_eq!(
+        ContractEvidenceProjection::new(&tree)
             .project()
-            .expect("the evidence arena must project"),
+            .expect("the evidence tree must project"),
         evidence
     );
 }
 
 #[test]
-fn an_evidence_index_outside_the_arena_is_a_fault() {
-    let arena = TranscriptBlockSearchEvidence {
-        match_evidence_nodes: vec![MatchEvidenceNode::AnyOf(vec![3])],
-        match_evidence_root: 0,
-    };
+fn an_evidence_position_the_engine_cannot_hold_is_a_fault() {
+    let tree = ContractMatchEvidence::AnyOf(vec![ContractMatchEvidence::Contains(
+        ContractContainsEvidence {
+            text_query_term: TextQueryTerm::Word(String::from("quota")),
+            occurrences: vec![ContractOccurrence {
+                start_word_position: -3,
+                end_word_position: 0,
+            }],
+        },
+    )]);
     assert_eq!(
-        ContractEvidenceProjection::new(&arena).project(),
-        Err(TextQueryProjectionFault::IndexOutsideArena {
-            index: 3,
-            length: 1,
-        })
+        ContractEvidenceProjection::new(&tree).project(),
+        Err(TextQueryProjectionFault::PositionOutsideRange { position: -3 })
+    );
+}
+
+#[test]
+fn an_evidence_tree_deeper_than_the_bound_is_a_fault() {
+    let mut tree = ContractMatchEvidence::Not;
+    for _ in 0..64 {
+        tree = ContractMatchEvidence::AllOf(vec![tree]);
+    }
+    assert_eq!(
+        ContractEvidenceProjection::new(&tree).project(),
+        Err(TextQueryProjectionFault::TooDeep)
     );
 }

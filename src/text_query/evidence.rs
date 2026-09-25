@@ -1,22 +1,21 @@
-//! Matching evidence in both shapes: the engine's tree and the contract's flat arena.
+//! Matching evidence in both shapes: the engine's tree and the contract's tree.
 
 use dotos_text_query::{
     CompositeEvidence, ContainsEvidence, MatchEvidence, NearEvidence, Occurrence,
     evidence::NearOccurrencePair,
 };
 use signal_aggregator::{
-    ContainsEvidence as ContractContainsEvidence, MatchEvidenceNode,
+    ContainsEvidence as ContractContainsEvidence, MatchEvidence as ContractMatchEvidence,
     NearEvidence as ContractNearEvidence, NearOccurrencePair as ContractNearOccurrencePair,
     Occurrence as ContractOccurrence, TranscriptBlockSearchEvidence,
 };
 
 use crate::text_query::{
-    ArenaIndex, ContractWordDistance, ContractWordPosition, MAXIMUM_PROJECTION_DEPTH,
-    MAXIMUM_PROJECTION_NODES, TextQueryProjectionFault,
+    ContractWordDistance, ContractWordPosition, ProjectionBudget, TextQueryProjectionFault,
     query::{ContractQueryTerm, EngineQueryTerm},
 };
 
-/// Reads the engine's evidence tree and yields a contract arena.
+/// Reads the engine's evidence tree and yields a contract tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineEvidenceProjection<'a> {
     evidence: &'a MatchEvidence,
@@ -28,18 +27,13 @@ impl<'a> EngineEvidenceProjection<'a> {
     }
 
     pub fn project(&self) -> TranscriptBlockSearchEvidence {
-        let mut nodes = Vec::new();
-        let root = Self::append(self.evidence, &mut nodes);
-        TranscriptBlockSearchEvidence {
-            match_evidence_nodes: nodes,
-            match_evidence_root: root,
-        }
+        Self::node(self.evidence)
     }
 
-    fn append(evidence: &MatchEvidence, nodes: &mut Vec<MatchEvidenceNode>) -> i64 {
-        let node = match evidence {
+    fn node(evidence: &MatchEvidence) -> ContractMatchEvidence {
+        match evidence {
             MatchEvidence::Contains(contains) => {
-                MatchEvidenceNode::Contains(ContractContainsEvidence {
+                ContractMatchEvidence::Contains(ContractContainsEvidence {
                     text_query_term: EngineQueryTerm::new(&contains.term).project(),
                     occurrences: contains
                         .occurrences
@@ -49,13 +43,13 @@ impl<'a> EngineEvidenceProjection<'a> {
                 })
             }
             MatchEvidence::AllOf(composite) => {
-                MatchEvidenceNode::AllOf(Self::append_children(composite, nodes))
+                ContractMatchEvidence::AllOf(Self::children(composite))
             }
             MatchEvidence::AnyOf(composite) => {
-                MatchEvidenceNode::AnyOf(Self::append_children(composite, nodes))
+                ContractMatchEvidence::AnyOf(Self::children(composite))
             }
-            MatchEvidence::Not => MatchEvidenceNode::Not,
-            MatchEvidence::Near(near) => MatchEvidenceNode::Near(ContractNearEvidence {
+            MatchEvidence::Not => ContractMatchEvidence::Not,
+            MatchEvidence::Near(near) => ContractMatchEvidence::Near(ContractNearEvidence {
                 left_text_query_term: EngineQueryTerm::new(&near.left).project(),
                 right_text_query_term: EngineQueryTerm::new(&near.right).project(),
                 word_distance: i64::from(near.distance.0),
@@ -69,24 +63,15 @@ impl<'a> EngineEvidenceProjection<'a> {
                     })
                     .collect(),
             }),
-        };
-        nodes.push(node);
-        (nodes.len() - 1) as i64
+        }
     }
 
-    fn append_children(
-        composite: &CompositeEvidence,
-        nodes: &mut Vec<MatchEvidenceNode>,
-    ) -> Vec<i64> {
-        composite
-            .matches
-            .iter()
-            .map(|child| Self::append(child, nodes))
-            .collect()
+    fn children(composite: &CompositeEvidence) -> Vec<ContractMatchEvidence> {
+        composite.matches.iter().map(Self::node).collect()
     }
 }
 
-/// Reads a contract evidence arena and yields the engine's tree.
+/// Reads a contract evidence tree and yields the engine's tree.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ContractEvidenceProjection<'a> {
     evidence: &'a TranscriptBlockSearchEvidence,
@@ -98,50 +83,34 @@ impl<'a> ContractEvidenceProjection<'a> {
     }
 
     pub fn project(&self) -> Result<MatchEvidence, TextQueryProjectionFault> {
-        let length = self.evidence.match_evidence_nodes.len();
-        if length > MAXIMUM_PROJECTION_NODES {
-            return Err(TextQueryProjectionFault::TooLarge { length });
-        }
-        self.node(self.evidence.match_evidence_root, &mut Vec::new())
+        Self::node(self.evidence, &mut ProjectionBudget::default())
     }
 
     fn node(
-        &self,
-        index: i64,
-        reaching: &mut Vec<i64>,
+        evidence: &ContractMatchEvidence,
+        budget: &mut ProjectionBudget,
     ) -> Result<MatchEvidence, TextQueryProjectionFault> {
-        if reaching.contains(&index) {
-            return Err(TextQueryProjectionFault::Cycle { index });
-        }
-        if reaching.len() >= MAXIMUM_PROJECTION_DEPTH {
-            return Err(TextQueryProjectionFault::TooDeep);
-        }
-        let nodes = &self.evidence.match_evidence_nodes;
-        let resolved = ArenaIndex::new(index, nodes.len()).resolve()?;
-        reaching.push(index);
-        let projected = match &nodes[resolved] {
-            MatchEvidenceNode::Contains(contains) => Self::contains(contains),
-            MatchEvidenceNode::AllOf(children) => self
-                .children(children, reaching)
+        budget.enter()?;
+        let projected = match evidence {
+            ContractMatchEvidence::Contains(contains) => Self::contains(contains),
+            ContractMatchEvidence::AllOf(children) => Self::children(children, budget)
                 .map(|matches| MatchEvidence::AllOf(CompositeEvidence::new(matches))),
-            MatchEvidenceNode::AnyOf(children) => self
-                .children(children, reaching)
+            ContractMatchEvidence::AnyOf(children) => Self::children(children, budget)
                 .map(|matches| MatchEvidence::AnyOf(CompositeEvidence::new(matches))),
-            MatchEvidenceNode::Not => Ok(MatchEvidence::Not),
-            MatchEvidenceNode::Near(near) => Self::near(near),
+            ContractMatchEvidence::Not => Ok(MatchEvidence::Not),
+            ContractMatchEvidence::Near(near) => Self::near(near),
         };
-        reaching.pop();
+        budget.leave();
         projected
     }
 
     fn children(
-        &self,
-        children: &[i64],
-        reaching: &mut Vec<i64>,
+        children: &[ContractMatchEvidence],
+        budget: &mut ProjectionBudget,
     ) -> Result<Vec<MatchEvidence>, TextQueryProjectionFault> {
         children
             .iter()
-            .map(|child| self.node(*child, reaching))
+            .map(|child| Self::node(child, budget))
             .collect()
     }
 

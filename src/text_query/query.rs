@@ -1,17 +1,14 @@
-//! The text query in both shapes: the contract's flat arena and the engine's tree.
+//! The text query in both shapes: the contract's tree and the engine's tree.
 
 use dotos_text_query::{NearQuery, Query, QueryTerm, SearchPhrase, SearchWord};
 use signal_aggregator::{
-    NearTextQuery, SearchPhrase as ContractSearchPhrase, TextQueryNode, TextQueryTerm,
+    NearTextQuery, SearchPhrase as ContractSearchPhrase, TextQuery, TextQueryTerm,
     TranscriptBlockTextQuery,
 };
 
-use crate::text_query::{
-    ArenaIndex, ContractWordDistance, MAXIMUM_PROJECTION_DEPTH, MAXIMUM_PROJECTION_NODES,
-    TextQueryProjectionFault,
-};
+use crate::text_query::{ContractWordDistance, ProjectionBudget, TextQueryProjectionFault};
 
-/// Reads a contract arena and yields the engine's tree.
+/// Reads a contract tree and yields the engine's tree.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ContractQueryProjection<'a> {
     query: &'a TranscriptBlockTextQuery,
@@ -23,50 +20,40 @@ impl<'a> ContractQueryProjection<'a> {
     }
 
     pub fn project(&self) -> Result<Query, TextQueryProjectionFault> {
-        let length = self.query.text_query_nodes.len();
-        if length > MAXIMUM_PROJECTION_NODES {
-            return Err(TextQueryProjectionFault::TooLarge { length });
-        }
-        self.node(self.query.text_query_root, &mut Vec::new())
+        Self::node(self.query, &mut ProjectionBudget::default())
     }
 
-    fn node(&self, index: i64, reaching: &mut Vec<i64>) -> Result<Query, TextQueryProjectionFault> {
-        if reaching.contains(&index) {
-            return Err(TextQueryProjectionFault::Cycle { index });
-        }
-        if reaching.len() >= MAXIMUM_PROJECTION_DEPTH {
-            return Err(TextQueryProjectionFault::TooDeep);
-        }
-        let nodes = &self.query.text_query_nodes;
-        let resolved = ArenaIndex::new(index, nodes.len()).resolve()?;
-        reaching.push(index);
-        let projected = match &nodes[resolved] {
-            TextQueryNode::Contains(term) => {
+    fn node(
+        query: &TextQuery,
+        budget: &mut ProjectionBudget,
+    ) -> Result<Query, TextQueryProjectionFault> {
+        budget.enter()?;
+        let projected = match query {
+            TextQuery::Contains(term) => {
                 Ok(Query::Contains(ContractQueryTerm::new(term).project()))
             }
-            TextQueryNode::AllOf(children) => self.children(children, reaching).map(Query::AllOf),
-            TextQueryNode::AnyOf(children) => self.children(children, reaching).map(Query::AnyOf),
-            TextQueryNode::Not(child) => self
-                .node(*child, reaching)
-                .map(|child| Query::Not(Box::new(child))),
-            TextQueryNode::Near(near) => self.near(near),
+            TextQuery::AllOf(children) => Self::children(children, budget).map(Query::AllOf),
+            TextQuery::AnyOf(children) => Self::children(children, budget).map(Query::AnyOf),
+            TextQuery::Not(child) => {
+                Self::node(child, budget).map(|child| Query::Not(Box::new(child)))
+            }
+            TextQuery::Near(near) => Self::near(near),
         };
-        reaching.pop();
+        budget.leave();
         projected
     }
 
     fn children(
-        &self,
-        children: &[i64],
-        reaching: &mut Vec<i64>,
+        children: &[TextQuery],
+        budget: &mut ProjectionBudget,
     ) -> Result<Vec<Query>, TextQueryProjectionFault> {
         children
             .iter()
-            .map(|child| self.node(*child, reaching))
+            .map(|child| Self::node(child, budget))
             .collect()
     }
 
-    fn near(&self, near: &NearTextQuery) -> Result<Query, TextQueryProjectionFault> {
+    fn near(near: &NearTextQuery) -> Result<Query, TextQueryProjectionFault> {
         Ok(Query::Near(NearQuery::new(
             ContractQueryTerm::new(&near.left_text_query_term).project(),
             ContractQueryTerm::new(&near.right_text_query_term).project(),
@@ -75,7 +62,7 @@ impl<'a> ContractQueryProjection<'a> {
     }
 }
 
-/// Reads the engine's tree and yields a contract arena.
+/// Reads the engine's tree and yields a contract tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineQueryProjection<'a> {
     query: &'a Query,
@@ -87,37 +74,25 @@ impl<'a> EngineQueryProjection<'a> {
     }
 
     pub fn project(&self) -> TranscriptBlockTextQuery {
-        let mut nodes = Vec::new();
-        let root = Self::append(self.query, &mut nodes);
-        TranscriptBlockTextQuery {
-            text_query_nodes: nodes,
-            text_query_root: root,
-        }
+        Self::node(self.query)
     }
 
-    /// Appends a subtree in post-order, so a child always sits below its parent
-    /// and an arena written here never reaches forward.
-    fn append(query: &Query, nodes: &mut Vec<TextQueryNode>) -> i64 {
-        let node = match query {
-            Query::Contains(term) => TextQueryNode::Contains(EngineQueryTerm::new(term).project()),
-            Query::AllOf(children) => TextQueryNode::AllOf(Self::append_children(children, nodes)),
-            Query::AnyOf(children) => TextQueryNode::AnyOf(Self::append_children(children, nodes)),
-            Query::Not(child) => TextQueryNode::Not(Self::append(child, nodes)),
-            Query::Near(near) => TextQueryNode::Near(NearTextQuery {
+    fn node(query: &Query) -> TextQuery {
+        match query {
+            Query::Contains(term) => TextQuery::Contains(EngineQueryTerm::new(term).project()),
+            Query::AllOf(children) => TextQuery::AllOf(Self::children(children)),
+            Query::AnyOf(children) => TextQuery::AnyOf(Self::children(children)),
+            Query::Not(child) => TextQuery::Not(Box::new(Self::node(child))),
+            Query::Near(near) => TextQuery::Near(NearTextQuery {
                 left_text_query_term: EngineQueryTerm::new(&near.left).project(),
                 right_text_query_term: EngineQueryTerm::new(&near.right).project(),
                 word_distance: i64::from(near.distance.0),
             }),
-        };
-        nodes.push(node);
-        (nodes.len() - 1) as i64
+        }
     }
 
-    fn append_children(children: &[Query], nodes: &mut Vec<TextQueryNode>) -> Vec<i64> {
-        children
-            .iter()
-            .map(|child| Self::append(child, nodes))
-            .collect()
+    fn children(children: &[Query]) -> Vec<TextQuery> {
+        children.iter().map(Self::node).collect()
     }
 }
 

@@ -1,12 +1,11 @@
-//! Projection between the contract's flat text-query arenas and the matching
-//! engine's recursive shapes.
+//! Projection between the contract's text-query trees and the matching engine's
+//! trees.
 //!
-//! A Signal root is an rkyv archive, and rkyv's derive cannot close the trait
-//! bounds of a self-reaching type, so no recursive type crosses the wire. The
-//! contract therefore carries a text query as a vector of nodes plus a root
-//! index, and matching evidence the same way. `dotos-text-query` is the
-//! matching engine and speaks the recursive shapes; this module is the only
-//! place where the two meet, and the engine's types never reach the wire.
+//! The contract carries a transcript-block text query as the recursive
+//! `TextQuery` and matching evidence as the recursive `MatchEvidence`.
+//! `dotos-text-query` is the matching engine and speaks its own recursive
+//! shapes; this module is the only place where the two meet, and the engine's
+//! types never reach the wire.
 
 pub mod evidence;
 pub mod query;
@@ -14,62 +13,55 @@ pub mod query;
 pub use evidence::{ContractEvidenceProjection, EngineEvidenceProjection};
 pub use query::{ContractQueryProjection, EngineQueryProjection};
 
-/// The greatest nesting a projected arena may reach.
+/// The greatest nesting a projected contract tree may reach.
 ///
-/// The arena is peer input and its edges are unconstrained by the wire type, so
-/// a walk over it is bounded before it recurses rather than after.
+/// The tree is peer input and its depth is bounded only by the frame that
+/// carried it, so a walk over it is bounded as it recurses.
 pub const MAXIMUM_PROJECTION_DEPTH: usize = 32;
 
-/// The greatest number of nodes a projected arena may hold.
+/// The greatest number of nodes a projected contract tree may hold.
 pub const MAXIMUM_PROJECTION_NODES: usize = 256;
 
-/// A flat arena that does not describe a finite tree.
+/// A contract tree that is not a bounded query, or a value the engine cannot
+/// hold.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TextQueryProjectionFault {
-    #[error("node index {index} is outside the {length} node arena")]
-    IndexOutsideArena { index: i64, length: usize },
-    #[error("node index {index} reaches itself")]
-    Cycle { index: i64 },
-    #[error("arena nesting exceeds {MAXIMUM_PROJECTION_DEPTH}")]
+    #[error("tree nesting exceeds {MAXIMUM_PROJECTION_DEPTH}")]
     TooDeep,
-    #[error("arena of {length} nodes exceeds {MAXIMUM_PROJECTION_NODES}")]
-    TooLarge { length: usize },
+    #[error("tree exceeds {MAXIMUM_PROJECTION_NODES} nodes")]
+    TooLarge,
     #[error("word distance {distance} is outside the representable range")]
     DistanceOutsideRange { distance: i64 },
     #[error("word position {position} is outside the representable range")]
     PositionOutsideRange { position: i64 },
 }
 
-/// An arena index paired with the arena it indexes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ArenaIndex {
-    index: i64,
-    length: usize,
+/// What a walk over one contract tree has spent: the nesting it is inside and
+/// the nodes it has entered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProjectionBudget {
+    depth: usize,
+    nodes: usize,
 }
 
-impl ArenaIndex {
-    pub fn new(index: i64, length: usize) -> Self {
-        Self { index, length }
+impl ProjectionBudget {
+    /// Enters one node, refusing it when the tree grows past either bound. A
+    /// node is refused before its children are read.
+    pub fn enter(&mut self) -> Result<(), TextQueryProjectionFault> {
+        if self.depth >= MAXIMUM_PROJECTION_DEPTH {
+            return Err(TextQueryProjectionFault::TooDeep);
+        }
+        if self.nodes >= MAXIMUM_PROJECTION_NODES {
+            return Err(TextQueryProjectionFault::TooLarge);
+        }
+        self.depth += 1;
+        self.nodes += 1;
+        Ok(())
     }
 
-    /// Resolves the index, refusing anything the arena does not hold. A count
-    /// that must index memory is converted explicitly; a negative index is a
-    /// fault, never a wrapped cast.
-    pub fn resolve(&self) -> Result<usize, TextQueryProjectionFault> {
-        let resolved = usize::try_from(self.index).map_err(|_| {
-            TextQueryProjectionFault::IndexOutsideArena {
-                index: self.index,
-                length: self.length,
-            }
-        })?;
-        if resolved < self.length {
-            Ok(resolved)
-        } else {
-            Err(TextQueryProjectionFault::IndexOutsideArena {
-                index: self.index,
-                length: self.length,
-            })
-        }
+    /// Leaves the node last entered; its nodes stay spent.
+    pub fn leave(&mut self) {
+        self.depth -= 1;
     }
 }
 

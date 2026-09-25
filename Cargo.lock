@@ -4,14 +4,14 @@ version = 4
 
 [[package]]
 name = "aggregator"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "blake3",
- "datom-codec",
+ "datom-codec 0.27.0",
  "dotos-text-query",
  "fs2",
  "meta-signal-aggregator",
- "protos",
+ "protos 0.30.1",
  "rkyv",
  "serde",
  "serde_json",
@@ -118,14 +118,34 @@ name = "datom-codec"
 version = "0.27.0"
 source = "git+https://github.com/LiGoldragon/datom-codec?rev=6dccc76b75918a91d3370a9d4fe88aa7dd567876#6dccc76b75918a91d3370a9d4fe88aa7dd567876"
 dependencies = [
- "datom-codec-derive",
- "protos",
+ "datom-codec-derive 0.27.0",
+ "protos 0.30.1",
+]
+
+[[package]]
+name = "datom-codec"
+version = "0.31.0"
+source = "git+https://github.com/LiGoldragon/datom-codec?rev=09e2a9d52bf7f2f11e51d15cb6c3177f72c6c927#09e2a9d52bf7f2f11e51d15cb6c3177f72c6c927"
+dependencies = [
+ "datom-codec-derive 0.31.0",
+ "protos 0.31.0",
+ "rkyv",
 ]
 
 [[package]]
 name = "datom-codec-derive"
 version = "0.27.0"
 source = "git+https://github.com/LiGoldragon/datom-codec?rev=6dccc76b75918a91d3370a9d4fe88aa7dd567876#6dccc76b75918a91d3370a9d4fe88aa7dd567876"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "datom-codec-derive"
+version = "0.31.0"
+source = "git+https://github.com/LiGoldragon/datom-codec?rev=09e2a9d52bf7f2f11e51d15cb6c3177f72c6c927#09e2a9d52bf7f2f11e51d15cb6c3177f72c6c927"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -168,10 +188,24 @@ name = "ethos-zero"
 version = "9.0.0"
 source = "git+https://github.com/LiGoldragon/ethos-zero?rev=b232d35e03011161fe7ec9129ad99a9914413348#b232d35e03011161fe7ec9129ad99a9914413348"
 dependencies = [
- "datom-codec",
+ "datom-codec 0.27.0",
  "prettyplease",
  "proc-macro2",
- "protos",
+ "protos 0.30.1",
+ "quote",
+ "rkyv",
+ "syn 3.0.5",
+]
+
+[[package]]
+name = "ethos-zero"
+version = "13.0.0"
+source = "git+https://github.com/LiGoldragon/ethos-zero?rev=407f938d083a89236ef8c2c6e8a90561ec6b637a#407f938d083a89236ef8c2c6e8a90561ec6b637a"
+dependencies = [
+ "datom-codec 0.31.0",
+ "prettyplease",
+ "proc-macro2",
+ "protos 0.31.0",
  "quote",
  "rkyv",
  "syn 3.0.5",
@@ -287,12 +321,12 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "meta-signal-aggregator"
-version = "0.7.0"
-source = "git+https://github.com/LiGoldragon/meta-signal-aggregator?rev=5baab6475ff70f555f514e69f2e671cd54d6e636#5baab6475ff70f555f514e69f2e671cd54d6e636"
+version = "0.8.0"
+source = "git+https://github.com/LiGoldragon/meta-signal-aggregator?rev=f7e9f4ff57f10da0f436ceeddc9aadcc6418f97c#f7e9f4ff57f10da0f436ceeddc9aadcc6418f97c"
 dependencies = [
- "datom-codec",
- "ethos-zero",
- "protos",
+ "datom-codec 0.27.0",
+ "ethos-zero 13.0.0",
+ "protos 0.30.1",
  "rkyv",
  "signal",
  "signal-aggregator",
@@ -365,6 +399,11 @@ dependencies = [
 name = "protos"
 version = "0.30.1"
 source = "git+https://github.com/LiGoldragon/protos?rev=171b21f65337983ab624b7b906397a4f1f92c5a3#171b21f65337983ab624b7b906397a4f1f92c5a3"
+
+[[package]]
+name = "protos"
+version = "0.31.0"
+source = "git+https://github.com/LiGoldragon/protos?rev=1febca7836bf8d5f5973a302fdd50aa9c84c159b#1febca7836bf8d5f5973a302fdd50aa9c84c159b"
 
 [[package]]
 name = "ptr_meta"
@@ -522,21 +561,21 @@ name = "signal"
 version = "4.0.0"
 source = "git+https://github.com/LiGoldragon/signal?rev=48ae17b485f2781e8ec1ca02a7fe04ad28a37f9f#48ae17b485f2781e8ec1ca02a7fe04ad28a37f9f"
 dependencies = [
- "datom-codec",
- "ethos-zero",
- "protos",
+ "datom-codec 0.27.0",
+ "ethos-zero 9.0.0",
+ "protos 0.30.1",
  "rkyv",
  "thiserror",
 ]
 
 [[package]]
 name = "signal-aggregator"
-version = "0.9.0"
-source = "git+https://github.com/LiGoldragon/signal-aggregator?rev=b21dc9fdf8580341a66dfceb01e9aae1b36b9783#b21dc9fdf8580341a66dfceb01e9aae1b36b9783"
+version = "1.0.0"
+source = "git+https://github.com/LiGoldragon/signal-aggregator?rev=d5ce22622bb499da89a87a394d01da9d31dffbb7#d5ce22622bb499da89a87a394d01da9d31dffbb7"
 dependencies = [
- "datom-codec",
- "ethos-zero",
- "protos",
+ "datom-codec 0.27.0",
+ "ethos-zero 13.0.0",
+ "protos 0.30.1",
  "rkyv",
  "signal",
 ]

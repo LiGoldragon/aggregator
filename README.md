@@ -15,7 +15,7 @@ sub-replies.
 
 - `examples/collect.datom` is the coarse evidence collection query.
 - `examples/configuration.datom` is the current configuration shape, including configured source roots, the daemon-local fragile output index policy, and read/preview/page limits. Replace the sample `/srv/aggregator/...` paths with local readable roots before validation.
-- `examples/transcript-block-search.datom` is a transcript block search carrying its text query as a flat node arena.
+- `examples/transcript-block-search.datom` is a transcript block search carrying its text query as a tree.
 - `examples/transcript-block-read.datom` is a bounded transcript block read response.
 
 One query per CLI invocation:
@@ -56,7 +56,7 @@ Transcript block search is for scraping configured local harness, session, and s
 2. `ListSessions` with source and time filters.
 2. `ListSubagents` for the selected session when subagent drill-down matters.
 3. `ListTranscriptBlocks` with `MetadataOnly` or a small `BoundedPreview` and a grounded kind filter.
-4. `SearchTranscriptBlocks` with a flat text-query arena: a vector of `TextQueryNode` values and the index of its root. A node is `Contains.Word.quota`, `Contains.Phrase.{ [ rate limit ] }`, `Near.{ Word.quota Word.reset 6 }`, or an `AllOf`, `AnyOf`, or `Not` naming its children by index into the same vector. An index outside the vector, or a node that reaches itself, is rejected as `InvalidQuery`.
+4. `SearchTranscriptBlocks` with a text-query tree. A `TextQuery` is `Contains.Word.quota`, `Contains.Phrase.{ [ rate limit ] }`, `Near.{ Word.quota Word.reset 6 }`, or an `AllOf.[ … ]`, `AnyOf.[ … ]`, or `Not.…` carrying its children in place, as in `AllOf.[ Near.{ Word.quota Word.reset 6 } Contains.Phrase.{ [ rate limit ] } ]`. A tree nested deeper than 32 or holding more than 256 nodes is rejected as `InvalidQuery`.
 5. `EstimateTranscriptBlock` for the selected fragile block reference.
 6. `ReadTranscriptBlock` only with an explicit `maximum_bytes`; there is no unbounded whole-block text fetch.
 

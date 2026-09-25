@@ -60,24 +60,23 @@ decode path.
 The whole wire vocabulary is one Ethos Signal declaration in each contract
 crate, generated into Rust. The runtime holds no hand-written wire type.
 
-## The flat text-query arena
+## The text-query tree
 
-A Signal root derives rkyv, and rkyv's derive cannot close the trait bounds of a
-self-reaching type, so no recursive type crosses the wire. The contract
-therefore carries a transcript-block text query as a vector of nodes plus a root
-index, and matching evidence the same way; children are named by index into the
-same vector.
+The contract carries a transcript-block text query as the recursive
+`TextQuery` and matching evidence as the recursive `MatchEvidence`, each
+declared in `signal-aggregator` (1.0.0 and later); a child sits in place inside
+its parent.
 
 `dotos-text-query` is the matching engine and nothing else. It is depended on
 with default features off, so it carries no Dotos dependency. `src/text_query/`
-is the only place the contract arena and the engine tree meet: it projects the
-arena into the engine's tree to run a match, and the engine's evidence back into
-an arena. The engine's types never reach the wire.
+is the only place the contract tree and the engine tree meet: it projects the
+contract tree into the engine's tree to run a match, and the engine's evidence
+back into a contract tree. The engine's types never reach the wire.
 
-The arena is peer input, so the projection is bounded before it recurses. An
-index outside the arena, a negative index, a node that reaches itself, an arena
-past its node bound, and nesting past its depth bound are each an
-`OperationRejected` with `OperationRejectionReason::InvalidQuery`.
+The tree is peer input, and its depth is bounded only by the frame that carried
+it, so the projection is bounded as it recurses. A tree past its node bound, a
+tree past its depth bound, and a distance or position the engine cannot hold
+are each an `OperationRejected` with `OperationRejectionReason::InvalidQuery`.
 
 ## Source boundaries
 
@@ -114,7 +113,7 @@ The ordinary contract exposes metadata-first output operations:
   projection.
 - `ListOutputSegments` lists segment cards for a selected output.
 - `ListTranscriptBlocks` lists whole logical transcript-block cards with grounded kind selection and optional bounded previews.
-- `SearchTranscriptBlocks` applies the `dotos-text-query` matching engine over readable transcript blocks and returns query evidence, as a flat node arena, with matching cards.
+- `SearchTranscriptBlocks` applies the `dotos-text-query` matching engine over readable transcript blocks and returns query evidence, as a `MatchEvidence` tree, with matching cards.
 - `ObserveHealth` reports metadata-first runtime capabilities, configured source health, and fragile-index counts without transcript text.
 - `EstimateTranscriptBlock` estimates a selected block before text projection.
 - `ReadTranscriptBlock` reads a selected whole block only with an explicit `maximum_bytes` bounded by the configured read cap.
@@ -176,7 +175,7 @@ src/client.rs                             CLI argument reading and client comman
 src/wire.rs                               Datom text and the Signal frame
 src/daemon.rs                             prototype Unix-socket daemon services and frame routing
 src/counting.rs                           measured counts and contract counts
-src/text_query.rs                         flat text-query arenas and their faults
+src/text_query.rs                         text-query tree projection and its faults
 src/text_query/query.rs                   text query in both shapes
 src/text_query/evidence.rs                matching evidence in both shapes
 src/signal.rs                             Signal validation, version, and rejection helpers
@@ -193,10 +192,10 @@ src/clock.rs                              collection reference time handling
 src/time_model.rs                         timestamp parsing and comparison
 src/error.rs                              typed crate error boundary
 tests/boundary.rs                         contract, daemon, adapter, and output-interface witnesses
-tests/text_query_projection.rs            flat arena and engine tree witnesses
+tests/text_query_projection.rs            contract tree and engine tree witnesses
 examples/collect.datom                    coarse evidence collection query
 examples/configuration.datom              current configuration shape
-examples/transcript-block-search.datom    transcript block search query with a flat text-query arena
+examples/transcript-block-search.datom    transcript block search query with a text-query tree
 examples/transcript-block-read.datom      bounded transcript block read response
 ```
 
@@ -206,7 +205,7 @@ The configured runtime path implements collection over configured transcript and
 repository evidence, and the daemon serves ordinary and meta frame requests over
 Unix sockets. The output interface implementation is present: session,
 subagent, output, segment, and transcript-block listings; complete metadata-first session inventory and lookup; aggregator-local rkyv session archive write/query/read with explicit archive paths; transcript-block
-search with matching evidence carried as a flat node arena; size estimates; bounded reads; durable
+search with matching evidence carried as a tree; size estimates; bounded reads; durable
 store-derived fragile index; metadata-first cards; typed stale, missing, broken,
 oversized, invalid-range, invalid-query, and invalid-request rejections; and
 query-bound page cursors.
