@@ -7,9 +7,11 @@
 //! shapes; this module is the only place where the two meet, and the engine's
 //! types never reach the wire.
 
+pub mod archived;
 pub mod evidence;
 pub mod query;
 
+pub use archived::ArchivedTree;
 pub use evidence::{ContractEvidenceProjection, EngineEvidenceProjection};
 pub use query::{ContractQueryProjection, EngineQueryProjection};
 

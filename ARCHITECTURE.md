@@ -78,6 +78,17 @@ it, so the projection is bounded as it recurses. A tree past its node bound, a
 tree past its depth bound, and a distance or position the engine cannot hold
 are each an `OperationRejected` with `OperationRejectionReason::InvalidQuery`.
 
+A received frame's nesting is bounded before it is decoded, with the same
+limits (depth 32, 256 nodes). rkyv validation recurses once per nested pointer,
+so `wire::ReceivedFrame` validates within `MAXIMUM_FRAME_NESTING` (the tree
+depth plus a fixed envelope allowance of 16); a frame past that ceiling is
+refused as `FrameRefusal::Unvalidated`. Inside the ceiling every `TextQuery`
+and `MatchEvidence` tree is measured still archived against the projection
+budget, and a tree past either bound is refused as
+`FrameRefusal::TreeOutsideBound` before any of it is allocated. On the ordinary
+socket that refusal is answered with the same `InvalidQuery` rejection, naming
+the request; a frame that does not validate gets no reply.
+
 ## Source boundaries
 
 The source of truth is underlying runtime evidence: harness/session/subagent

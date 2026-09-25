@@ -84,6 +84,13 @@ pub enum Error {
         source: signal::FrameError,
     },
 
+    #[error("received frame {context} refused: {refusal}")]
+    FrameRefused {
+        context: &'static str,
+        #[source]
+        refusal: crate::wire::FrameRefusal,
+    },
+
     #[error("Signal archive {context} failed: {detail}")]
     Archive {
         context: &'static str,
@@ -129,6 +136,10 @@ impl Error {
 
     pub fn frame(context: &'static str, source: signal::FrameError) -> Self {
         Self::Frame { context, source }
+    }
+
+    pub fn frame_refused(context: &'static str, refusal: crate::wire::FrameRefusal) -> Self {
+        Self::FrameRefused { context, refusal }
     }
 
     pub fn archive(context: &'static str, detail: impl Into<String>) -> Self {

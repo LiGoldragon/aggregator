@@ -17,7 +17,8 @@ use signal_aggregator::{
 
 use crate::{
     CollectionClock, ConfigurationStore, Error, NexusPlane, Result, RuntimeConfiguration,
-    RuntimeConfigurationValidation, SemaPlane, SignalPlane, wire::SignalFrame,
+    RuntimeConfigurationValidation, SemaPlane, SignalPlane,
+    wire::{FrameRefusal, SignalFrame},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,11 +165,27 @@ impl OrdinarySocketService {
     }
 
     pub fn handle_stream(&self, mut stream: UnixStream) -> Result<()> {
-        let Ok(query) = SignalFrame::read::<Query>("ordinary query", &mut stream) else {
-            return Ok(());
+        let response = match SignalFrame::read::<Query>("ordinary query", &mut stream) {
+            Ok(query) => {
+                OrdinaryRequestHandler::new(self.sema.clone(), self.clock.clone()).handle(query)
+            }
+            // A frame that validates but carries a tree past its bound still
+            // names its request, so it is answered with the typed rejection the
+            // projection would give. Only a search request carries a tree.
+            Err(Error::FrameRefused {
+                refusal:
+                    FrameRefusal::TreeOutsideBound {
+                        request_identifier, ..
+                    },
+                ..
+            }) => SignalPlane.reject_operation(
+                request_identifier,
+                OperationKind::SearchTranscriptBlocks,
+                OperationRejectionReason::InvalidQuery,
+                None,
+            ),
+            Err(_) => return Ok(()),
         };
-        let response =
-            OrdinaryRequestHandler::new(self.sema.clone(), self.clock.clone()).handle(query);
         SignalFrame::write("ordinary response", &mut stream, &response)
     }
 }
